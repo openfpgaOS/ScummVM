@@ -1,451 +1,321 @@
 /*
- * Celeste Classic -- openfpgaOS port
+ * Celeste Classic -- openfpgaOS port (SDL shim)
  *
- * Replaces the SDL frontend from ccleste with of.h API calls.
- * Game logic is in celeste.c/celeste.h (MIT license, lemon32767).
+ * Adapted from lemon32767/ccleste sdl12main.c.
+ * Uses the openfpgaOS SDL2 shim — surface points directly at the
+ * 320x240 HW framebuffer. Renders at 2x scale with centering.
  *
- * Renders the 128x128 PICO-8 screen at 2x scale into the 320x240
- * framebuffer, centered horizontally and vertically.
+ * Game logic: celeste.c/celeste.h (MIT license, lemon32767)
  */
 
-#include <stddef.h>
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_mixer.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
-#include <math.h>
+#include <string.h>
 
-#include "of.h"
 #include "celeste.h"
-
-/* tilemap data (extracted from PICO-8 cartridge) */
 #include "tilemap.h"
 
 /* ======================================================================
- * PICO-8 palette (16 colors)
+ * Globals
  * ====================================================================== */
 
-static const uint32_t base_palette[16] = {
-    0x000000, 0x1D2B53, 0x7E2553, 0x008751,
-    0xAB5236, 0x5F574F, 0xC2C3C7, 0xFFF1E8,
-    0xFF004D, 0xFFA300, 0xFFEC27, 0x00E436,
-    0x29ADFF, 0x83769C, 0xFF77A8, 0xFFCCAA
+static SDL_Surface *screen = NULL;
+
+#define PICO8_W 128
+#define PICO8_H 128
+
+/* Scale=2: render 128x128 at 2x into 320x240, centered with clipping */
+static const int scale = 2;
+#define OFS_X ((320 - PICO8_W * 2) / 2)   /* 32 */
+#define OFS_Y ((240 - PICO8_H * 2) / 2)   /* -8 */
+
+/* ======================================================================
+ * Palette — PICO-8 16 colors, stored as SDL_Color for getcolor()
+ * ====================================================================== */
+
+static const SDL_Color base_palette[16] = {
+    {0x00,0x00,0x00,0xFF}, {0x1D,0x2B,0x53,0xFF},
+    {0x7E,0x25,0x53,0xFF}, {0x00,0x87,0x51,0xFF},
+    {0xAB,0x52,0x36,0xFF}, {0x5F,0x57,0x4F,0xFF},
+    {0xC2,0xC3,0xC7,0xFF}, {0xFF,0xF1,0xE8,0xFF},
+    {0xFF,0x00,0x4D,0xFF}, {0xFF,0xA3,0x00,0xFF},
+    {0xFF,0xEC,0x27,0xFF}, {0x00,0xE4,0x36,0xFF},
+    {0x29,0xAD,0xFF,0xFF}, {0x83,0x76,0x9C,0xFF},
+    {0xFF,0x77,0xA8,0xFF}, {0xFF,0xCC,0xAA,0xFF},
 };
+static SDL_Color palette[16];
 
-static uint32_t palette[16];
+static inline Uint8 getcolor(int idx) {
+    SDL_Color c = palette[idx & 15];
+    for (int i = 0; i < 16; i++)
+        if (base_palette[i].r == c.r && base_palette[i].g == c.g && base_palette[i].b == c.b)
+            return (Uint8)i;
+    return (Uint8)(idx & 15);
+}
 
-static void reset_palette(void) {
-    memcpy(palette, base_palette, sizeof(palette));
+static void ResetPalette(void) {
+    memcpy(palette, base_palette, sizeof palette);
 }
 
 /* ======================================================================
- * Sprite / font data (embedded from BMP files)
- *
- * gfx.bmp  = 128x64, 4bpp indexed = PICO-8 spritesheet
- * font.bmp = 128x85, 1bpp = PICO-8 font (actually only 128x48 used: 6 rows of 16 chars)
- *
- * We convert these to flat 8-bit arrays at startup.
+ * Sprite / font data (embedded BMP)
  * ====================================================================== */
 
-/* Spritesheet: 128x64 pixels, each pixel is a 4-bit palette index */
 static uint8_t gfx_data[128 * 64];
-
-/* Font: 128x85 pixels, 1-bit (0 or 7) */
 static uint8_t font_data[128 * 85];
 
-/* BMP loader: reads uncompressed 4bpp or 1bpp BMP into 8-bit buffer */
-static int load_bmp(const uint8_t *bmp, int bmp_len, uint8_t *out, int w, int h, int bpp) {
+static int load_bmp_data(const uint8_t *bmp, int bmp_len, uint8_t *out,
+                         int w, int h, int bpp) {
     if (bmp_len < 54) return -1;
-
-    /* Read BMP header */
-    int data_offset = bmp[10] | (bmp[11] << 8) | (bmp[12] << 16) | (bmp[13] << 24);
-    int bmp_w = bmp[18] | (bmp[19] << 8) | (bmp[20] << 16) | (bmp[21] << 24);
-    int bmp_h = bmp[22] | (bmp[23] << 8) | (bmp[24] << 16) | (bmp[25] << 24);
+    int data_offset = bmp[10]|(bmp[11]<<8)|(bmp[12]<<16)|(bmp[13]<<24);
+    int bmp_w = bmp[18]|(bmp[19]<<8)|(bmp[20]<<16)|(bmp[21]<<24);
+    int bmp_h = bmp[22]|(bmp[23]<<8)|(bmp[24]<<16)|(bmp[25]<<24);
     int top_down = 0;
     if (bmp_h < 0) { bmp_h = -bmp_h; top_down = 1; }
-
     if (bmp_w != w || bmp_h != h) return -2;
-
-    int row_bytes;
-    if (bpp == 4)
-        row_bytes = (w + 1) / 2;
-    else /* bpp == 1 */
-        row_bytes = (w + 7) / 8;
-
-    /* Rows are padded to 4-byte boundaries */
+    int row_bytes = (bpp == 4) ? (w+1)/2 : (w+7)/8;
     int row_stride = (row_bytes + 3) & ~3;
-
     for (int y = 0; y < h; y++) {
-        int src_y = top_down ? y : (h - 1 - y);
+        int src_y = top_down ? y : (h-1-y);
         const uint8_t *row = bmp + data_offset + src_y * row_stride;
-
         for (int x = 0; x < w; x++) {
             uint8_t pixel;
-            if (bpp == 4) {
-                uint8_t byte = row[x / 2];
-                pixel = (x & 1) ? (byte & 0x0F) : (byte >> 4);
-            } else {
-                uint8_t byte = row[x / 8];
-                pixel = (byte >> (7 - (x & 7))) & 1;
-            }
-            out[y * w + x] = pixel;
+            if (bpp == 4) { uint8_t b = row[x/2]; pixel = (x&1) ? (b&0x0F) : (b>>4); }
+            else { pixel = (row[x/8] >> (7-(x&7))) & 1; }
+            out[y*w+x] = pixel;
         }
     }
     return 0;
 }
 
+#include "gfx_data.h"
+
+static void LoadData(void) {
+    printf("loading gfx...");
+    load_bmp_data(gfx_bmp, gfx_bmp_len, gfx_data, 128, 64, 4);
+    printf("done\nloading font...");
+    load_bmp_data(font_bmp, font_bmp_len, font_data, 128, 85, 1);
+    printf("done\n");
+}
+
 /* ======================================================================
- * Intermediate 128x128 framebuffer (PICO-8 screen)
+ * Drawing — render at 2x scale with centering, directly to HW FB
  *
- * Stores resolved palette indices: when pal(a,b) is active and
- * color 'a' is drawn, we find which base_palette entry 'palette[a]'
- * maps to, and store that index. This handles mid-frame PAL changes.
+ * All functions take PICO-8 coordinates (0..127) and apply SCALE + OFS.
+ * screen->pixels points directly at the 320x240 hardware framebuffer.
  * ====================================================================== */
 
-#define P8_W 128
-#define P8_H 128
-
-static uint8_t p8_screen[P8_W * P8_H];
-
-/* Resolve a PICO-8 color through the current palette remap.
- * Returns the base palette index that palette[col] corresponds to. */
-static inline uint8_t resolve_color(int col) {
-    col &= 0xF;
-    uint32_t target = palette[col];
-    for (int i = 0; i < 16; i++) {
-        if (base_palette[i] == target) return (uint8_t)i;
-    }
-    return (uint8_t)col;  /* fallback */
-}
-
-static inline void p8_pixel(int x, int y, int col) {
-    if ((unsigned)x < P8_W && (unsigned)y < P8_H)
-        p8_screen[y * P8_W + x] = resolve_color(col);
-}
-
-static inline int p8_get_pixel(int x, int y) {
-    if ((unsigned)x < P8_W && (unsigned)y < P8_H)
-        return p8_screen[y * P8_W + x];
-    return 0;
-}
-
-/* ======================================================================
- * PICO-8 drawing primitives
- * ====================================================================== */
-
-static void p8_rectfill(int x0, int y0, int x1, int y1, int col) {
-    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
-    if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
-    for (int y = y0; y <= y1; y++)
-        for (int x = x0; x <= x1; x++)
-            p8_pixel(x, y, col);
-}
-
-static void p8_line(int x0, int y0, int x1, int y1, int col) {
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx - dy;
-
-    for (;;) {
-        p8_pixel(x0, y0, col);
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 > -dy) { err -= dy; x0 += sx; }
-        if (e2 < dx)  { err += dx; y0 += sy; }
-    }
-}
-
-static void p8_hline(int x0, int x1, int y, int col) {
-    if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
-    for (int x = x0; x <= x1; x++) p8_pixel(x, y, col);
-}
-
-static void p8_circfill(int cx, int cy, int r, int col) {
-    if (r <= 0) {
-        p8_pixel(cx, cy, col);
-        return;
-    }
-    /* Midpoint circle fill (integer only) */
-    int x = r, y = 0, err = 1 - r;
-    while (x >= y) {
-        p8_hline(cx - x, cx + x, cy + y, col);
-        p8_hline(cx - x, cx + x, cy - y, col);
-        p8_hline(cx - y, cx + y, cy + x, col);
-        p8_hline(cx - y, cx + y, cy - x, col);
-        y++;
-        if (err < 0) {
-            err += 2 * y + 1;
-        } else {
-            x--;
-            err += 2 * (y - x) + 1;
-        }
-    }
-}
-
-static void p8_spr_with_pal(int sprite, int x, int y, int flipx, int flipy) {
+static inline void Xblit(int sprite, int x, int y, int flipx, int flipy) {
     int sx = (sprite % 16) * 8;
     int sy = (sprite / 16) * 8;
+    uint8_t *fb = (uint8_t *)screen->pixels;
 
     for (int py = 0; py < 8; py++) {
         for (int px = 0; px < 8; px++) {
-            int gx = sx + (flipx ? (7 - px) : px);
-            int gy = sy + (flipy ? (7 - py) : py);
+            int gx = sx + (flipx ? (7-px) : px);
+            int gy = sy + (flipy ? (7-py) : py);
             if (gy >= 64) continue;
             uint8_t pixel = gfx_data[gy * 128 + gx];
-            if (pixel != 0) {
-                /* Palette remapping: find which base color this maps to */
-                p8_pixel(x + px, y + py, pixel);
+            if (pixel == 0) continue;
+            uint8_t c = getcolor(pixel);
+            /* Write scale×scale block */
+            for (int ssy = 0; ssy < scale; ssy++) {
+                int fy = OFS_Y + (y+py) * scale + ssy;
+                if ((unsigned)fy >= 240) continue;
+                for (int ssx = 0; ssx < scale; ssx++) {
+                    int fx = OFS_X + (x+px) * scale + ssx;
+                    if ((unsigned)fx >= 320) continue;
+                    fb[fy * 320 + fx] = c;
+                }
             }
         }
+    }
+}
+
+static void p8_rectfill(int x0, int y0, int x1, int y1, int col) {
+    if (x0 > x1) { int t=x0; x0=x1; x1=t; }
+    if (y0 > y1) { int t=y0; y0=y1; y1=t; }
+    Uint8 c = getcolor(col);
+    SDL_Rect rc = { OFS_X + x0*scale, OFS_Y + y0*scale,
+                    (x1-x0+1)*scale, (y1-y0+1)*scale };
+    SDL_FillRect(screen, &rc, c);
+}
+
+static void p8_line(int x0, int y0, int x1, int y1, int col) {
+    Uint8 c = getcolor(col);
+    uint8_t *fb = (uint8_t *)screen->pixels;
+    int dx = abs(x1-x0), sx = x0<x1?1:-1;
+    int dy = abs(y1-y0), sy = y0<y1?1:-1;
+    int err = dx-dy;
+    for (;;) {
+        for (int ssy = 0; ssy < scale; ssy++) {
+            int fy = OFS_Y + y0*scale + ssy;
+            if ((unsigned)fy >= 240) continue;
+            for (int ssx = 0; ssx < scale; ssx++) {
+                int fx = OFS_X + x0*scale + ssx;
+                if ((unsigned)fx >= 320) continue;
+                fb[fy*320+fx] = c;
+            }
+        }
+        if (x0==x1 && y0==y1) break;
+        int e2 = 2*err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
     }
 }
 
 static void p8_print(const char *str, int x, int y, int col) {
-    for (const char *c = str; *c; c++) {
-        int ch = (*c) & 0x7F;
-        int fx = (ch % 16) * 8;
-        int fy = (ch / 16) * 8;
-
-        for (int py = 0; py < 8; py++) {
-            for (int px = 0; px < 4; px++) {
-                /* font is 1-bit: pixel is either 0 or 1 */
-                if (fy + py < 85 && font_data[(fy + py) * 128 + fx + px])
-                    p8_pixel(x + px, y + py, col);
-            }
-        }
+    Uint8 c = getcolor(col);
+    uint8_t *fb = (uint8_t *)screen->pixels;
+    for (const char *s = str; *s; s++) {
+        int ch = (*s) & 0x7F;
+        int fx = (ch%16)*8, fy = (ch/16)*8;
+        for (int py = 0; py < 8; py++)
+            for (int px = 0; px < 4; px++)
+                if (fy+py < 85 && font_data[(fy+py)*128+fx+px])
+                    for (int ssy = 0; ssy < scale; ssy++) {
+                        int dy = OFS_Y + (y+py)*scale + ssy;
+                        if ((unsigned)dy >= 240) continue;
+                        for (int ssx = 0; ssx < scale; ssx++) {
+                            int dx = OFS_X + (x+px)*scale + ssx;
+                            if ((unsigned)dx >= 320) continue;
+                            fb[dy*320+dx] = c;
+                        }
+                    }
         x += 4;
     }
 }
 
+static void p8_circfill(int cx, int cy, int r, int col) {
+    if (r <= 0) { p8_rectfill(cx,cy,cx,cy,col); return; }
+    /* Horizontal-line fill for each scanline */
+    Uint8 c = getcolor(col);
+    int xx = r, yy = 0, err = 1-r;
+    while (xx >= yy) {
+        p8_rectfill(cx-xx, cy+yy, cx+xx, cy+yy, col);
+        p8_rectfill(cx-xx, cy-yy, cx+xx, cy-yy, col);
+        p8_rectfill(cx-yy, cy+xx, cx+yy, cy+xx, col);
+        p8_rectfill(cx-yy, cy-xx, cx+yy, cy-xx, col);
+        (void)c;
+        yy++;
+        if (err < 0) err += 2*yy+1;
+        else { xx--; err += 2*(yy-xx)+1; }
+    }
+}
+
 static void p8_map(int mx, int my, int tx, int ty, int mw, int mh, int mask,
-                   int camera_x, int camera_y) {
-    for (int y = 0; y < mh; y++) {
+                   int cam_x, int cam_y) {
+    for (int y = 0; y < mh; y++)
         for (int x = 0; x < mw; x++) {
-            int tile = tilemap_data[(x + mx) + (y + my) * 128];
+            int tile = tilemap_data[(x+mx)+(y+my)*128];
             int draw = 0;
-            if (mask == 0) {
-                draw = 1;
-            } else if (mask == 4 && tile_flags[tile] == 4) {
-                draw = 1;
-            } else if (mask != 4 && tile < (int)(sizeof(tile_flags)/sizeof(*tile_flags))
-                       && (tile_flags[tile] & (1 << (mask - 1)))) {
-                draw = 1;
-            }
-            if (draw) {
-                p8_spr_with_pal(tile, tx + x * 8 - camera_x,
-                                ty + y * 8 - camera_y, 0, 0);
-            }
+            if (mask == 0) draw = 1;
+            else if (mask == 4 && tile_flags[tile] == 4) draw = 1;
+            else if (mask != 4 && tile < (int)(sizeof(tile_flags)/sizeof(*tile_flags))
+                     && (tile_flags[tile] & (1<<(mask-1)))) draw = 1;
+            if (draw)
+                Xblit(tile, tx+x*8-cam_x, ty+y*8-cam_y, 0, 0);
         }
-    }
 }
 
 /* ======================================================================
- * Scale 128x128 → framebuffer and present
- * ====================================================================== */
-
-/* Scale factor and offsets for centering */
-#define SCREEN_W 320
-#define SCREEN_H 240
-#define SCALE 2
-#define OFS_X ((SCREEN_W - P8_W * SCALE) / 2)   /* (320 - 256) / 2 = 32 */
-#define OFS_Y ((SCREEN_H - P8_H * SCALE) / 2)   /* (240 - 256) / 2 = -8 */
-
-static void present(void) {
-    uint8_t *fb = of_video_surface();
-
-    for (int py = 0; py < P8_H; py++) {
-        int dy = OFS_Y + py * SCALE;
-        for (int s = 0; s < SCALE; s++) {
-            int fy = dy + s;
-            if ((unsigned)fy >= SCREEN_H) continue;
-            for (int px = 0; px < P8_W; px++) {
-                uint8_t col = p8_screen[py * P8_W + px];
-                int dx = OFS_X + px * SCALE;
-                fb[fy * SCREEN_W + dx]     = col;
-                fb[fy * SCREEN_W + dx + 1] = col;
-            }
-        }
-    }
-    of_video_flip();
-}
-
-/* ======================================================================
- * Input mapping
- * ====================================================================== */
-
-static uint16_t buttons_state;
-
-/* PICO-8 buttons: 0=left, 1=right, 2=up, 3=down, 4=jump(z), 5=dash(x) */
-static void read_input(void) {
-    of_input_poll();
-
-    buttons_state = 0;
-    if (of_btn(OF_BTN_LEFT))   buttons_state |= (1 << 0);
-    if (of_btn(OF_BTN_RIGHT))  buttons_state |= (1 << 1);
-    if (of_btn(OF_BTN_UP))     buttons_state |= (1 << 2);
-    if (of_btn(OF_BTN_DOWN))   buttons_state |= (1 << 3);
-    if (of_btn(OF_BTN_A))      buttons_state |= (1 << 4);  /* jump */
-    if (of_btn(OF_BTN_B))      buttons_state |= (1 << 5);  /* dash */
-}
-
-/* ======================================================================
- * PICO-8 callback implementation
- * ====================================================================== */
-
-static int camera_x, camera_y;
-static int enable_screenshake = 1;
-
-static int pico8emu(CELESTE_P8_CALLBACK_TYPE call, ...) {
-    va_list args;
-    int ret = 0;
-    va_start(args, call);
-
-    #define   INT_ARG() va_arg(args, int)
-    #define  BOOL_ARG() (Celeste_P8_bool_t)va_arg(args, int)
-
-    switch (call) {
-    case CELESTE_P8_MUSIC: {
-        int index = INT_ARG();
-        int fade = INT_ARG();
-        int mask = INT_ARG();
-        (void)index; (void)fade; (void)mask;
-        /* Audio not implemented in this port */
-    } break;
-
-    case CELESTE_P8_SPR: {
-        int sprite = INT_ARG();
-        int x = INT_ARG() - camera_x;
-        int y = INT_ARG() - camera_y;
-        int cols = INT_ARG();
-        int rows = INT_ARG();
-        int flipx = BOOL_ARG();
-        int flipy = BOOL_ARG();
-        (void)cols; (void)rows;
-        if (sprite >= 0)
-            p8_spr_with_pal(sprite, x, y, flipx, flipy);
-    } break;
-
-    case CELESTE_P8_BTN: {
-        int b = INT_ARG();
-        ret = (buttons_state & (1 << b)) != 0;
-    } break;
-
-    case CELESTE_P8_SFX: {
-        int id = INT_ARG();
-        (void)id;
-        /* Audio not implemented */
-    } break;
-
-    case CELESTE_P8_PAL: {
-        int a = INT_ARG();
-        int b = INT_ARG();
-        if (a >= 0 && a < 16 && b >= 0 && b < 16)
-            palette[a] = base_palette[b];
-    } break;
-
-    case CELESTE_P8_PAL_RESET: {
-        reset_palette();
-    } break;
-
-    case CELESTE_P8_CIRCFILL: {
-        int cx = INT_ARG() - camera_x;
-        int cy = INT_ARG() - camera_y;
-        int r = INT_ARG();
-        int col = INT_ARG();
-        p8_circfill(cx, cy, r, col);
-    } break;
-
-    case CELESTE_P8_PRINT: {
-        const char *str = va_arg(args, const char *);
-        int x = INT_ARG() - camera_x;
-        int y = INT_ARG() - camera_y;
-        int col = INT_ARG() % 16;
-        p8_print(str, x, y, col);
-    } break;
-
-    case CELESTE_P8_RECTFILL: {
-        int x0 = INT_ARG() - camera_x;
-        int y0 = INT_ARG() - camera_y;
-        int x1 = INT_ARG() - camera_x;
-        int y1 = INT_ARG() - camera_y;
-        int col = INT_ARG();
-        p8_rectfill(x0, y0, x1, y1, col);
-    } break;
-
-    case CELESTE_P8_LINE: {
-        int x0 = INT_ARG() - camera_x;
-        int y0 = INT_ARG() - camera_y;
-        int x1 = INT_ARG() - camera_x;
-        int y1 = INT_ARG() - camera_y;
-        int col = INT_ARG();
-        p8_line(x0, y0, x1, y1, col);
-    } break;
-
-    case CELESTE_P8_MGET: {
-        int tx = INT_ARG();
-        int ty = INT_ARG();
-        ret = tilemap_data[tx + ty * 128];
-    } break;
-
-    case CELESTE_P8_CAMERA: {
-        if (enable_screenshake) {
-            camera_x = INT_ARG();
-            camera_y = INT_ARG();
-        }
-    } break;
-
-    case CELESTE_P8_FGET: {
-        int tile = INT_ARG();
-        int flag = INT_ARG();
-        ret = tile < (int)(sizeof(tile_flags)/sizeof(*tile_flags))
-              && (tile_flags[tile] & (1 << flag)) != 0;
-    } break;
-
-    case CELESTE_P8_MAP: {
-        int mx = INT_ARG(), my = INT_ARG();
-        int tx = INT_ARG(), ty = INT_ARG();
-        int mw = INT_ARG(), mh = INT_ARG();
-        int mask = INT_ARG();
-        p8_map(mx, my, tx, ty, mw, mh, mask, camera_x, camera_y);
-    } break;
-    }
-
-    va_end(args);
-    return ret;
-}
-
-/* ======================================================================
- * Embedded BMP data (gfx.bmp + font.bmp baked into the binary)
- * ====================================================================== */
-
-#include "gfx_data.h"
-
-static int load_gfx(void) {
-    if (load_bmp(gfx_bmp, gfx_bmp_len, gfx_data, 128, 64, 4) < 0)
-        return -1;
-    if (load_bmp(font_bmp, font_bmp_len, font_data, 128, 85, 1) < 0)
-        return -2;
-    return 0;
-}
-
-/* ======================================================================
- * OSD (on-screen display)
+ * OSD
  * ====================================================================== */
 
 static char osd_text[200] = "";
 static int osd_timer = 0;
-
-static void osd_draw(void) {
+static void OSDset(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(osd_text, sizeof osd_text, fmt, ap);
+    osd_timer = 30; va_end(ap);
+}
+static void OSDdraw(void) {
     if (osd_timer > 0) {
-        osd_timer--;
-        int x = 4;
-        int y = 120 + (osd_timer < 10 ? 10 - osd_timer : 0);
-        int len = 0;
-        for (const char *s = osd_text; *s; s++) len++;
-        p8_rectfill(x - 2, y - 2, x + 4 * len, y + 6, 6);
-        p8_rectfill(x - 1, y - 1, x + 4 * len - 1, y + 5, 0);
+        --osd_timer;
+        int x = 4, y = 120 + (osd_timer<10 ? 10-osd_timer : 0);
+        int len = (int)strlen(osd_text);
+        p8_rectfill(x-2,y-2, x+4*len,y+6, 6);
+        p8_rectfill(x-1,y-1, x+4*len-1,y+5, 0);
         p8_print(osd_text, x, y, 7);
     }
+}
+
+/* ======================================================================
+ * PICO-8 callback
+ * ====================================================================== */
+
+static int camera_x, camera_y;
+static int enable_screenshake = 1;
+static Uint16 buttons_state;
+
+static int pico8emu(CELESTE_P8_CALLBACK_TYPE call, ...) {
+    va_list args; int ret = 0;
+    va_start(args, call);
+    #define INT_ARG()  va_arg(args, int)
+    #define BOOL_ARG() (Celeste_P8_bool_t)va_arg(args, int)
+
+    switch (call) {
+    case CELESTE_P8_MUSIC: { INT_ARG(); INT_ARG(); INT_ARG(); } break;
+    case CELESTE_P8_SPR: {
+        int spr=INT_ARG(), x=INT_ARG(), y=INT_ARG();
+        int cols=INT_ARG(), rows=INT_ARG();
+        int fx=BOOL_ARG(), fy=BOOL_ARG();
+        (void)cols;(void)rows;
+        if (spr>=0) Xblit(spr, x-camera_x, y-camera_y, fx, fy);
+    } break;
+    case CELESTE_P8_BTN: { int b=INT_ARG(); ret=(buttons_state&(1<<b))!=0; } break;
+    case CELESTE_P8_SFX: { INT_ARG(); } break;
+    case CELESTE_P8_PAL: {
+        int a=INT_ARG(), b=INT_ARG();
+        if (a>=0&&a<16&&b>=0&&b<16) palette[a]=base_palette[b];
+    } break;
+    case CELESTE_P8_PAL_RESET: { ResetPalette(); } break;
+    case CELESTE_P8_CIRCFILL: {
+        int cx=INT_ARG()-camera_x, cy=INT_ARG()-camera_y;
+        int r=INT_ARG(), col=INT_ARG();
+        p8_circfill(cx,cy,r,col);
+    } break;
+    case CELESTE_P8_PRINT: {
+        const char *str=va_arg(args,const char*);
+        int x=INT_ARG()-camera_x, y=INT_ARG()-camera_y, col=INT_ARG()%16;
+        p8_print(str,x,y,col);
+    } break;
+    case CELESTE_P8_RECTFILL: {
+        int x0=INT_ARG()-camera_x, y0=INT_ARG()-camera_y;
+        int x1=INT_ARG()-camera_x, y1=INT_ARG()-camera_y;
+        int col=INT_ARG();
+        p8_rectfill(x0,y0,x1,y1,col);
+    } break;
+    case CELESTE_P8_LINE: {
+        int x0=INT_ARG()-camera_x, y0=INT_ARG()-camera_y;
+        int x1=INT_ARG()-camera_x, y1=INT_ARG()-camera_y;
+        int col=INT_ARG();
+        p8_line(x0,y0,x1,y1,col);
+    } break;
+    case CELESTE_P8_MGET: {
+        int tx=INT_ARG(), ty=INT_ARG();
+        ret=tilemap_data[tx+ty*128];
+    } break;
+    case CELESTE_P8_CAMERA: {
+        if (enable_screenshake) { camera_x=INT_ARG(); camera_y=INT_ARG(); }
+    } break;
+    case CELESTE_P8_FGET: {
+        int tile=INT_ARG(), flag=INT_ARG();
+        ret=tile<(int)(sizeof(tile_flags)/sizeof(*tile_flags))
+            &&(tile_flags[tile]&(1<<flag))!=0;
+    } break;
+    case CELESTE_P8_MAP: {
+        int mx=INT_ARG(),my=INT_ARG(),tx=INT_ARG(),ty=INT_ARG();
+        int mw=INT_ARG(),mh=INT_ARG(),mask=INT_ARG();
+        p8_map(mx,my,tx,ty,mw,mh,mask,camera_x,camera_y);
+    } break;
+    }
+    va_end(args);
+    return ret;
 }
 
 /* ======================================================================
@@ -453,72 +323,76 @@ static void osd_draw(void) {
  * ====================================================================== */
 
 int main(void) {
-    of_video_init();
+    /* SDL_SetVideoMode: inits video, clears buffer, returns HW surface */
+    screen = SDL_SetVideoMode(320, 240, 8, SDL_SWSURFACE);
 
-    /* Set up PICO-8 palette */
-    of_video_palette_bulk(base_palette, 16);
+    /* Set PICO-8 palette on hardware */
+    SDL_SetPalette(screen, SDL_PHYSPAL|SDL_LOGPAL,
+                   (SDL_Color *)base_palette, 0, 16);
+    ResetPalette();
 
-    /* Load spritesheet and font */
-    printf("Loading Celeste...\n");
+    Mix_OpenAudio(22050, AUDIO_S16SYS, 1, 1024);
 
-    if (load_gfx() < 0) {
-        printf("Error loading graphics!\n");
-        printf("Place gfx.bmp and font.bmp\n");
-        printf("in data/ directory.\n");
-        while (1) { of_delay_ms(100); }
-    }
+    printf("now loading...\n");
+    LoadData();
 
-    printf("OK!\n");
-
-    /* Initialize game */
-    reset_palette();
     Celeste_P8_set_call_func(pico8emu);
-    Celeste_P8_set_rndseed(of_time_ms());
+
+    void *initial_state = SDL_malloc(Celeste_P8_get_state_size());
+    if (initial_state) Celeste_P8_save_state(initial_state);
+    Celeste_P8_set_rndseed(SDL_GetTicks());
     Celeste_P8_init();
+    printf("ready\n");
 
-    /* Save initial state for reset */
-    void *initial_state = malloc(Celeste_P8_get_state_size());
-    if (initial_state)
-        Celeste_P8_save_state(initial_state);
+    int running = 1;
+    while (running) {
+        /* Input: keyboard state is updated during SDL_PollEvent */
+        const Uint8 *kbstate = SDL_GetKeyState(NULL);
 
-    /* Game loop (30fps) */
-    while (1) {
-        uint32_t frame_start = of_time_ms();
-
-        read_input();
-
-        /* Check for reset (hold SELECT+START for 1 second) */
-        {
-            static int reset_timer = 0;
-            if (of_btn(OF_BTN_SELECT) && of_btn(OF_BTN_START)) {
-                reset_timer++;
-                if (reset_timer >= 30 && initial_state) {
-                    reset_timer = 0;
-                    Celeste_P8_load_state(initial_state);
-                    Celeste_P8_set_rndseed(of_time_ms());
-                    Celeste_P8_init();
-                    memcpy(osd_text, "reset", 6);
-                    osd_timer = 30;
-                }
-            } else {
+        /* Hold Y (F9) to reset */
+        static int reset_timer = 0;
+        if (initial_state && kbstate[SDLK_F9]) {
+            if (++reset_timer >= 30) {
                 reset_timer = 0;
+                OSDset("reset");
+                Celeste_P8_load_state(initial_state);
+                Celeste_P8_set_rndseed(SDL_GetTicks());
+                Celeste_P8_init();
             }
+        } else reset_timer = 0;
+
+        buttons_state = 0;
+        SDL_GameControllerUpdate();
+
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) running = 0;
         }
 
-        /* Update and draw */
+        if (kbstate[SDLK_LEFT])  buttons_state |= (1<<0);
+        if (kbstate[SDLK_RIGHT]) buttons_state |= (1<<1);
+        if (kbstate[SDLK_UP])    buttons_state |= (1<<2);
+        if (kbstate[SDLK_DOWN])  buttons_state |= (1<<3);
+        if (kbstate[SDLK_z]||kbstate[SDLK_c]) buttons_state |= (1<<4);
+        if (kbstate[SDLK_x]||kbstate[SDLK_v]) buttons_state |= (1<<5);
+
         Celeste_P8_update();
         Celeste_P8_draw();
-        osd_draw();
+        OSDdraw();
 
-        /* Clear framebuffer and blit scaled PICO-8 screen */
-        of_video_clear(0);
-        present();
+        /* SDL_Flip: flip → clear next buffer → update surface pointer */
+        SDL_Flip(screen);
 
-        /* Frame timing: ~33ms per frame for 30fps */
-        uint32_t elapsed = of_time_ms() - frame_start;
-        if (elapsed < 33)
-            of_delay_ms(33 - elapsed);
+        /* 30 fps */
+        static unsigned frame_start = 0;
+        unsigned frame_end = SDL_GetTicks();
+        unsigned frame_time = frame_end - frame_start;
+        if (frame_time < 33) SDL_Delay(33 - frame_time);
+        frame_start = SDL_GetTicks();
     }
 
+    if (initial_state) SDL_free(initial_state);
+    Mix_CloseAudio();
+    SDL_Quit();
     return 0;
 }
