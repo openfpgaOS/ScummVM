@@ -1,440 +1,25 @@
 /*
- * of_midi.c -- MIDI playback engine for openfpgaOS
+ * of_midi.c -- Standard MIDI File parser driving the sample voice engine.
  *
- * Plays Standard MIDI Files (Format 0 and 1) through 18 OPL3 channels.
- * Non-blocking design: of_midi_pump() is driven by of_time_us().
+ * No synthesis state lives here: the parser unpacks events and forwards
+ * them to of_smp_voice_* calls.  Per-channel controller state (volume,
+ * expression, sustain, filter) is kept here because it's tracked at the
+ * MIDI-event level and needs to survive across note-ons.
  */
 
 #include "include/of_midi.h"
-#include "include/of_audio.h"
+#include "include/of_smp_bank.h"
+#include "include/of_smp_voice.h"
 #include "include/of_timer.h"
+#include "include/of_services.h"
+#include "include/of_fastram.h"
 
-#ifndef NULL
-#define NULL ((void *)0)
-#endif
+#include <stdint.h>
+#include <stddef.h>
 
-/* ======================================================================
- * Built-in General MIDI instrument bank
- *
- * 128 melodic programs + 47 percussion (GM drum map notes 35-81).
- * 11 bytes per instrument:
- *   [0]   FB/CNT  (0xC0+ch: feedback[3:1], connection[0])
- *   [1-5] Modulator: AVEK_MULT, KSL_TL, AR_DR, SL_RR, WS
- *   [6-10] Carrier:  AVEK_MULT, KSL_TL, AR_DR, SL_RR, WS
- * ====================================================================== */
-
-static const uint8_t gm_bank[175 * 11] = {
-    /* ---- Melodic instruments (programs 0-127) ---- */
-
-    /* 0: Acoustic Grand Piano */
-    0x30, 0x01,0x10,0xF2,0x72,0x00, 0x01,0x00,0xF2,0x74,0x00,
-    /* 1: Bright Acoustic Piano */
-    0x30, 0x01,0x0C,0xF2,0x72,0x00, 0x01,0x00,0xF4,0x74,0x01,
-    /* 2: Electric Grand Piano */
-    0x06, 0x02,0x28,0xF5,0x35,0x00, 0x01,0x00,0xF2,0x72,0x00,
-    /* 3: Honky-tonk Piano */
-    0x34, 0x01,0x0D,0xF3,0x73,0x00, 0x01,0x00,0xF3,0x73,0x00,
-    /* 4: Electric Piano 1 (Rhodes) */
-    0x06, 0x02,0x1E,0xF5,0x35,0x00, 0x01,0x00,0xF2,0x73,0x00,
-    /* 5: Electric Piano 2 (DX) */
-    0x08, 0x04,0x24,0xF4,0x46,0x01, 0x01,0x00,0xF2,0x73,0x00,
-    /* 6: Harpsichord */
-    0x30, 0x01,0x12,0xFF,0x8A,0x00, 0x01,0x00,0xFF,0x8A,0x00,
-    /* 7: Clavinet */
-    0x32, 0x03,0x10,0xFF,0x89,0x00, 0x01,0x00,0xFD,0x88,0x00,
-
-    /* 8: Celesta */
-    0x04, 0x04,0x20,0xFA,0x67,0x00, 0x01,0x00,0xF5,0x75,0x00,
-    /* 9: Glockenspiel */
-    0x04, 0x05,0x22,0xFF,0x69,0x00, 0x01,0x00,0xFF,0x78,0x00,
-    /* 10: Music Box */
-    0x06, 0x04,0x20,0xF8,0x67,0x01, 0x01,0x00,0xF4,0x76,0x01,
-    /* 11: Vibraphone */
-    0x00, 0x01,0x1E,0xF3,0x56,0x00, 0x01,0x00,0xF1,0x64,0x00,
-    /* 12: Marimba */
-    0x00, 0x01,0x14,0xF8,0x8A,0x00, 0x01,0x00,0xF6,0x89,0x00,
-    /* 13: Xylophone */
-    0x04, 0x05,0x14,0xFA,0x8A,0x00, 0x01,0x00,0xF8,0x8A,0x00,
-    /* 14: Tubular Bells */
-    0x04, 0x04,0x1C,0xF5,0x56,0x00, 0x01,0x00,0xF2,0x65,0x00,
-    /* 15: Dulcimer */
-    0x02, 0x02,0x18,0xF5,0x76,0x00, 0x01,0x00,0xF3,0x75,0x00,
-
-    /* 16: Drawbar Organ */
-    0x01, 0x21,0x12,0xF0,0x10,0x00, 0x21,0x00,0xF0,0x10,0x00,
-    /* 17: Percussive Organ */
-    0x01, 0x21,0x12,0xF4,0x3A,0x00, 0x21,0x00,0xF2,0x2A,0x00,
-    /* 18: Rock Organ */
-    0x01, 0x21,0x14,0xF2,0x10,0x02, 0x21,0x00,0xF2,0x10,0x02,
-    /* 19: Church Organ */
-    0x01, 0x21,0x10,0x50,0x10,0x00, 0x21,0x00,0x50,0x10,0x00,
-    /* 20: Reed Organ */
-    0x01, 0x21,0x16,0x70,0x20,0x00, 0x21,0x00,0x60,0x20,0x00,
-    /* 21: Accordion */
-    0x01, 0x21,0x1A,0x82,0x32,0x00, 0x21,0x00,0x72,0x22,0x00,
-    /* 22: Harmonica */
-    0x01, 0x21,0x18,0x70,0x20,0x00, 0x21,0x00,0x62,0x20,0x00,
-    /* 23: Tango Accordion */
-    0x01, 0x21,0x1A,0x82,0x32,0x02, 0x21,0x00,0x72,0x22,0x02,
-
-    /* 24: Nylon Guitar */
-    0x00, 0x01,0x14,0xF4,0x65,0x00, 0x01,0x00,0xF2,0x74,0x00,
-    /* 25: Steel Guitar */
-    0x02, 0x01,0x12,0xF5,0x65,0x00, 0x01,0x00,0xF3,0x74,0x00,
-    /* 26: Jazz Guitar */
-    0x00, 0x01,0x16,0xF2,0x65,0x00, 0x01,0x00,0xF1,0x74,0x00,
-    /* 27: Clean Guitar */
-    0x02, 0x01,0x10,0xF4,0x65,0x01, 0x01,0x00,0xF2,0x74,0x01,
-    /* 28: Muted Guitar */
-    0x02, 0x01,0x16,0xFA,0x8A,0x00, 0x01,0x00,0xF8,0x8A,0x00,
-    /* 29: Overdriven Guitar */
-    0x04, 0x21,0x18,0xF5,0x55,0x01, 0x21,0x00,0xF2,0x52,0x01,
-    /* 30: Distortion Guitar */
-    0x06, 0x21,0x14,0xF6,0x54,0x02, 0x21,0x00,0xF2,0x52,0x02,
-    /* 31: Guitar Harmonics */
-    0x04, 0x04,0x1C,0xF4,0x76,0x00, 0x01,0x00,0xF2,0x75,0x00,
-
-    /* 32: Acoustic Bass */
-    0x00, 0x01,0x18,0xF5,0x75,0x00, 0x01,0x00,0xF2,0x73,0x00,
-    /* 33: Electric Bass (finger) */
-    0x00, 0x01,0x14,0xF5,0x75,0x00, 0x01,0x00,0xF3,0x73,0x00,
-    /* 34: Electric Bass (pick) */
-    0x02, 0x01,0x12,0xF7,0x75,0x00, 0x01,0x00,0xF5,0x73,0x00,
-    /* 35: Fretless Bass */
-    0x00, 0x01,0x16,0xA3,0x74,0x00, 0x01,0x00,0xA1,0x73,0x00,
-    /* 36: Slap Bass 1 */
-    0x04, 0x01,0x10,0xFA,0x75,0x00, 0x01,0x00,0xF8,0x73,0x00,
-    /* 37: Slap Bass 2 */
-    0x04, 0x01,0x12,0xFA,0x75,0x01, 0x01,0x00,0xF8,0x73,0x01,
-    /* 38: Synth Bass 1 */
-    0x00, 0x22,0x14,0xF4,0x54,0x01, 0x21,0x00,0xF2,0x53,0x01,
-    /* 39: Synth Bass 2 */
-    0x02, 0x22,0x16,0xF3,0x54,0x02, 0x21,0x00,0xF1,0x53,0x02,
-
-    /* 40: Violin */
-    0x00, 0x21,0x1A,0x82,0x42,0x00, 0x21,0x00,0x72,0x32,0x00,
-    /* 41: Viola */
-    0x00, 0x21,0x1C,0x82,0x42,0x00, 0x21,0x00,0x72,0x32,0x00,
-    /* 42: Cello */
-    0x00, 0x21,0x1E,0x82,0x43,0x00, 0x21,0x00,0x72,0x33,0x00,
-    /* 43: Contrabass */
-    0x00, 0x21,0x20,0x82,0x44,0x00, 0x21,0x00,0x72,0x34,0x00,
-    /* 44: Tremolo Strings */
-    0x00, 0xA1,0x1A,0x82,0x42,0x00, 0x21,0x00,0x72,0x32,0x00,
-    /* 45: Pizzicato Strings */
-    0x00, 0x01,0x14,0xFA,0x8A,0x00, 0x01,0x00,0xF8,0x8A,0x00,
-    /* 46: Orchestral Harp */
-    0x02, 0x01,0x10,0xF4,0x75,0x00, 0x01,0x00,0xF2,0x74,0x00,
-    /* 47: Timpani */
-    0x00, 0x01,0x00,0xF5,0x85,0x00, 0x01,0x00,0xF2,0x83,0x00,
-
-    /* 48: String Ensemble 1 */
-    0x01, 0x21,0x1A,0x72,0x32,0x00, 0x21,0x00,0x62,0x22,0x00,
-    /* 49: String Ensemble 2 */
-    0x01, 0x21,0x1C,0x62,0x32,0x00, 0x21,0x00,0x52,0x22,0x00,
-    /* 50: Synth Strings 1 */
-    0x01, 0x21,0x18,0x72,0x32,0x01, 0x21,0x00,0x62,0x22,0x01,
-    /* 51: Synth Strings 2 */
-    0x01, 0x21,0x1A,0x62,0x32,0x02, 0x21,0x00,0x52,0x22,0x02,
-    /* 52: Choir Aahs */
-    0x01, 0x21,0x1C,0x62,0x43,0x00, 0x21,0x00,0x52,0x33,0x00,
-    /* 53: Voice Oohs */
-    0x01, 0x21,0x1E,0x62,0x43,0x01, 0x21,0x00,0x52,0x33,0x01,
-    /* 54: Synth Choir */
-    0x01, 0x21,0x1C,0x62,0x43,0x02, 0x21,0x00,0x52,0x33,0x02,
-    /* 55: Orchestra Hit */
-    0x04, 0x01,0x00,0xFF,0x75,0x00, 0x01,0x00,0xFA,0x73,0x00,
-
-    /* 56: Trumpet */
-    0x04, 0x21,0x18,0xF5,0x55,0x00, 0x21,0x00,0xF2,0x52,0x00,
-    /* 57: Trombone */
-    0x04, 0x21,0x1C,0xF4,0x55,0x00, 0x21,0x00,0xF1,0x52,0x00,
-    /* 58: Tuba */
-    0x04, 0x21,0x20,0xF3,0x56,0x00, 0x21,0x00,0xF0,0x53,0x00,
-    /* 59: Muted Trumpet */
-    0x04, 0x21,0x20,0xF5,0x65,0x00, 0x21,0x00,0xF2,0x62,0x00,
-    /* 60: French Horn */
-    0x02, 0x21,0x1C,0x93,0x44,0x00, 0x21,0x00,0x82,0x33,0x00,
-    /* 61: Brass Section */
-    0x05, 0x21,0x18,0xF4,0x45,0x00, 0x21,0x00,0xF2,0x42,0x00,
-    /* 62: Synth Brass 1 */
-    0x04, 0x22,0x18,0xF4,0x45,0x01, 0x21,0x00,0xF2,0x42,0x01,
-    /* 63: Synth Brass 2 */
-    0x06, 0x22,0x18,0xF4,0x45,0x02, 0x21,0x00,0xF2,0x42,0x02,
-
-    /* 64: Soprano Sax */
-    0x04, 0x21,0x1A,0xA4,0x44,0x00, 0x21,0x00,0x82,0x33,0x00,
-    /* 65: Alto Sax */
-    0x04, 0x21,0x1C,0xA3,0x44,0x00, 0x21,0x00,0x82,0x33,0x00,
-    /* 66: Tenor Sax */
-    0x04, 0x21,0x1E,0xA3,0x44,0x00, 0x21,0x00,0x82,0x33,0x00,
-    /* 67: Baritone Sax */
-    0x04, 0x21,0x20,0xA3,0x44,0x00, 0x21,0x00,0x82,0x33,0x00,
-    /* 68: Oboe */
-    0x04, 0x21,0x1C,0xA5,0x45,0x00, 0x21,0x00,0x92,0x34,0x00,
-    /* 69: English Horn */
-    0x04, 0x21,0x1E,0xA4,0x45,0x00, 0x21,0x00,0x92,0x34,0x00,
-    /* 70: Bassoon */
-    0x04, 0x21,0x20,0xA3,0x46,0x00, 0x21,0x00,0x92,0x35,0x00,
-    /* 71: Clarinet */
-    0x04, 0x21,0x1A,0xA5,0x44,0x02, 0x21,0x00,0x92,0x33,0x02,
-
-    /* 72: Piccolo */
-    0x04, 0x24,0x1C,0xB5,0x44,0x00, 0x21,0x00,0xA2,0x33,0x00,
-    /* 73: Flute */
-    0x04, 0x21,0x1C,0xA5,0x44,0x00, 0x21,0x00,0xA2,0x33,0x00,
-    /* 74: Recorder */
-    0x04, 0x22,0x1E,0xA5,0x44,0x00, 0x21,0x00,0xA2,0x33,0x00,
-    /* 75: Pan Flute */
-    0x02, 0x21,0x1E,0xA4,0x44,0x01, 0x21,0x00,0xA2,0x33,0x01,
-    /* 76: Blown Bottle */
-    0x02, 0x21,0x20,0x94,0x44,0x00, 0x21,0x00,0x92,0x33,0x00,
-    /* 77: Shakuhachi */
-    0x04, 0x21,0x20,0xA5,0x44,0x00, 0x21,0x00,0xA2,0x33,0x00,
-    /* 78: Whistle */
-    0x00, 0x21,0x1C,0x70,0x33,0x01, 0x21,0x00,0x60,0x23,0x01,
-    /* 79: Ocarina */
-    0x00, 0x21,0x1E,0x80,0x33,0x01, 0x21,0x00,0x70,0x23,0x01,
-
-    /* 80: Square Lead */
-    0x02, 0x22,0x1E,0xF3,0x45,0x01, 0x21,0x00,0xF2,0x44,0x01,
-    /* 81: Sawtooth Lead */
-    0x02, 0x22,0x1C,0xF3,0x45,0x02, 0x21,0x00,0xF2,0x44,0x02,
-    /* 82: Calliope Lead */
-    0x00, 0x21,0x1C,0x80,0x34,0x01, 0x21,0x00,0x70,0x24,0x01,
-    /* 83: Chiff Lead */
-    0x04, 0x22,0x1C,0xF5,0x56,0x01, 0x21,0x00,0xF2,0x44,0x01,
-    /* 84: Charang Lead */
-    0x06, 0x22,0x18,0xF4,0x45,0x02, 0x21,0x00,0xF2,0x44,0x02,
-    /* 85: Voice Lead */
-    0x01, 0x21,0x1C,0x72,0x44,0x00, 0x21,0x00,0x62,0x34,0x00,
-    /* 86: Fifths Lead */
-    0x01, 0x22,0x1C,0xF3,0x45,0x00, 0x21,0x00,0xF2,0x44,0x00,
-    /* 87: Bass+Lead */
-    0x04, 0x21,0x14,0xF4,0x55,0x01, 0x21,0x00,0xF2,0x53,0x01,
-
-    /* 88: New Age Pad */
-    0x01, 0x21,0x18,0x52,0x22,0x01, 0x21,0x00,0x42,0x12,0x01,
-    /* 89: Warm Pad */
-    0x01, 0x21,0x1A,0x52,0x22,0x00, 0x21,0x00,0x42,0x12,0x00,
-    /* 90: Polysynth Pad */
-    0x01, 0x21,0x18,0x62,0x32,0x02, 0x21,0x00,0x52,0x22,0x02,
-    /* 91: Choir Pad */
-    0x01, 0x21,0x1C,0x52,0x33,0x00, 0x21,0x00,0x42,0x23,0x00,
-    /* 92: Bowed Pad */
-    0x01, 0x21,0x1A,0x62,0x33,0x01, 0x21,0x00,0x52,0x23,0x01,
-    /* 93: Metallic Pad */
-    0x01, 0x24,0x18,0x62,0x33,0x03, 0x21,0x00,0x52,0x23,0x03,
-    /* 94: Halo Pad */
-    0x01, 0x21,0x1C,0x52,0x23,0x01, 0x21,0x00,0x42,0x13,0x01,
-    /* 95: Sweep Pad */
-    0x01, 0x22,0x1A,0x52,0x23,0x02, 0x21,0x00,0x42,0x13,0x02,
-
-    /* 96: Rain (FX) */
-    0x04, 0x05,0x22,0xF5,0x76,0x03, 0x01,0x00,0xF2,0x75,0x03,
-    /* 97: Soundtrack (FX) */
-    0x01, 0x21,0x18,0x52,0x23,0x00, 0x21,0x00,0x42,0x13,0x00,
-    /* 98: Crystal (FX) */
-    0x06, 0x05,0x20,0xF6,0x67,0x01, 0x01,0x00,0xF3,0x76,0x01,
-    /* 99: Atmosphere (FX) */
-    0x01, 0x21,0x1A,0x42,0x13,0x01, 0x21,0x00,0x32,0x03,0x01,
-    /* 100: Brightness (FX) */
-    0x01, 0x24,0x1C,0x62,0x23,0x01, 0x21,0x00,0x52,0x13,0x01,
-    /* 101: Goblins (FX) */
-    0x04, 0x22,0x1A,0x62,0x34,0x03, 0x21,0x00,0x52,0x24,0x03,
-    /* 102: Echoes (FX) */
-    0x01, 0x21,0x1C,0x52,0x24,0x01, 0x21,0x00,0x42,0x14,0x01,
-    /* 103: Sci-Fi (FX) */
-    0x06, 0x24,0x18,0x72,0x35,0x03, 0x21,0x00,0x62,0x25,0x03,
-
-    /* 104: Sitar */
-    0x02, 0x01,0x14,0xF6,0x76,0x00, 0x01,0x00,0xF4,0x75,0x00,
-    /* 105: Banjo */
-    0x30, 0x01,0x12,0xFF,0x89,0x00, 0x01,0x00,0xFF,0x89,0x00,
-    /* 106: Shamisen */
-    0x04, 0x01,0x14,0xFA,0x8A,0x00, 0x01,0x00,0xF8,0x89,0x00,
-    /* 107: Koto */
-    0x02, 0x01,0x16,0xF5,0x76,0x00, 0x01,0x00,0xF3,0x75,0x00,
-    /* 108: Kalimba */
-    0x04, 0x04,0x1C,0xFA,0x89,0x00, 0x01,0x00,0xF8,0x88,0x00,
-    /* 109: Bag Pipe */
-    0x01, 0x21,0x14,0x50,0x10,0x00, 0x21,0x00,0x50,0x10,0x00,
-    /* 110: Fiddle */
-    0x00, 0x21,0x1A,0x82,0x42,0x00, 0x21,0x00,0x72,0x32,0x00,
-    /* 111: Shanai */
-    0x06, 0x21,0x1A,0xA5,0x45,0x00, 0x21,0x00,0x92,0x34,0x00,
-
-    /* 112: Tinkle Bell */
-    0x04, 0x05,0x22,0xFF,0x7A,0x00, 0x01,0x00,0xFF,0x79,0x00,
-    /* 113: Agogo */
-    0x04, 0x04,0x1C,0xFA,0x8A,0x00, 0x01,0x00,0xF8,0x89,0x00,
-    /* 114: Steel Drums */
-    0x06, 0x02,0x18,0xF5,0x76,0x01, 0x01,0x00,0xF3,0x75,0x01,
-    /* 115: Woodblock */
-    0x00, 0x05,0x00,0xFF,0x8F,0x00, 0x01,0x00,0xFF,0x8F,0x00,
-    /* 116: Taiko Drum */
-    0x00, 0x01,0x00,0xF5,0x85,0x00, 0x01,0x00,0xF3,0x83,0x00,
-    /* 117: Melodic Tom */
-    0x00, 0x01,0x00,0xF6,0x86,0x00, 0x01,0x00,0xF4,0x84,0x00,
-    /* 118: Synth Drum */
-    0x00, 0x02,0x00,0xF8,0x87,0x01, 0x01,0x00,0xF5,0x85,0x01,
-    /* 119: Reverse Cymbal */
-    0x00, 0x05,0x00,0x0F,0xF0,0x03, 0x01,0x00,0x0E,0xF0,0x03,
-
-    /* 120: Guitar Fret Noise */
-    0x00, 0x05,0x00,0xFF,0xAF,0x00, 0x01,0x00,0xFF,0xAF,0x00,
-    /* 121: Breath Noise */
-    0x00, 0x05,0x00,0xC8,0x9A,0x00, 0x01,0x00,0xC6,0x99,0x00,
-    /* 122: Seashore */
-    0x00, 0x05,0x00,0x08,0xF0,0x03, 0x05,0x00,0x06,0xF0,0x03,
-    /* 123: Bird Tweet */
-    0x04, 0x0C,0x20,0xF8,0x89,0x01, 0x01,0x00,0xF6,0x88,0x01,
-    /* 124: Telephone Ring */
-    0x04, 0x0C,0x1C,0xFF,0x7F,0x01, 0x01,0x00,0xFF,0x7F,0x01,
-    /* 125: Helicopter */
-    0x00, 0x05,0x00,0x3F,0xF0,0x03, 0x05,0x00,0x3E,0xF0,0x03,
-    /* 126: Applause */
-    0x00, 0x05,0x00,0x08,0xF0,0x03, 0x05,0x00,0x07,0xF0,0x03,
-    /* 127: Gunshot */
-    0x00, 0x01,0x00,0xFF,0xFF,0x00, 0x01,0x00,0xFF,0xFF,0x00,
-
-    /* ---- Percussion instruments (GM drum map: notes 35-81) ---- */
-
-    /* 128/35: Acoustic Bass Drum */
-    0x00, 0x01,0x00,0xF8,0x85,0x00, 0x01,0x00,0xF5,0x83,0x00,
-    /* 129/36: Bass Drum 1 */
-    0x00, 0x01,0x00,0xFA,0x85,0x00, 0x01,0x00,0xF7,0x83,0x00,
-    /* 130/37: Side Stick */
-    0x00, 0x05,0x00,0xFF,0xAF,0x00, 0x01,0x00,0xFF,0xAF,0x00,
-    /* 131/38: Acoustic Snare */
-    0x00, 0x05,0x00,0xFF,0x8F,0x00, 0x01,0x00,0xFF,0x8F,0x00,
-    /* 132/39: Hand Clap */
-    0x00, 0x05,0x00,0xFF,0x9F,0x00, 0x01,0x00,0xFE,0x9F,0x00,
-    /* 133/40: Electric Snare */
-    0x00, 0x05,0x00,0xFF,0x8F,0x01, 0x01,0x00,0xFF,0x8F,0x01,
-    /* 134/41: Low Floor Tom */
-    0x00, 0x01,0x00,0xF7,0x86,0x00, 0x01,0x00,0xF5,0x84,0x00,
-    /* 135/42: Closed Hi-Hat */
-    0x00, 0x05,0x00,0xFF,0xCF,0x00, 0x01,0x00,0xFF,0xCF,0x00,
-    /* 136/43: High Floor Tom */
-    0x00, 0x01,0x00,0xF7,0x86,0x00, 0x01,0x00,0xF5,0x84,0x00,
-    /* 137/44: Pedal Hi-Hat */
-    0x00, 0x05,0x00,0xFF,0xBF,0x00, 0x01,0x00,0xFF,0xBF,0x00,
-    /* 138/45: Low Tom */
-    0x00, 0x01,0x00,0xF6,0x86,0x00, 0x01,0x00,0xF4,0x84,0x00,
-    /* 139/46: Open Hi-Hat */
-    0x00, 0x05,0x00,0xFF,0x9F,0x03, 0x01,0x00,0xFF,0x9F,0x03,
-    /* 140/47: Low-Mid Tom */
-    0x00, 0x01,0x00,0xF6,0x86,0x00, 0x01,0x00,0xF4,0x84,0x00,
-    /* 141/48: Hi-Mid Tom */
-    0x00, 0x01,0x00,0xF7,0x87,0x00, 0x01,0x00,0xF5,0x85,0x00,
-    /* 142/49: Crash Cymbal 1 */
-    0x00, 0x05,0x00,0xF5,0x7A,0x03, 0x01,0x00,0xF3,0x79,0x03,
-    /* 143/50: High Tom */
-    0x00, 0x01,0x00,0xF8,0x87,0x00, 0x01,0x00,0xF6,0x85,0x00,
-    /* 144/51: Ride Cymbal 1 */
-    0x00, 0x05,0x00,0xF8,0x8A,0x03, 0x01,0x00,0xF6,0x89,0x03,
-    /* 145/52: Chinese Cymbal */
-    0x00, 0x05,0x00,0xF4,0x7A,0x03, 0x01,0x00,0xF2,0x79,0x03,
-    /* 146/53: Ride Bell */
-    0x04, 0x05,0x18,0xFF,0x8A,0x00, 0x01,0x00,0xFE,0x89,0x00,
-    /* 147/54: Tambourine */
-    0x00, 0x05,0x00,0xFF,0xAF,0x03, 0x01,0x00,0xFE,0xAF,0x03,
-    /* 148/55: Splash Cymbal */
-    0x00, 0x05,0x00,0xF6,0x8A,0x03, 0x01,0x00,0xF4,0x89,0x03,
-    /* 149/56: Cowbell */
-    0x04, 0x05,0x18,0xFF,0xAF,0x00, 0x01,0x00,0xFF,0xAF,0x00,
-    /* 150/57: Crash Cymbal 2 */
-    0x00, 0x05,0x00,0xF5,0x7A,0x03, 0x01,0x00,0xF3,0x79,0x03,
-    /* 151/58: Vibraslap */
-    0x00, 0x05,0x00,0xFA,0xBF,0x03, 0x01,0x00,0xF8,0xBE,0x03,
-    /* 152/59: Ride Cymbal 2 */
-    0x00, 0x05,0x00,0xF8,0x8A,0x03, 0x01,0x00,0xF6,0x89,0x03,
-    /* 153/60: Hi Bongo */
-    0x00, 0x01,0x00,0xFA,0x9A,0x00, 0x01,0x00,0xF8,0x99,0x00,
-    /* 154/61: Low Bongo */
-    0x00, 0x01,0x00,0xF8,0x9A,0x00, 0x01,0x00,0xF6,0x99,0x00,
-    /* 155/62: Mute Hi Conga */
-    0x00, 0x01,0x00,0xFA,0xAA,0x00, 0x01,0x00,0xF8,0xA9,0x00,
-    /* 156/63: Open Hi Conga */
-    0x00, 0x01,0x00,0xF8,0x9A,0x00, 0x01,0x00,0xF6,0x98,0x00,
-    /* 157/64: Low Conga */
-    0x00, 0x01,0x00,0xF6,0x9A,0x00, 0x01,0x00,0xF4,0x99,0x00,
-    /* 158/65: High Timbale */
-    0x00, 0x01,0x00,0xFF,0x9A,0x00, 0x01,0x00,0xFD,0x99,0x00,
-    /* 159/66: Low Timbale */
-    0x00, 0x01,0x00,0xFD,0x9A,0x00, 0x01,0x00,0xFB,0x99,0x00,
-    /* 160/67: High Agogo */
-    0x04, 0x04,0x1C,0xFF,0x9A,0x00, 0x01,0x00,0xFE,0x99,0x00,
-    /* 161/68: Low Agogo */
-    0x04, 0x04,0x1E,0xFF,0x9A,0x00, 0x01,0x00,0xFE,0x99,0x00,
-    /* 162/69: Cabasa */
-    0x00, 0x05,0x00,0xFF,0xCF,0x03, 0x01,0x00,0xFF,0xCE,0x03,
-    /* 163/70: Maracas */
-    0x00, 0x05,0x00,0xFF,0xDF,0x03, 0x01,0x00,0xFF,0xDE,0x03,
-    /* 164/71: Short Whistle */
-    0x00, 0x04,0x1C,0xFA,0x9A,0x01, 0x01,0x00,0xF8,0x99,0x01,
-    /* 165/72: Long Whistle */
-    0x00, 0x04,0x1C,0xF5,0x76,0x01, 0x01,0x00,0xF3,0x75,0x01,
-    /* 166/73: Short Guiro */
-    0x00, 0x05,0x00,0xFA,0xBF,0x03, 0x01,0x00,0xF9,0xBE,0x03,
-    /* 167/74: Long Guiro */
-    0x00, 0x05,0x00,0xF5,0x9F,0x03, 0x01,0x00,0xF4,0x9E,0x03,
-    /* 168/75: Claves */
-    0x00, 0x05,0x00,0xFF,0xDF,0x00, 0x01,0x00,0xFF,0xDF,0x00,
-    /* 169/76: Hi Wood Block */
-    0x00, 0x05,0x00,0xFF,0xCF,0x00, 0x01,0x00,0xFF,0xCE,0x00,
-    /* 170/77: Low Wood Block */
-    0x00, 0x05,0x00,0xFF,0xBF,0x00, 0x01,0x00,0xFF,0xBE,0x00,
-    /* 171/78: Mute Cuica */
-    0x04, 0x02,0x1E,0xFA,0xAA,0x01, 0x01,0x00,0xF8,0xA9,0x01,
-    /* 172/79: Open Cuica */
-    0x04, 0x02,0x1E,0xF5,0x8A,0x01, 0x01,0x00,0xF3,0x89,0x01,
-    /* 173/80: Mute Triangle */
-    0x00, 0x05,0x22,0xFF,0xDF,0x00, 0x01,0x00,0xFF,0xDE,0x00,
-    /* 174/81: Open Triangle */
-    0x00, 0x05,0x22,0xFF,0x9F,0x00, 0x01,0x00,0xFF,0x9E,0x00,
-};
-
-/* ======================================================================
- * OPL3 register mapping for 18 two-operator channels
- *
- * Channels 0-8:  bank 0 (registers 0x00-0xFF)
- * Channels 9-17: bank 1 (registers 0x100-0x1FF)
- * ====================================================================== */
-
-#define OPL_CHANNELS 18
-
-/* Operator register offsets within a bank */
-static const uint8_t op_mod[9] = { 0, 1, 2, 8, 9, 10, 16, 17, 18 };
-static const uint8_t op_car[9] = { 3, 4, 5, 11, 12, 13, 19, 20, 21 };
-
-/* Bank base: 0x000 for channels 0-8, 0x100 for channels 9-17 */
-static uint16_t bank_base(int ch) { return (ch >= 9) ? 0x100 : 0x000; }
-static int      ch_local(int ch)  { return (ch >= 9) ? (ch - 9) : ch; }
-
-/* Write to a per-channel register */
-static void opl_ch_write(int ch, uint16_t base_reg, uint8_t val) {
-    of_audio_opl_write(bank_base(ch) + base_reg + ch_local(ch), val);
-}
-
-/* Write to a per-operator register */
-static void opl_op_write(int ch, int is_carrier, uint16_t base_reg, uint8_t val) {
-    int lch = ch_local(ch);
-    uint8_t off = is_carrier ? op_car[lch] : op_mod[lch];
-    of_audio_opl_write(bank_base(ch) + base_reg + off, val);
-}
-
-/* F-Numbers for one octave (C4..B4) at block 4.
- * F = note_freq * 2^16 / 49716 (standard OPL3 sample rate). */
-static const uint16_t fnums[12] = {
-    345, 365, 387, 410, 435, 460,  /* C, C#, D, D#, E, F */
-    488, 517, 548, 580, 615, 651   /* F#, G, G#, A, A#, B */
-};
-
-/* ======================================================================
- * MIDI engine state
- * ====================================================================== */
+/* ========================================================================
+ * Playback state
+ * ======================================================================== */
 
 #define MIDI_MAX_TRACKS 32
 
@@ -447,7 +32,10 @@ typedef struct {
     int      done;
 } midi_track_t;
 
-static struct {
+/* Pinned to BRAM (OF_FASTDATA): the timer ISR updates this struct every
+ * tick (track cursors, tick_accum_us, channel state).  ISR SDRAM stores
+ * race with GPU/bridge bus traffic — BRAM breaks the race. */
+static OF_FASTDATA struct {
     int inited;
     int playing;
     int paused;
@@ -461,34 +49,27 @@ static struct {
     uint16_t division;
 
     uint32_t us_per_beat;
+    uint32_t last_pump_us;
+    uint32_t tick_accum_us;   /* accumulates until >= 1000 µs → one voice tick (matches of_smp_tables.c 1 kHz envelope rate) */
 
     midi_track_t tracks[MIDI_MAX_TRACKS];
 
-    uint32_t last_pump_us;
+    /* Per-MIDI-channel controller state */
+    uint8_t program[16];
+    uint8_t volume[16];      /* CC7 */
+    uint8_t expression[16];  /* CC11 */
+    uint8_t pan[16];         /* CC10 */
+    uint8_t sustain[16];     /* CC64 */
+    uint8_t mod_wheel[16];   /* CC1 */
+    uint8_t brightness[16];  /* CC74 */
+    uint8_t resonance[16];   /* CC71 */
 
-    /* Per-MIDI-channel state */
-    uint8_t ch_program[16];
-    uint8_t ch_volume[16];
-    uint8_t ch_pan[16];
-    int16_t ch_bend[16];
-
-    /* Per-OPL-channel state */
-    struct {
-        int8_t  note;
-        int8_t  midi_ch;
-        int8_t  velocity;
-        uint32_t age;
-    } opl[OPL_CHANNELS];
-    const uint8_t *opl_inst[OPL_CHANNELS]; /* loaded instrument pointer */
-
-    uint32_t age_counter;
     int master_volume;
-    const uint8_t *bank;
 } M;
 
-/* ======================================================================
- * Helpers
- * ====================================================================== */
+/* ========================================================================
+ * SMF byte helpers
+ * ======================================================================== */
 
 static uint16_t rd16(const uint8_t *p) {
     return ((uint16_t)p[0] << 8) | p[1];
@@ -496,241 +77,111 @@ static uint16_t rd16(const uint8_t *p) {
 
 static uint32_t rd32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8) | p[3];
+           ((uint32_t)p[2] <<  8) |  (uint32_t)p[3];
 }
 
 static uint32_t read_var(midi_track_t *t) {
     uint32_t val = 0;
     const uint8_t *d = t->data;
-    while (t->pos < t->len) {
+    for (int i = 0; i < 4 && t->pos < t->len; i++) {
         uint8_t b = d[t->pos++];
         val = (val << 7) | (b & 0x7F);
-        if (!(b & 0x80)) break;
+        if (!(b & 0x80)) return val;
     }
     return val;
 }
 
-static const uint8_t *get_instrument(int program) {
-    const uint8_t *b = M.bank ? M.bank : gm_bank;
-    return b + program * OF_MIDI_INST_SIZE;
-}
+/* ========================================================================
+ * Channel-state reset
+ * ======================================================================== */
 
-static const uint8_t *get_drum(int note) {
-    if (note < 35 || note > 81) note = 38; /* default to snare */
-    const uint8_t *b = M.bank ? M.bank : gm_bank;
-    return b + (128 + (note - 35)) * OF_MIDI_INST_SIZE;
-}
-
-/* ======================================================================
- * OPL3 driver
- * ====================================================================== */
-
-static void load_instrument(int ch, const uint8_t *p) {
-    if (M.opl_inst[ch] == p)
-        return;
-
-    /* Feedback/Connection — OR in L+R output enable (bits 4,5) */
-    opl_ch_write(ch, 0xC0, p[0] | 0x30);
-
-    /* Modulator registers */
-    opl_op_write(ch, 0, 0x20, p[1]);
-    opl_op_write(ch, 0, 0x40, p[2]);
-    opl_op_write(ch, 0, 0x60, p[3]);
-    opl_op_write(ch, 0, 0x80, p[4]);
-    opl_op_write(ch, 0, 0xE0, p[5]);
-
-    /* Carrier registers (TL will be overridden by velocity) */
-    opl_op_write(ch, 1, 0x20, p[6]);
-    opl_op_write(ch, 1, 0x60, p[8]);
-    opl_op_write(ch, 1, 0x80, p[9]);
-    opl_op_write(ch, 1, 0xE0, p[10]);
-
-    M.opl_inst[ch] = p;
-}
-
-/* Compute carrier TL with velocity, channel volume, and master volume */
-static uint8_t scaled_tl(const uint8_t *inst, int velocity, int ch_vol) {
-    int base_tl = inst[7] & 0x3F;
-    /* Combined level: 0..127 */
-    int level = (velocity * ch_vol) / 127;
-    level = (level * M.master_volume) / 255;
-    /* Attenuation: 0 at max level, 63 at zero level (full OPL3 range).
-     * Hardware mix in audio_output.v scales OPL 5x relative to PCM. */
-    int atten = 63 - (level * 55 / 127); //bajado de 63 a 50, ya que hay excesiva atenuación
-    int tl = base_tl + atten;
-    if (tl > 63) tl = 63;
-    return (uint8_t)((inst[7] & 0xC0) | tl);
-}
-
-/* Apply pan (CC10) to OPL3 connection register L/R bits */
-static void apply_pan(int ch, int midi_ch) {
-    const uint8_t *p = M.opl_inst[ch];
-    if (!p) return;
-    uint8_t fb_cnt = p[0] & 0x0F;
-    int pan = M.ch_pan[midi_ch];
-    uint8_t lr;
-    if (pan < 43)       lr = 0x10; /* left only */
-    else if (pan > 84)  lr = 0x20; /* right only */
-    else                lr = 0x30; /* both */
-    opl_ch_write(ch, 0xC0, fb_cnt | lr);
-}
-
-static void note_to_freq(int note, int16_t bend, uint8_t *flo, uint8_t *fhi_blk) {
-    if (note < 0) note = 0;
-    if (note > 127) note = 127;
-
-    int oct = note / 12;
-    int semi = note % 12;
-    int block = oct - 1;
-    if (block < 0) block = 0;
-    if (block > 7) block = 7;
-
-    uint32_t fnum = fnums[semi];
-
-    /* Apply pitch bend: ±2 semitones.
-     * Linear approximation: factor = 1024 + bend * 125 / 8192 */
-    if (bend != 0) {
-        int factor = 1024 + (int32_t)bend * 125 / 8192;
-        fnum = fnum * (uint32_t)factor / 1024;
-        /* Handle overflow into next block */
-        while (fnum > 1023 && block < 7) {
-            fnum >>= 1;
-            block++;
-        }
-        if (fnum > 1023) fnum = 1023;
+static void reset_channels(void) {
+    for (int i = 0; i < 16; i++) {
+        M.program[i]    = 0;
+        M.volume[i]     = 100;
+        M.expression[i] = 127;
+        M.pan[i]        = 64;
+        M.sustain[i]    = 0;
+        M.mod_wheel[i]  = 0;
+        M.brightness[i] = 64;
+        M.resonance[i]  = 64;
     }
-
-    *flo = fnum & 0xFF;
-    *fhi_blk = (uint8_t)((block << 2) | ((fnum >> 8) & 0x03));
+    M.us_per_beat = 500000;  /* 120 BPM */
 }
 
-static int alloc_channel(int midi_ch) {
-    const uint8_t *inst;
-    if (midi_ch == 9)
-        inst = NULL; /* percussion — different instrument per note */
-    else
-        inst = get_instrument(M.ch_program[midi_ch]);
+/* ========================================================================
+ * Event dispatch — MIDI → voice engine
+ * ======================================================================== */
 
-    /* Prefer channel already assigned to this MIDI channel and released */
-    for (int i = 0; i < OPL_CHANNELS; i++) {
-        if (M.opl[i].midi_ch == midi_ch && M.opl[i].note < 0)
-            return i;
-    }
-    /* Free channel with same instrument */
-    int best_free = -1;
-    for (int i = 0; i < OPL_CHANNELS; i++) {
-        if (M.opl[i].note < 0) {
-            if (inst && M.opl_inst[i] == inst)
-                return i;
-            if (best_free < 0)
-                best_free = i;
-        }
-    }
-    if (best_free >= 0)
-        return best_free;
-
-    /* Steal oldest released channel, then oldest active */
-    int steal = 0;
-    uint32_t steal_age = M.opl[0].age;
-    int steal_released = (M.opl[0].note < 0);
-    for (int i = 1; i < OPL_CHANNELS; i++) {
-        int released = (M.opl[i].note < 0);
-        if (released > steal_released ||
-            (released == steal_released && M.opl[i].age < steal_age)) {
-            steal = i;
-            steal_age = M.opl[i].age;
-            steal_released = released;
-        }
-    }
-    /* KEY-OFF stolen channel */
-    opl_ch_write(steal, 0xB0, 0x00);
-    M.opl[steal].note = -1;
-    return steal;
+static void note_on(int ch, int note, int vel) {
+    const ofsf_zone_t *zones[4];
+    int bank_idx = (ch == 9) ? 128 : 0;
+    int n = of_smp_zone_lookup(bank_idx, M.program[ch], note, vel, zones, 4);
+    const void *sbase = of_smp_bank_sample_base();
+    for (int i = 0; i < n; i++)
+        smp_voice_note_on(zones[i], ch, note, vel, sbase);
 }
 
-static void opl_note_on(int midi_ch, int note, int vel) {
-    int ch = alloc_channel(midi_ch);
-    const uint8_t *inst;
-    if (midi_ch == 9)
-        inst = get_drum(note);
-    else
-        inst = get_instrument(M.ch_program[midi_ch]);
-
-    load_instrument(ch, inst);
-    apply_pan(ch, midi_ch);
-
-    /* Set carrier TL with velocity scaling */
-    opl_op_write(ch, 1, 0x40, scaled_tl(inst, vel, M.ch_volume[midi_ch]));
-
-    M.opl[ch].note = (int8_t)note;
-    M.opl[ch].midi_ch = (int8_t)midi_ch;
-    M.opl[ch].velocity = (int8_t)vel;
-    M.opl[ch].age = M.age_counter++;
-
-    uint8_t flo, fhi_blk;
-    int play_note = (midi_ch == 9) ? 60 : note; /* drums at fixed pitch */
-    note_to_freq(play_note, M.ch_bend[midi_ch], &flo, &fhi_blk);
-
-    /* KEY-OFF, set frequency, KEY-ON */
-    opl_ch_write(ch, 0xB0, fhi_blk);
-    opl_ch_write(ch, 0xA0, flo);
-    opl_ch_write(ch, 0xB0, 0x20 | fhi_blk);
-}
-
-static void opl_note_off(int midi_ch, int note) {
-    for (int i = 0; i < OPL_CHANNELS; i++) {
-        if (M.opl[i].midi_ch == midi_ch && M.opl[i].note == note) {
-            uint8_t flo, fhi_blk;
-            int play_note = (midi_ch == 9) ? 60 : note;
-            note_to_freq(play_note, M.ch_bend[midi_ch], &flo, &fhi_blk);
-            opl_ch_write(i, 0xB0, fhi_blk); /* KEY-ON=0 */
-            M.opl[i].note = -1;
-            M.opl[i].age = M.age_counter++;
-            return;
-        }
+static void control_change(int ch, int cc, int val) {
+    switch (cc) {
+    case 1:  /* Mod wheel */
+        M.mod_wheel[ch] = (uint8_t)val;
+        smp_voice_update_mod(ch, val);
+        break;
+    case 7:  /* Channel volume */
+        M.volume[ch] = (uint8_t)val;
+        smp_voice_update_volume(ch, val, M.expression[ch]);
+        break;
+    case 10: /* Pan */
+        M.pan[ch] = (uint8_t)val;
+        smp_voice_update_pan(ch, val);
+        break;
+    case 11: /* Expression */
+        M.expression[ch] = (uint8_t)val;
+        smp_voice_update_volume(ch, M.volume[ch], val);
+        break;
+    case 64: /* Sustain pedal */
+        M.sustain[ch] = (uint8_t)val;
+        smp_voice_update_sustain(ch, val >= 64);
+        break;
+    case 71: /* Resonance */
+        M.resonance[ch] = (uint8_t)val;
+        smp_voice_update_filter(ch, M.brightness[ch], val);
+        break;
+    case 74: /* Brightness */
+        M.brightness[ch] = (uint8_t)val;
+        smp_voice_update_filter(ch, val, M.resonance[ch]);
+        break;
+    case 91: /* Reverb send (CC91) */
+        smp_voice_update_reverb_send(ch, val);
+        break;
+    case 93: /* Chorus send (CC93) */
+        smp_voice_update_chorus_send(ch, val);
+        break;
+    case 120: /* All Sound Off */
+    case 123: /* All Notes Off */
+        smp_voice_all_off(ch);
+        break;
+    case 121: /* Reset All Controllers */
+        M.expression[ch] = 127;
+        M.sustain[ch]    = 0;
+        M.mod_wheel[ch]  = 0;
+        M.brightness[ch] = 64;
+        M.resonance[ch]  = 64;
+        smp_voice_update_sustain(ch, 0);
+        break;
     }
 }
 
-static void all_notes_off(void) {
-    for (int i = 0; i < OPL_CHANNELS; i++) {
-        opl_ch_write(i, 0xB0, 0x00);
-        M.opl[i].note = -1;
-        M.opl[i].midi_ch = -1;
-        M.opl[i].velocity = 0;
-        M.opl_inst[i] = 0;
-    }
+/* ========================================================================
+ * SMF track processor
+ * ======================================================================== */
+
+static inline int trk_need(midi_track_t *t, uint32_t n) {
+    if (t->pos + n > t->len) { t->done = 1; return 0; }
+    return 1;
 }
 
-/* Update carrier TL for all notes on a MIDI channel (volume/master change) */
-static void update_channel_volume(int midi_ch) {
-    for (int i = 0; i < OPL_CHANNELS; i++) {
-        if (M.opl[i].midi_ch == midi_ch && M.opl[i].note >= 0) {
-            const uint8_t *inst = M.opl_inst[i];
-            if (inst)
-                opl_op_write(i, 1, 0x40,
-                    scaled_tl(inst, M.opl[i].velocity, M.ch_volume[midi_ch]));
-        }
-    }
-}
-
-/* Update pitch for all notes on a MIDI channel (pitch bend change) */
-static void update_channel_pitch(int midi_ch) {
-    for (int i = 0; i < OPL_CHANNELS; i++) {
-        if (M.opl[i].midi_ch == midi_ch && M.opl[i].note >= 0) {
-            int play_note = (midi_ch == 9) ? 60 : M.opl[i].note;
-            uint8_t flo, fhi_blk;
-            note_to_freq(play_note, M.ch_bend[midi_ch], &flo, &fhi_blk);
-            opl_ch_write(i, 0xA0, flo);
-            opl_ch_write(i, 0xB0, 0x20 | fhi_blk); /* keep KEY-ON */
-        }
-    }
-}
-
-/* ======================================================================
- * MIDI event processing
- * ====================================================================== */
-
-/* Process one event from a track. Returns 0 if track ended. */
 static int process_event(midi_track_t *t) {
     if (t->done || t->pos >= t->len)
         return 0;
@@ -738,6 +189,7 @@ static int process_event(midi_track_t *t) {
     uint8_t status = t->data[t->pos];
     if (status < 0x80) {
         status = t->running;
+        if (status == 0) { t->done = 1; return 0; }
     } else {
         t->pos++;
         if (status < 0xF0)
@@ -749,11 +201,11 @@ static int process_event(midi_track_t *t) {
 
     if (status == 0xFF) {
         /* Meta event */
+        if (!trk_need(t, 1)) return 0;
         uint8_t meta = t->data[t->pos++];
         uint32_t mlen = read_var(t);
-
+        if (mlen > t->len - t->pos) { t->done = 1; return 0; }
         if (meta == 0x51 && mlen == 3) {
-            /* Tempo change */
             M.us_per_beat = ((uint32_t)t->data[t->pos] << 16) |
                             ((uint32_t)t->data[t->pos+1] << 8) |
                             t->data[t->pos+2];
@@ -764,74 +216,59 @@ static int process_event(midi_track_t *t) {
     } else if (status >= 0xF0 && status <= 0xF7) {
         /* SysEx */
         uint32_t slen = read_var(t);
+        if (slen > t->len - t->pos) { t->done = 1; return 0; }
         t->pos += slen;
     } else if (cmd == 0x90) {
+        if (!trk_need(t, 2)) return 0;
         uint8_t note = t->data[t->pos++];
         uint8_t vel  = t->data[t->pos++];
-        if (vel > 0)
-            opl_note_on(ch, note, vel);
-        else
-            opl_note_off(ch, note);
+        if (vel > 0) note_on(ch, note, vel);
+        else         smp_voice_note_off(ch, note);
     } else if (cmd == 0x80) {
+        if (!trk_need(t, 2)) return 0;
         uint8_t note = t->data[t->pos++];
-        t->pos++; /* skip release velocity */
-        opl_note_off(ch, note);
+        t->pos++;
+        smp_voice_note_off(ch, note);
     } else if (cmd == 0xC0) {
-        M.ch_program[ch] = t->data[t->pos++];
+        if (!trk_need(t, 1)) return 0;
+        M.program[ch] = t->data[t->pos++];
     } else if (cmd == 0xB0) {
-        /* Control Change */
+        if (!trk_need(t, 2)) return 0;
         uint8_t cc  = t->data[t->pos++];
         uint8_t val = t->data[t->pos++];
-        if (cc == 7) {
-            M.ch_volume[ch] = val;
-            update_channel_volume(ch);
-        } else if (cc == 10) {
-            M.ch_pan[ch] = val;
-            /* Update pan for active notes on this channel */
-            for (int i = 0; i < OPL_CHANNELS; i++)
-                if (M.opl[i].midi_ch == ch)
-                    apply_pan(i, ch);
-        } else if (cc == 123 || cc == 120) {
-            /* All Notes Off / All Sound Off */
-            for (int i = 0; i < OPL_CHANNELS; i++) {
-                if (M.opl[i].midi_ch == ch && M.opl[i].note >= 0) {
-                    opl_ch_write(i, 0xB0, 0x00);
-                    M.opl[i].note = -1;
-                    M.opl[i].age = M.age_counter++;
-                }
-            }
-        }
+        control_change(ch, cc, val);
     } else if (cmd == 0xE0) {
-        /* Pitch Bend */
+        if (!trk_need(t, 2)) return 0;
         uint8_t lsb = t->data[t->pos++];
         uint8_t msb = t->data[t->pos++];
-        M.ch_bend[ch] = (int16_t)(((uint16_t)msb << 7) | lsb) - 8192;
-        update_channel_pitch(ch);
+        int16_t bend = (int16_t)(((uint16_t)msb << 7) | lsb) - 8192;
+        smp_voice_update_bend(ch, bend);
     } else if (cmd == 0xD0) {
-        t->pos += 1; /* channel pressure */
+        if (!trk_need(t, 1)) return 0;
+        t->pos += 1;
     } else if (cmd == 0xA0) {
-        t->pos += 2; /* polyphonic key pressure */
+        if (!trk_need(t, 2)) return 0;
+        t->pos += 2;
     } else {
-        t->pos += 2; /* unknown — skip 2 bytes */
+        if (!trk_need(t, 2)) return 0;
+        t->pos += 2;
     }
 
     return !t->done;
 }
 
-/* Read next delta from track and convert to microseconds */
 static void read_next_delta(midi_track_t *t) {
     if (t->done || t->pos >= t->len) {
         t->done = 1;
         return;
     }
     uint32_t delta = read_var(t);
-    /* Convert ticks to microseconds: us = delta * us_per_beat / division */
     t->pending_us += (int64_t)delta * M.us_per_beat / M.division;
 }
 
-/* ======================================================================
- * MIDI file parsing
- * ====================================================================== */
+/* ========================================================================
+ * SMF header parsing
+ * ======================================================================== */
 
 static int parse_header(void) {
     if (M.len < 14) return OF_MIDI_ERR_BAD_HDR;
@@ -840,31 +277,29 @@ static int parse_header(void) {
         return OF_MIDI_ERR_BAD_HDR;
 
     uint32_t hdr_len = rd32(M.data + 4);
-    M.format = rd16(M.data + 8);
+    M.format     = rd16(M.data + 8);
     M.num_tracks = rd16(M.data + 10);
-    M.division = rd16(M.data + 12);
+    M.division   = rd16(M.data + 12);
 
-    if (M.format > 1) return OF_MIDI_ERR_FORMAT;
+    if (M.format > 1)      return OF_MIDI_ERR_FORMAT;
     if (M.num_tracks == 0) return OF_MIDI_ERR_NO_TRACKS;
     if (M.num_tracks > MIDI_MAX_TRACKS) M.num_tracks = MIDI_MAX_TRACKS;
 
-    /* Parse track chunks */
     uint32_t offset = 8 + hdr_len;
     int found = 0;
     for (int i = 0; i < M.num_tracks && offset + 8 <= M.len; i++) {
         if (M.data[offset] == 'M' && M.data[offset+1] == 'T' &&
             M.data[offset+2] == 'r' && M.data[offset+3] == 'k') {
             uint32_t tlen = rd32(M.data + offset + 4);
-            M.tracks[found].data = M.data + offset + 8;
-            M.tracks[found].len = tlen;
-            M.tracks[found].pos = 0;
+            M.tracks[found].data       = M.data + offset + 8;
+            M.tracks[found].len        = tlen;
+            M.tracks[found].pos        = 0;
             M.tracks[found].pending_us = 0;
-            M.tracks[found].running = 0;
-            M.tracks[found].done = 0;
+            M.tracks[found].running    = 0;
+            M.tracks[found].done       = 0;
             found++;
             offset += 8 + tlen;
         } else {
-            /* Skip unknown chunk */
             uint32_t clen = rd32(M.data + offset + 4);
             offset += 8 + clen;
         }
@@ -878,166 +313,189 @@ static int parse_header(void) {
 
 static void reset_tracks(void) {
     for (int i = 0; i < M.num_tracks; i++) {
-        M.tracks[i].pos = 0;
+        M.tracks[i].pos        = 0;
         M.tracks[i].pending_us = 0;
-        M.tracks[i].running = 0;
-        M.tracks[i].done = 0;
-        /* Read initial delta for each track */
+        M.tracks[i].running    = 0;
+        M.tracks[i].done       = 0;
         read_next_delta(&M.tracks[i]);
     }
 }
 
-static void reset_channels(void) {
-    for (int i = 0; i < 16; i++) {
-        M.ch_program[i] = 0;
-        M.ch_volume[i] = 100;
-        M.ch_pan[i] = 64;
-        M.ch_bend[i] = 0;
-    }
-    M.us_per_beat = 500000; /* 120 BPM */
-    M.age_counter = 0;
-    for (int i = 0; i < OPL_CHANNELS; i++) {
-        M.opl[i].note = -1;
-        M.opl[i].midi_ch = -1;
-        M.opl[i].velocity = 0;
-        M.opl[i].age = 0;
-        M.opl_inst[i] = 0;
-    }
-}
-
-/* ======================================================================
+/* ========================================================================
  * Public API
- * ====================================================================== */
+ * ======================================================================== */
 
 int of_midi_init(void) {
-    of_audio_opl_reset();
-
-    /* Enable OPL3 mode: register 0x105 bit 0 */
-    of_audio_opl_write(0x105, 0x01);
-
-    /* Enable waveform select */
-    of_audio_opl_write(0x01, 0x20);
-
-    M.inited = 1;
-    M.playing = 0;
-    M.paused = 0;
-    M.master_volume = 255;
-    M.bank = 0;
-
+    smp_voice_init();
     reset_channels();
+    M.inited        = 1;
+    M.playing       = 0;
+    M.paused        = 0;
+    M.tick_accum_us = 0;
+    /* Default below full-scale to give the mixer headroom for dense
+     * polyphony.  The HW mixer sums voices into s32 accumulators and
+     * saturates to s16 — at master=255 a 20-28 voice MIDI passage
+     * hard-clips at peaks and sounds like voice "breakup".  128 halves
+     * the per-voice peak so roughly 4× more concurrent voices fit
+     * without clipping.  Apps can raise it with of_midi_set_volume()
+     * if they know polyphony is low. */
+    M.master_volume = 128;
+    smp_voice_set_master_volume(M.master_volume);
     return OF_MIDI_OK;
 }
 
 int of_midi_play(const uint8_t *data, uint32_t len, int loop) {
-    if (!M.inited) return OF_MIDI_ERR_NOT_INIT;
-    if (M.playing)  return OF_MIDI_ERR_PLAYING;
+    if (!M.inited)                      return OF_MIDI_ERR_NOT_INIT;
+    if (M.playing)                      return OF_MIDI_ERR_PLAYING;
+    if (of_smp_bank_get() == NULL)      return OF_MIDI_ERR_NO_BANK;
 
-    M.data = data;
-    M.len = len;
+    M.data    = data;
+    M.len     = len;
     M.looping = loop;
 
     int rc = parse_header();
     if (rc != OF_MIDI_OK) return rc;
 
     reset_channels();
-    all_notes_off();
+    smp_voice_all_off_global();
     reset_tracks();
 
-    M.playing = 1;
-    M.paused = 0;
+    M.playing      = 1;
+    M.paused       = 0;
     M.last_pump_us = of_time_us();
 
+    /* DEBUG: 100 Hz still hangs occasionally (~3 demo loops between
+     * crashes).  Drop to 50 Hz to test whether even fewer trap entries
+     * eliminates the accumulation.  Combined with the 2 ms PUMP_BUDGET_US
+     * cap below, total ISR CPU load is at most 50 × 2 ms = 100 ms/sec
+     * = 10 % CPU. */
+    of_timer_set_callback(of_midi_pump, 50);
     return OF_MIDI_OK;
 }
 
 void of_midi_stop(void) {
-    all_notes_off();
+    /* Detach the ISR before mutating state — otherwise the ISR could
+     * preempt mid-teardown and race on M.playing / voice state. */
+    of_timer_set_callback(NULL, 0);
+    smp_voice_all_off_global();
     M.playing = 0;
-    M.paused = 0;
+    M.paused  = 0;
 }
 
 void of_midi_pause(void) {
-    if (M.playing)
-        M.paused = 1;
+    if (M.playing) M.paused = 1;
 }
 
 void of_midi_resume(void) {
     if (M.paused) {
-        M.paused = 0;
+        M.paused       = 0;
         M.last_pump_us = of_time_us();
     }
 }
 
 void of_midi_pump(void) {
-    if (!M.playing || M.paused)
-        return;
+    if (!M.playing || M.paused) return;
 
-    uint32_t now = of_time_us();
+    /* Called from the machine-timer ISR.  DO NOT use of_time_us() here
+     * — it issues an ECALL which triggers a nested trap, clobbering
+     * mscratch + the existing trap frame and hanging the CPU.  Read
+     * the monotonic timer via the direct service-table pointer
+     * instead; it reads the cycle CSR in-line from M-mode. */
+    uint32_t now = OF_SVC->timer_get_us();
     int64_t elapsed = (int64_t)(now - M.last_pump_us);
     M.last_pump_us = now;
 
-    /* Clamp elapsed to avoid huge jumps (e.g., after a long pause) */
     if (elapsed > 500000) elapsed = 500000;
-    if (elapsed <= 0) return;
 
-    /* Subtract elapsed time from all active tracks */
-    for (int i = 0; i < M.num_tracks; i++) {
-        if (M.tracks[i].done) continue;
-        M.tracks[i].pending_us -= elapsed;
-    }
+    if (elapsed > 0) {
+        M.tick_accum_us += (uint32_t)elapsed;
 
-    /* Process events whose time has arrived.
-     * Safety limit to avoid infinite loops on malformed files. */
-    int safety = 10000;
-    int any_active;
-    do {
-        any_active = 0;
+        /* OVERRUN GUARD.  Cap the ENTIRE pump call (envelope ticks +
+         * MIDI event dispatch below) to PUMP_BUDGET_US of wall-clock
+         * work.  Both loops re-check the budget every iteration; on
+         * overrun we drop unprocessed envelope accumulation AND stop
+         * dispatching MIDI events for this call.  Avoids ISR-monopoly
+         * starvation of the main thread. */
+        const uint32_t PUMP_BUDGET_US = 2000;   /* 2 ms hard cap */
+        uint32_t pump_start_us = OF_SVC->timer_get_us();
+
+        /* of_smp_tables.c bakes envelope rates assuming 1 kHz (1 ms/tick),
+         * so smp_voice_tick MUST fire every 1000 µs.  Half-rate (every
+         * 2 ms) made every attack/decay/release run at 2× duration —
+         * audible as muddy notes that overlap into the next tone.
+         * Doubled the tick budget so a moderate polyphony burst still
+         * stays inside the pump-side wall-clock cap. */
+        int tick_budget = 500;
+        int ticks_fired = 0;
+        int overrun = 0;
+        while (M.tick_accum_us >= 1000 && tick_budget > 0) {
+            smp_voice_tick();
+            M.tick_accum_us -= 1000;
+            tick_budget--;
+            ticks_fired++;
+            if ((OF_SVC->timer_get_us() - pump_start_us) > PUMP_BUDGET_US) {
+                overrun = 1;
+                break;
+            }
+        }
+        int budget_exceeded = (tick_budget == 0) || overrun;
+        if (budget_exceeded)
+            M.tick_accum_us = 0;
+        smp_voice_tick_record_pump((uint32_t)elapsed, ticks_fired,
+                                   budget_exceeded);
+
+        int any_active = 0;
         for (int i = 0; i < M.num_tracks; i++) {
             midi_track_t *t = &M.tracks[i];
             if (t->done) continue;
             any_active = 1;
+            t->pending_us -= elapsed;
+        }
 
-            while (t->pending_us <= 0 && !t->done && safety > 0) {
+        int safety = 10000;
+        for (int i = 0; i < M.num_tracks; i++) {
+            midi_track_t *t = &M.tracks[i];
+            while (!t->done && t->pending_us <= 0 && safety > 0) {
                 process_event(t);
-                if (!t->done)
-                    read_next_delta(t);
+                if (!t->done) read_next_delta(t);
                 safety--;
+                /* Same overrun cap as the envelope loop.  Pending MIDI
+                 * events stay queued (their pending_us is still <=0)
+                 * so the next pump call picks them up — no notes lost,
+                 * just delayed. */
+                if ((OF_SVC->timer_get_us() - pump_start_us) > PUMP_BUDGET_US)
+                    goto pump_done;
             }
         }
-    } while (0);
+        pump_done: ;
 
-    /* Check if all tracks are done */
-    if (!any_active) {
-        if (M.looping) {
-            /* Restart without OPL3 reset for smooth transition */
-            all_notes_off();
-            reset_channels();
-            reset_tracks();
-            M.last_pump_us = of_time_us();
-        } else {
-            all_notes_off();
-            M.playing = 0;
+        if (!any_active) {
+            if (M.looping) {
+                smp_voice_all_off_global();
+                reset_channels();
+                reset_tracks();
+                /* ISR context — no ECALL, see note in of_midi_pump. */
+                M.last_pump_us = OF_SVC->timer_get_us();
+            } else {
+                smp_voice_all_off_global();
+                M.playing = 0;
+            }
         }
     }
 }
 
-int of_midi_playing(void)  { return M.playing; }
-int of_midi_paused(void)   { return M.paused; }
+int of_midi_playing(void)    { return M.playing; }
+int of_midi_paused(void)     { return M.paused; }
 int of_midi_get_volume(void) { return M.master_volume; }
 
 void of_midi_set_volume(int volume) {
     if (volume < 0)   volume = 0;
     if (volume > 255) volume = 255;
     M.master_volume = volume;
-
-    /* Update TL for all currently sounding notes */
-    for (int ch = 0; ch < 16; ch++)
-        update_channel_volume(ch);
+    smp_voice_set_master_volume(volume);
 }
 
-void of_midi_load_bank(const uint8_t *bank) {
-    M.bank = bank;
-    /* Invalidate cached instruments so they get reloaded */
-    for (int i = 0; i < OPL_CHANNELS; i++)
-        M.opl_inst[i] = 0;
+int of_midi_get_program(int ch) {
+    if (ch < 0 || ch > 15) return 0;
+    return M.program[ch];
 }

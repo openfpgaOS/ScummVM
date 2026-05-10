@@ -1,0 +1,41 @@
+/* <initializer_list> -- Minimal implementation for freestanding C++ */
+#ifndef _OPENFPGA_INITIALIZER_LIST
+#define _OPENFPGA_INITIALIZER_LIST
+
+namespace std {
+
+template<class T>
+class initializer_list {
+public:
+    typedef T              value_type;
+    typedef const T&       reference;
+    typedef const T&       const_reference;
+    typedef __SIZE_TYPE__  size_type;
+    typedef const T*       iterator;
+    typedef const T*       const_iterator;
+
+private:
+    iterator  _begin;
+    size_type _size;
+
+    /* The compiler calls this constructor internally */
+    constexpr initializer_list(const_iterator b, size_type s)
+        : _begin(b), _size(s) {}
+
+public:
+    constexpr initializer_list() : _begin(nullptr), _size(0) {}
+
+    constexpr size_type size() const { return _size; }
+    constexpr const_iterator begin() const { return _begin; }
+    constexpr const_iterator end() const { return _begin + _size; }
+};
+
+template<class T>
+constexpr const T* begin(initializer_list<T> il) { return il.begin(); }
+
+template<class T>
+constexpr const T* end(initializer_list<T> il) { return il.end(); }
+
+} /* namespace std */
+
+#endif /* _OPENFPGA_INITIALIZER_LIST */

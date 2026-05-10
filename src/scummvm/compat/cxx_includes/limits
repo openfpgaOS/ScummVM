@@ -1,0 +1,138 @@
+/* <limits> -- Minimal C++ numeric_limits for freestanding environment */
+#ifndef _OPENFPGA_LIMITS
+#define _OPENFPGA_LIMITS
+
+#include <limits.h>
+#include <float.h>
+
+namespace std {
+
+template<class T>
+class numeric_limits {
+public:
+    static constexpr bool is_specialized = false;
+    static constexpr T min() { return T(); }
+    static constexpr T max() { return T(); }
+};
+
+template<>
+class numeric_limits<bool> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr bool min() { return false; }
+    static constexpr bool max() { return true; }
+};
+
+template<>
+class numeric_limits<char> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr char min() { return CHAR_MIN; }
+    static constexpr char max() { return CHAR_MAX; }
+};
+
+template<>
+class numeric_limits<signed char> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr signed char min() { return SCHAR_MIN; }
+    static constexpr signed char max() { return SCHAR_MAX; }
+};
+
+template<>
+class numeric_limits<unsigned char> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr unsigned char min() { return 0; }
+    static constexpr unsigned char max() { return UCHAR_MAX; }
+};
+
+template<>
+class numeric_limits<short> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr short min() { return SHRT_MIN; }
+    static constexpr short max() { return SHRT_MAX; }
+};
+
+template<>
+class numeric_limits<unsigned short> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr unsigned short min() { return 0; }
+    static constexpr unsigned short max() { return USHRT_MAX; }
+};
+
+template<>
+class numeric_limits<int> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr int min() { return INT_MIN; }
+    static constexpr int max() { return INT_MAX; }
+};
+
+template<>
+class numeric_limits<unsigned int> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr unsigned int min() { return 0; }
+    static constexpr unsigned int max() { return UINT_MAX; }
+};
+
+template<>
+class numeric_limits<long> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr long min() { return LONG_MIN; }
+    static constexpr long max() { return LONG_MAX; }
+};
+
+template<>
+class numeric_limits<unsigned long> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr unsigned long min() { return 0; }
+    static constexpr unsigned long max() { return ULONG_MAX; }
+};
+
+template<>
+class numeric_limits<long long> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr long long min() { return LLONG_MIN; }
+    static constexpr long long max() { return LLONG_MAX; }
+};
+
+template<>
+class numeric_limits<unsigned long long> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr unsigned long long min() { return 0; }
+    static constexpr unsigned long long max() { return ULLONG_MAX; }
+};
+
+template<>
+class numeric_limits<float> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr float min() { return FLT_MIN; }
+    static constexpr float max() { return FLT_MAX; }
+    static constexpr float epsilon() { return FLT_EPSILON; }
+    static constexpr int digits = FLT_MANT_DIG;
+    static constexpr int digits10 = FLT_DIG;
+};
+
+template<>
+class numeric_limits<double> {
+public:
+    static constexpr bool is_specialized = true;
+    static constexpr double min() { return DBL_MIN; }
+    static constexpr double max() { return DBL_MAX; }
+    static constexpr double epsilon() { return DBL_EPSILON; }
+    static constexpr int digits = DBL_MANT_DIG;
+    static constexpr int digits10 = DBL_DIG;
+};
+
+} /* namespace std */
+
+#endif /* _OPENFPGA_LIMITS */

@@ -8,6 +8,10 @@
 #ifndef OF_TILE_H
 #define OF_TILE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 #define OF_TILE_COLS    64
@@ -24,31 +28,32 @@
 /* Tile Layer */
 
 static inline void of_tile_enable(int enable, int priority) {
-    __of_syscall2(OF_SYS_TILE_ENABLE, enable, priority);
+    of_ecall2(OF_EID_TILE, OF_TILE_FID_ENABLE, enable, priority);
 }
 
 static inline void of_tile_scroll(int x, int y) {
-    __of_syscall2(OF_SYS_TILE_SCROLL, x, y);
+    of_ecall2(OF_EID_TILE, OF_TILE_FID_SCROLL, x, y);
 }
 
 static inline void of_tile_set(int col, int row, uint16_t entry) {
-    __of_syscall3(OF_SYS_TILE_SET, col, row, entry);
+    of_ecall3(OF_EID_TILE, OF_TILE_FID_SET, col, row, entry);
 }
 
 static inline void of_tile_load_map(const uint16_t *data,
                                      int x, int y, int w, int h) {
-    __of_syscall5(OF_SYS_TILE_LOAD_MAP, (long)data, x, y, w, h);
+    of_ecall5(OF_EID_TILE, OF_TILE_FID_LOAD_MAP, (long)data, x, y, w, h);
 }
 
 static inline void of_tile_load_chr(int first_tile,
                                      const void *data, int num_tiles) {
-    __of_syscall3(OF_SYS_TILE_LOAD_CHR, first_tile, (long)data, num_tiles);
+    of_ecall3(OF_EID_TILE, OF_TILE_FID_LOAD_CHR,
+              first_tile, (long)data, num_tiles);
 }
 
 /* Sprite Engine */
 
 static inline void of_sprite_enable(int enable) {
-    __of_syscall1(OF_SYS_SPRITE_ENABLE, enable);
+    of_ecall1(OF_EID_SPRITE, OF_SPRITE_FID_ENABLE, enable);
 }
 
 static inline void of_sprite_set(int index, int x, int y,
@@ -58,24 +63,25 @@ static inline void of_sprite_set(int index, int x, int y,
                   ((hflip & 1) << 4) |
                   ((vflip & 1) << 5) |
                   ((enable & 1) << 6);
-    __of_syscall5(OF_SYS_SPRITE_SET, index, x, y, tile_id, packed);
+    of_ecall5(OF_EID_SPRITE, OF_SPRITE_FID_SET, index, x, y, tile_id, packed);
 }
 
 static inline void of_sprite_move(int index, int x, int y) {
-    __of_syscall3(OF_SYS_SPRITE_MOVE, index, x, y);
+    of_ecall3(OF_EID_SPRITE, OF_SPRITE_FID_MOVE, index, x, y);
 }
 
 static inline void of_sprite_load_chr(int first_tile,
                                        const void *data, int num_tiles) {
-    __of_syscall3(OF_SYS_SPRITE_LOAD_CHR, first_tile, (long)data, num_tiles);
+    of_ecall3(OF_EID_SPRITE, OF_SPRITE_FID_LOAD_CHR,
+              first_tile, (long)data, num_tiles);
 }
 
 static inline void of_sprite_hide(int index) {
-    __of_syscall1(OF_SYS_SPRITE_HIDE, index);
+    of_ecall1(OF_EID_SPRITE, OF_SPRITE_FID_HIDE, index);
 }
 
 static inline void of_sprite_hide_all(void) {
-    __of_syscall0(OF_SYS_SPRITE_HIDE_ALL);
+    of_ecall0(OF_EID_SPRITE, OF_SPRITE_FID_HIDE_ALL);
 }
 
 #else /* OF_PC */
@@ -108,5 +114,9 @@ static inline uint16_t of_tile_entry(int tile_id, int palette,
         (vflip ? (1 << 15) : 0)
     );
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* OF_TILE_H */

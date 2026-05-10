@@ -7,6 +7,8 @@
 
 #include "of.h"
 #include <stdio.h>
+#include <time.h>
+#include <unistd.h>
 
 /* ======================================================================
  * Test function: 16.16 fixed-point multiply (tight inner loop)
@@ -84,7 +86,7 @@ int main(void) {
         of_input_state(0, &st);
         if (st.buttons_pressed)
             break;
-        of_delay_ms(16);
+        usleep(16 * 1000);
     }
 
     return 0;

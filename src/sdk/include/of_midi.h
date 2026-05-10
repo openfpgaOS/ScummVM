@@ -1,21 +1,36 @@
 /*
- * of_midi.h -- MIDI playback for openfpgaOS
+ * of_midi.h -- Standard MIDI File playback for openfpgaOS
  *
- * Plays Standard MIDI Files (Format 0 and 1) through the hardware
- * OPL3 (YMF262) FM synthesizer.  Non-blocking: call of_midi_pump()
- * from your game loop or idle hook.
+ * Renders Format 0 / Format 1 .mid files with the sample-based
+ * synthesizer (of_smp_voice + of_smp_bank).  Non-blocking: call
+ * of_midi_pump() from your game loop or idle hook.
+ *
+ * Requirements:
+ *   - A .ofsf bank must be staged in a data slot. The kernel detects
+ *     and loads it at boot — no app-side init is required. Ship the
+ *     SC-55-derived bank in assets/banks/sc55.ofsf, or roll your own
+ *     with tools/sf2_to_ofsf. Users can swap the file to pick a
+ *     different SoundFont.
  *
  * Usage:
  *   of_midi_init();
  *   of_midi_play(midi_data, midi_len, 1);  // loop
  *   while (1) {
- *       of_midi_pump();
- *       // ... game logic ...
+ *       // ... game logic ...  (pump runs in timer ISR at 500 Hz)
  *   }
+ *
+ * Note: of_midi_play() installs of_midi_pump as the machine-timer ISR
+ * callback at 500 Hz, so the mixer is driven independently of the main
+ * thread.  Do NOT call of_midi_pump() from the main loop while playback
+ * is active — the ISR owns it and concurrent calls will race.
  */
 
 #ifndef OF_MIDI_H
 #define OF_MIDI_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #include <stdint.h>
 
@@ -26,40 +41,45 @@
 #define OF_MIDI_ERR_FORMAT    (-3)
 #define OF_MIDI_ERR_NO_TRACKS (-4)
 #define OF_MIDI_ERR_PLAYING   (-5)
+#define OF_MIDI_ERR_NO_BANK   (-6)
 
-/* Instrument patch size (11 bytes: FB/CNT + 5 mod + 5 car) */
-#define OF_MIDI_INST_SIZE 11
-
-/* Initialize MIDI subsystem.  Resets OPL3 and enables OPL3 mode. */
+/* Initialize the MIDI front-end and the sample voice engine. */
 int of_midi_init(void);
 
 /* Start playback of a Standard MIDI File in memory.
  * data/len: raw .mid file bytes.
- * loop: 1 = restart on end-of-track, 0 = play once.
+ * loop:     1 = restart on end-of-track, 0 = play once.
  * Returns OF_MIDI_OK or an error code. */
 int of_midi_play(const uint8_t *data, uint32_t len, int loop);
 
-/* Stop playback, silence all channels. */
+/* Stop playback, silence all voices. */
 void of_midi_stop(void);
 
-/* Pause / resume playback (notes sustain during pause). */
+/* Pause / resume (notes sustain during pause). */
 void of_midi_pause(void);
 void of_midi_resume(void);
 
-/* Process pending MIDI events.  Call this every frame.
- * Uses of_time_us() internally for timing. */
+/* Process pending MIDI events and advance envelopes.
+ * Installed as the machine-timer ISR callback by of_midi_play() and
+ * called internally at 500 Hz.  Do NOT invoke from the main loop while
+ * playback is active. */
 void of_midi_pump(void);
 
 /* Query state */
 int of_midi_playing(void);
 int of_midi_paused(void);
 
-/* Master volume (0 = silent, 255 = full).  Default: 255. */
+/* Master volume (0 = silent, 255 = full). Default: 255. */
 void of_midi_set_volume(int volume);
 int  of_midi_get_volume(void);
 
-/* Load a custom instrument bank (128 melodic + 47 percussion instruments,
- * 11 bytes each = 1925 bytes total).  Pass NULL to restore built-in bank. */
-void of_midi_load_bank(const uint8_t *bank);
+/* Diagnostic: current GM program number on a channel (0-127).  Channel 9
+ * is the drum channel; its program selects the drum kit.  Returns 0 for
+ * out-of-range channels. */
+int  of_midi_get_program(int ch);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* OF_MIDI_H */

@@ -13,6 +13,8 @@
  */
 
 #include "of.h"
+#include <time.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -41,8 +43,12 @@ static void draw_8bit(void) {
         else if (i < 171) { r = 0;               g = 255-(i-128)*6;  b = 255; }
         else if (i < 214) { r = (i-171)*6;       g = 0;              b = 255; }
         else              { r = 255;             g = 0;              b = 255-(i-214)*6; }
-        if (r > 255) r = 255; if (g > 255) g = 255; if (b > 255) b = 255;
-        if (r < 0) r = 0; if (g < 0) g = 0; if (b < 0) b = 0;
+        if (r > 255) r = 255;
+        if (g > 255) g = 255;
+        if (b > 255) b = 255;
+        if (r < 0) r = 0;
+        if (g < 0) g = 0;
+        if (b < 0) b = 0;
         of_video_palette(i, ((uint32_t)r << 16) | ((uint32_t)g << 8) | b);
     }
 
@@ -154,11 +160,11 @@ static const draw_fn_t draw_fns[] = {
     draw_8bit, draw_4bit, draw_2bit,
     draw_rgb565, draw_rgb555, draw_rgba5551,
 };
+#define NUM_MODES ((int)(sizeof(draw_fns) / sizeof(draw_fns[0])))
 
 int main(void) {
     of_video_init();
     int mode = 0;
-    int num_modes = 6;
 
     while (1) {
         /* Set color mode */
@@ -181,16 +187,16 @@ int main(void) {
         while (1) {
             of_input_poll();
             if (of_btn_pressed(OF_BTN_A)) {
-                mode = (mode + 1) % num_modes;
+                mode = (mode + 1) % NUM_MODES;
                 break;
             }
             if (of_btn_pressed(OF_BTN_B)) {
-                mode = (mode + num_modes - 1) % num_modes;
+                mode = (mode + NUM_MODES - 1) % NUM_MODES;
                 break;
             }
-            of_delay_ms(16);
+            usleep(16 * 1000);
         }
-        of_delay_ms(200);  /* debounce */
+        usleep(200 * 1000);  /* debounce */
     }
 
     return 0;

@@ -1,0 +1,26 @@
+/* <cstring> -- C++ wrapper for string.h */
+#ifndef _OPENFPGA_CSTRING
+#define _OPENFPGA_CSTRING
+
+#include <string.h>
+
+namespace std {
+    using ::memcpy;
+    using ::memmove;
+    using ::memset;
+    using ::memcmp;
+    using ::memchr;
+    using ::strlen;
+    using ::strcmp;
+    using ::strncmp;
+    using ::strcpy;
+    using ::strncpy;
+    using ::strcat;
+    using ::strncat;
+    using ::strchr;
+    using ::strrchr;
+    using ::strstr;
+    using ::strdup;
+}
+
+#endif /* _OPENFPGA_CSTRING */

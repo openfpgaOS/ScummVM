@@ -1,0 +1,12 @@
+/* <ctime> -- C++ wrapper for time.h */
+#ifndef _OPENFPGA_CTIME
+#define _OPENFPGA_CTIME
+
+#include <time.h>
+
+namespace std {
+    using ::time_t;
+    using ::time;
+}
+
+#endif /* _OPENFPGA_CTIME */

@@ -1,0 +1,11 @@
+/* <cerrno> -- C++ wrapper for errno.h */
+#ifndef _OPENFPGA_CERRNO
+#define _OPENFPGA_CERRNO
+
+#include <errno.h>
+
+namespace std {
+    using ::errno;
+}
+
+#endif /* _OPENFPGA_CERRNO */

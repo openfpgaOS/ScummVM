@@ -7,6 +7,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
+#include <time.h>
+#include <unistd.h>
 
 struct vec3 {
 	float x, y, z;
@@ -40,7 +42,6 @@ struct camera {
 };
 
 void render(int xsz, int ysz, int samples);
-void renderbuf(int xsz, int ysz, uint16_t *fb, int samples);
 struct vec3 trace(struct ray ray, int depth);
 struct vec3 shade(struct sphere *obj, struct spoint *sp, int depth);
 struct vec3 reflect(struct vec3 v, struct vec3 n);
@@ -92,63 +93,33 @@ unsigned int rays = 0, prim_rays = 0;
 
 
 int main(int argc, char **argv) {
-	unsigned long rend_time, start_time;
-	static char str[256];
+	(void)argc; (void)argv;
 
 	xres = 320;
 	yres = 240;
 	aspect = (float)xres / (float)yres;
 
-	// gba_init();
-	// set_video_mode(VMODE_LFB_240x160_16, 1);
-	// clear_buffer(front_buffer, RGB(160, 200, 255));
-    of_video_init();
-    of_video_set_color_mode(OF_VIDEO_MODE_RGB565);
+	of_video_init();
+	of_video_set_color_mode(OF_VIDEO_MODE_RGB565);
 
-    /* Clear framebuffer */
-    uint16_t *fb = of_video_surface16();
-        for (int i = 0; i < xres  * yres*2; i++) fb[i] = 0;
+	/* Clear framebuffer */
+	uint16_t *fb = of_video_surface16();
+	for (int i = 0; i < xres * yres; i++) fb[i] = 0;
 
-	//draw_string("rendering...", 0, 8, front_buffer);
-    printf("rendering...\n");
+	printf("rendering...\n");
 	create_scene();
 
-	start_time = of_time_ms(); //get_millisec();
+	unsigned long t0 = of_time_ms();
 	render(xres, yres, 1);
-	rend_time = of_time_ms(); - start_time;
+	printf("done in %lu ms (%u rays, %u primary)\n",
+	       of_time_ms() - t0, rays, prim_rays);
 
-	//memcpy(back_buffer->pixels, front_buffer->pixels, xres * yres * sizeof(uint16_t));
-    //of_video_flip();
-
-	// {	/* stats */
-	// 	int line = 0;
-	// 	sprintf(str, "rendering time: %lu sec", rend_time / 1000);
-	// 	draw_string(str, 0, line++ * 16, front_buffer);
-	// 	sprintf(str, "    (%lu msec)", rend_time);
-	// 	draw_string(str, 0, line++ * 16, front_buffer);
-	// 	line++;
-
-	// 	sprintf(str, "total rays cast: %u", rays);
-	// 	draw_string(str, 0, line++ * 16, front_buffer);
-	// 	sprintf(str, "   primary rays: %u", prim_rays);
-	// 	draw_string(str, 0, line++ * 16, front_buffer);
-	// 	line++;
-
-	// 	draw_string("Press any key to clear text", 0, line++ * 16, front_buffer);
-	// 	getchar();
-	// }
-	//flip();
-	
-	//clr_int();
-	//halt();
-    /* Wait for button press */
-    while (1) {
-        of_input_poll();
-        if (of_btn_pressed(OF_BTN_A)) {
-            break;
-        }
-        of_delay_ms(16);
-    }
+	/* Wait for button press */
+	while (1) {
+		of_input_poll();
+		if (of_btn_pressed(OF_BTN_A)) break;
+		usleep(16 * 1000);
+	}
 
 	return 0;
 }
@@ -157,6 +128,7 @@ int main(int argc, char **argv) {
 
 /* render a frame of xsz/ysz dimensions into the provided framebuffer */
 void render(int xsz, int ysz, int samples) {
+	(void)samples;
 	int i, j, k, x, y;
 	uint16_t *fb16;
 	char *wbuf;
@@ -164,8 +136,7 @@ void render(int xsz, int ysz, int samples) {
 
 	for(k=START_PSIZE; k>0; k>>=1) {
 		int scanoffs = (k - 1) * xsz;
-		
-		//fb16 = (uint16_t*)fb;
+
 		fb16 = of_video_surface16();
 		wbuf = tmp;
 		for(j=0; j<ysz; j+=k) {
@@ -375,6 +346,7 @@ struct ray get_primary_ray(int x, int y, int sample) {
 
 
 struct vec3 get_sample_pos(int x, int y, int sample) {
+	(void)sample;
 	struct vec3 pt;
 	/*float xsz = 2.0, ysz = xres / aspect;*/
 	static float sf = 0.0;
@@ -503,59 +475,3 @@ void create_scene(void) {
 }
 
 
-void renderbuf(int xsz, int ysz, uint16_t *fb, int samples) {
-	int i, j, k, x, y;
-	uint16_t *fb16;
-	char *wbuf;
-	uint16_t *temp_fb = malloc(153600);  // ✓ Buffer temporal
-	char *tmp = malloc(76800);
-
-	for(k=START_PSIZE; k>0; k>>=1) {
-		int scanoffs = (k - 1) * xsz;
-
-		fb16 = temp_fb;
-		wbuf = tmp;
-		for(j=0; j<ysz; j+=k) {
-			
-			for(i=0; i<xsz; i+=k) {
-				uint16_t pixel;
-				int calced = *wbuf == 1;
-
-				if(!calced) {
-					struct vec3 col = trace(get_primary_ray(i, j, 0), 0);
-					prim_rays++;
-				
-					pixel = RGB(MIN((uint16_t)(col.x * 255.0), 255),
-								MIN((uint16_t)(col.y * 255.0), 255),
-								MIN((uint16_t)(col.z * 255.0), 255));
-					*wbuf = 1;
-				} else {
-					pixel = *fb16;
-				}
-				
-				uint16_t *sub = fb16;
-				for(y=0; y<k; y++) {
-					for(x=0; x<k; x++) {
-						if(x || y || !calced) {
-							*sub = pixel;
-						}
-						sub++;
-					}
-					sub += xsz - k;
-				}
-
-				fb16 += k;
-				wbuf += k;
-			}
-			fb16 += scanoffs;
-			wbuf += scanoffs;
-		}
-		// ✓ Copiar buffer temporal al framebuffer final de una vez
-		memcpy(fb, temp_fb, xsz * ysz * sizeof(uint16_t));
-		of_video_flip();
-		//of_video_flush();
-	}
-
-	free(temp_fb);
-	free(tmp);
-}

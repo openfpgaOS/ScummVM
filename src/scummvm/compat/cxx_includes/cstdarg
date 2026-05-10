@@ -1,0 +1,11 @@
+/* <cstdarg> -- C++ wrapper for stdarg.h */
+#ifndef _OPENFPGA_CSTDARG
+#define _OPENFPGA_CSTDARG
+
+#include <stdarg.h>
+
+namespace std {
+    using ::va_list;
+}
+
+#endif /* _OPENFPGA_CSTDARG */

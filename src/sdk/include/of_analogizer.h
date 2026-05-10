@@ -5,6 +5,10 @@
 #ifndef OF_ANALOGIZER_H
 #define OF_ANALOGIZER_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 typedef struct {
@@ -22,11 +26,14 @@ typedef struct {
 #include "of_syscall_numbers.h"
 
 static inline int of_analogizer_enabled(void) {
-    return (int)__of_syscall0(OF_SYS_ANALOGIZER_IS_ENABLED);
+    return (int)of_ecall0(OF_EID_ANALOGIZER,
+                          OF_ANALOGIZER_FID_IS_ENABLED).value;
 }
 
 static inline int of_analogizer_state(of_analogizer_state_t *state) {
-    return (int)__of_syscall1(OF_SYS_ANALOGIZER_GET_STATE, (long)state);
+    return (int)of_ecall1(OF_EID_ANALOGIZER,
+                          OF_ANALOGIZER_FID_GET_STATE,
+                          (long)state).value;
 }
 
 #else /* OF_PC */
@@ -35,5 +42,9 @@ int of_analogizer_enabled(void);
 int of_analogizer_state(of_analogizer_state_t *state);
 
 #endif /* OF_PC */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* OF_ANALOGIZER_H */

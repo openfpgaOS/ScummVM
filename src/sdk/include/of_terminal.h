@@ -2,48 +2,25 @@
  * of_terminal.h -- Terminal API for openfpgaOS
  *
  * 40x30 text console with 16-color support and CP437 character set.
+ *
+ * Use printf with ANSI escape sequences for terminal output.
+ * The ACS_* character constants are provided for box drawing.
  */
 
 #ifndef OF_TERMINAL_H
 #define OF_TERMINAL_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
-
-#ifndef OF_PC
-
-#include "of_syscall.h"
-#include "of_syscall_numbers.h"
-
-static inline void of_print(const char *s) {
-    while (*s) __of_syscall1(OF_SYS_TERM_PUTCHAR, *s++);
-}
-
-static inline void of_print_char(char c) {
-    __of_syscall1(OF_SYS_TERM_PUTCHAR, c);
-}
-
-static inline void of_print_clear(void) {
-    __of_syscall0(OF_SYS_TERM_CLEAR);
-}
-
-static inline void of_print_at(int col, int row) {
-    __of_syscall2(OF_SYS_TERM_SET_POS, col, row);
-}
-
-#else /* OF_PC */
-
-void of_print(const char *s);
-void of_print_char(char c);
-void of_print_clear(void);
-void of_print_at(int col, int row);
-
-#endif /* OF_PC */
 
 /* ======================================================================
  * Alternate Character Set (ncurses-compatible names)
  *
  * CP437 box drawing, block elements, and special characters.
- * Use with printf("%c", ACS_VLINE) or of_print_char(ACS_VLINE).
+ * Use with printf("%c", ACS_VLINE).
  * ====================================================================== */
 
 /* Helper: cast to char for printf %c (char is signed on rv32) */
@@ -80,7 +57,7 @@ void of_print_at(int col, int row);
 #define ACS_BOARD       _ACS(177)   /* ▒ */
 #define ACS_CKBOARD     _ACS(176)   /* ░ */
 #define ACS_BLOCK_LO    _ACS(220)   /* ▄ */
-#define ACS_BLOCK_HI    _ACS(223)   /* ▐ -- note: font has this as right half */
+#define ACS_BLOCK_HI    _ACS(223)   /* ▐ right half block (CP437 0xDF) */
 
 /* Arrows */
 #define ACS_UARROW      _ACS(24)    /* ↑ */
@@ -98,5 +75,9 @@ void of_print_at(int col, int row);
 #define ACS_SHADE_LIGHT  _ACS(176)  /* ░ */
 #define ACS_SHADE_MEDIUM _ACS(177)  /* ▒ */
 #define ACS_SHADE_DARK   _ACS(178)  /* ▓ */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* OF_TERMINAL_H */

@@ -1,0 +1,44 @@
+/* <cmath> -- C++ wrapper for math.h */
+#ifndef _OPENFPGA_CMATH
+#define _OPENFPGA_CMATH
+
+#include <math.h>
+
+namespace std {
+    using ::sinf;
+    using ::cosf;
+    using ::tanf;
+    using ::sqrtf;
+    using ::fabsf;
+    using ::floorf;
+    using ::ceilf;
+    using ::fmodf;
+    using ::powf;
+    using ::logf;
+    using ::log10f;
+    using ::expf;
+    using ::atan2f;
+    using ::atanf;
+    using ::asinf;
+    using ::acosf;
+
+    /* Double versions provided by missing_libc.cpp */
+    using ::sin;
+    using ::cos;
+    using ::tan;
+    using ::sqrt;
+    using ::fabs;
+    using ::floor;
+    using ::ceil;
+    using ::fmod;
+    using ::pow;
+    using ::log;
+    using ::log10;
+    using ::exp;
+    using ::atan2;
+    using ::atan;
+    using ::asin;
+    using ::acos;
+}
+
+#endif /* _OPENFPGA_CMATH */

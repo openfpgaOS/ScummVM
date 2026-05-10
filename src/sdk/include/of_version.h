@@ -5,6 +5,10 @@
 #ifndef OF_VERSION_H
 #define OF_VERSION_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stdint.h>
 
 #define OF_API_VERSION_MAJOR  1
@@ -24,7 +28,7 @@
 #include "of_syscall_numbers.h"
 
 static inline uint32_t of_get_version(void) {
-    return (uint32_t)__of_syscall0(OF_SYS_GET_VERSION);
+    return (uint32_t)of_ecall0(OF_EID_BASE, OF_BASE_FID_GET_VERSION).value;
 }
 
 #else
@@ -34,5 +38,9 @@ static inline uint32_t of_get_version(void) {
 }
 
 #endif /* OF_PC */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* OF_VERSION_H */

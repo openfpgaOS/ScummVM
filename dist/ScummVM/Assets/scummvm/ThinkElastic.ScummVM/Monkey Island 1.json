@@ -1,0 +1,95 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": {
+            "id": 666,
+            "select": false
+        },
+        "data_slots": [
+            {
+                "id": 1,
+                "filename": "os.bin"
+            },
+            {
+                "id": 2,
+                "filename": "scummvm.elf"
+            },
+            {
+                "id": 3,
+                "filename": "000.LFL"
+            },
+            {
+                "id": 4,
+                "filename": "DISK01.LEC"
+            },
+            {
+                "id": 5,
+                "filename": "DISK02.LEC"
+            },
+            {
+                "id": 6,
+                "filename": "DISK03.LEC"
+            },
+            {
+                "id": 7,
+                "filename": "DISK04.LEC"
+            },
+            {
+                "id": 8,
+                "filename": "901.LFL"
+            },
+            {
+                "id": 20,
+                "filename": "902.LFL"
+            },
+            {
+                "id": 21,
+                "filename": "903.LFL"
+            },
+            {
+                "id": 22,
+                "filename": "904.LFL"
+            },
+            {
+                "id": 10,
+                "filename": "monkey1_0.sav"
+            },
+            {
+                "id": 11,
+                "filename": "monkey1_1.sav"
+            },
+            {
+                "id": 12,
+                "filename": "monkey1_2.sav"
+            },
+            {
+                "id": 13,
+                "filename": "monkey1_3.sav"
+            },
+            {
+                "id": 14,
+                "filename": "monkey1_4.sav"
+            },
+            {
+                "id": 15,
+                "filename": "monkey1_5.sav"
+            },
+            {
+                "id": 16,
+                "filename": "monkey1_6.sav"
+            },
+            {
+                "id": 17,
+                "filename": "monkey1_7.sav"
+            },
+            {
+                "id": 18,
+                "filename": "monkey1_8.sav"
+            },
+            {
+                "id": 19,
+                "filename": "monkey1_9.sav"
+            }
+        ]
+    }
+}

@@ -1,0 +1,8 @@
+/* <cfloat> -- C++ wrapper for float.h */
+#ifndef _OPENFPGA_CFLOAT
+#define _OPENFPGA_CFLOAT
+
+/* GCC's built-in float.h provides FLT_MAX, DBL_MAX, etc. */
+#include_next <float.h>
+
+#endif /* _OPENFPGA_CFLOAT */

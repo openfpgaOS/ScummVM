@@ -1,0 +1,7 @@
+/* <climits> -- C++ wrapper for limits.h */
+#ifndef _OPENFPGA_CLIMITS
+#define _OPENFPGA_CLIMITS
+
+#include <limits.h>
+
+#endif /* _OPENFPGA_CLIMITS */

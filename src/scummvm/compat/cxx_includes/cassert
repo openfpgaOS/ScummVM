@@ -1,0 +1,7 @@
+/* <cassert> -- C++ wrapper for assert.h */
+#ifndef _OPENFPGA_CASSERT
+#define _OPENFPGA_CASSERT
+
+#include <assert.h>
+
+#endif /* _OPENFPGA_CASSERT */

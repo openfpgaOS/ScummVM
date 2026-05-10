@@ -1,0 +1,24 @@
+/* <cstdio> -- C++ wrapper for stdio.h */
+#ifndef _OPENFPGA_CSTDIO
+#define _OPENFPGA_CSTDIO
+
+#include <stdio.h>
+
+namespace std {
+    using ::FILE;
+    using ::fopen;
+    using ::fclose;
+    using ::fread;
+    using ::fwrite;
+    using ::fseek;
+    using ::ftell;
+    using ::feof;
+    using ::ferror;
+    using ::printf;
+    using ::snprintf;
+    using ::vsnprintf;
+    using ::sprintf;
+    using ::sscanf;
+}
+
+#endif /* _OPENFPGA_CSTDIO */

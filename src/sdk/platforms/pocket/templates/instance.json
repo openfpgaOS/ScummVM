@@ -1,0 +1,21 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": { "id": 666, "select": false },
+        "data_slots": [
+            { "id": 1, "filename": "os.bin" },
+            { "id": 2, "filename": "{{APP}}.elf" },
+            { "id": 7, "filename": "bank.ofsf" },
+            { "id": 10, "filename": "{{APP}}.sav" },
+            { "id": 11, "filename": "{{APP}}_1.sav" },
+            { "id": 12, "filename": "{{APP}}_2.sav" },
+            { "id": 13, "filename": "{{APP}}_3.sav" },
+            { "id": 14, "filename": "{{APP}}_4.sav" },
+            { "id": 15, "filename": "{{APP}}_5.sav" },
+            { "id": 16, "filename": "{{APP}}_6.sav" },
+            { "id": 17, "filename": "{{APP}}_7.sav" },
+            { "id": 18, "filename": "{{APP}}_8.sav" },
+            { "id": 19, "filename": "{{APP}}_9.sav" }
+        ]
+    }
+}

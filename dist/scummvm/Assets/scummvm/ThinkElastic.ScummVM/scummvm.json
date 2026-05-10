@@ -1,0 +1,21 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": { "id": 666, "select": false },
+        "data_slots": [
+            { "id": 1, "filename": "os.bin" },
+            { "id": 2, "filename": "scummvm.elf" },
+            { "id": 7, "filename": "bank.ofsf" },
+            { "id": 10, "filename": "scummvm.sav" },
+            { "id": 11, "filename": "scummvm_1.sav" },
+            { "id": 12, "filename": "scummvm_2.sav" },
+            { "id": 13, "filename": "scummvm_3.sav" },
+            { "id": 14, "filename": "scummvm_4.sav" },
+            { "id": 15, "filename": "scummvm_5.sav" },
+            { "id": 16, "filename": "scummvm_6.sav" },
+            { "id": 17, "filename": "scummvm_7.sav" },
+            { "id": 18, "filename": "scummvm_8.sav" },
+            { "id": 19, "filename": "scummvm_9.sav" }
+        ]
+    }
+}

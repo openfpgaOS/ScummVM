@@ -1,0 +1,8 @@
+{
+    "platform": {
+        "category": "Computer",
+        "name": "{{NAME}}",
+        "year": {{YEAR}},
+        "manufacturer": "{{AUTHOR}}"
+    }
+}

@@ -1,0 +1,13 @@
+/* <cstddef> -- C++ wrapper for stddef.h */
+#ifndef _OPENFPGA_CSTDDEF
+#define _OPENFPGA_CSTDDEF
+
+#include <stddef.h>
+
+namespace std {
+    using ::size_t;
+    using ::ptrdiff_t;
+    typedef decltype(nullptr) nullptr_t;
+}
+
+#endif /* _OPENFPGA_CSTDDEF */

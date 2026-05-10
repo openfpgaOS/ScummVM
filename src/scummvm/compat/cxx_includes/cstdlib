@@ -1,0 +1,27 @@
+/* <cstdlib> -- C++ wrapper for stdlib.h */
+#ifndef _OPENFPGA_CSTDLIB
+#define _OPENFPGA_CSTDLIB
+
+#include <stdlib.h>
+
+namespace std {
+    using ::malloc;
+    using ::free;
+    using ::calloc;
+    using ::realloc;
+    using ::atoi;
+    using ::atol;
+    using ::strtol;
+    using ::strtoul;
+    using ::strtod;
+    using ::qsort;
+    using ::bsearch;
+    using ::abs;
+    using ::rand;
+    using ::srand;
+    using ::abort;
+    using ::exit;
+    using ::getenv;
+}
+
+#endif /* _OPENFPGA_CSTDLIB */

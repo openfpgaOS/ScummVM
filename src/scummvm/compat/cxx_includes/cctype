@@ -1,0 +1,21 @@
+/* <cctype> -- C++ wrapper for ctype.h */
+#ifndef _OPENFPGA_CCTYPE
+#define _OPENFPGA_CCTYPE
+
+#include <ctype.h>
+
+namespace std {
+    using ::toupper;
+    using ::tolower;
+    using ::isalpha;
+    using ::isdigit;
+    using ::isalnum;
+    using ::isspace;
+    using ::islower;
+    using ::isupper;
+    using ::isxdigit;
+    using ::ispunct;
+    using ::isprint;
+}
+
+#endif /* _OPENFPGA_CCTYPE */

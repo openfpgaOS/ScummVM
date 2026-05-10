@@ -1,58 +1,45 @@
 /*
  * openfpgaOS Slot Demo
- * Displays registered file slots with a box-drawn table.
+ * Discovers and lists files using standard POSIX opendir/readdir/stat.
+ * No of_file_slot_register needed — the kernel auto-discovers from the bridge.
  */
 
 #include "of.h"
+#include <time.h>
+#include <unistd.h>
 #include <stdio.h>
-
-static void draw_hline(int w, int sep, char left, char mid, char right) {
-    printf("  %c", left);
-    for (int i = 1; i < w - 1; i++)
-        printf("%c", (i == sep) ? mid : ACS_HLINE);
-    printf("%c\n", right);
-}
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 int main(void) {
-    /* Register the slots this instance uses so the table has entries to show.
-     * In a real app, register your data files at startup so fopen() can find them. */
-    of_file_slot_register(1, "os.bin");
-    of_file_slot_register(2, "slotdemo.elf");
+    printf("\033[2J\033[H");
+    printf("\n  \033[93mSlot Demo — File Discovery\033[0m\n\n");
 
-    printf("\033[2J\033[H");  /* clear screen, cursor home */
-
-    int count = of_file_slot_count();
-
-    printf("\n  openfpgaOS File Slot Registry\n\n");
-    printf("  Registered file slots: %d\n\n", count);
-
-    if (count == 0) {
-        printf("  (none)\n");
-    } else {
-        int sep = 7;
-        int w = 37;
-
-        draw_hline(w, sep, ACS_ULCORNER, ACS_TTEE, ACS_URCORNER);
-
-        printf("  %c  ID  %c  Filename                  %c\n",
-               ACS_VLINE, ACS_VLINE, ACS_VLINE);
-
-        draw_hline(w, sep, ACS_LTEE, ACS_PLUS, ACS_RTEE);
-
-        for (int i = 0; i < count; i++) {
-            of_file_slot_t slot;
-            if (of_file_slot_get(i, &slot) < 0)
-                continue;
-            printf("  %c %3d  %c  %-25s %c\n",
-                   ACS_VLINE, (int)slot.slot_id, ACS_VLINE,
-                   slot.filename, ACS_VLINE);
-        }
-
-        draw_hline(w, sep, ACS_LLCORNER, ACS_BTEE, ACS_LRCORNER);
+    DIR *d = opendir("/");
+    if (!d) {
+        printf("  opendir failed\n");
+        while (1) usleep(100 * 1000);
     }
 
+    int count = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        int slot = (int)e->d_ino - 1;
+        struct stat st;
+        long sz = -1;
+        if (stat(e->d_name, &st) == 0)
+            sz = (long)st.st_size;
+        printf("  slot %d: %-12s %7ld B\n", slot, e->d_name, sz);
+
+        count++;
+    }
+    closedir(d);
+
+    printf("\n  %d file(s)\n", count);
+
     while (1)
-        of_delay_ms(100);
+        usleep(100 * 1000);
 
     return 0;
 }

@@ -92,15 +92,6 @@ Comprehensive positive, negative, and edge case tests for all SDK functions.
 - **Positive**: After writing, returns reduced capacity
 - **Edge**: FIFO full → returns 0
 
-### of_opl_write(reg, val)
-- **Positive**: Write to OPL3 register → sound output changes
-- **Positive**: Write key-on → note plays
-- **Edge**: Write to register 0xFF → valid (OPL3 has 256 registers)
-
-### of_opl_reset()
-- **Positive**: After playing notes, reset → silence
-- **Positive**: Call twice → no crash
-
 ### of_audio_init()
 - **Positive**: Initializes audio subsystem
 - **Edge**: Call twice → idempotent

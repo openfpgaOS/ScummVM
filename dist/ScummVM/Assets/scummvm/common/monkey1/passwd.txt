@@ -1,0 +1,50 @@
+
+  A1=Upper half of face, A2=Lower half
+
+         1           2             3             4           5           6
+A1 I ape       I dark lady  I 2 eyeflags  I thorn-head I holed hat I dark man I
+A2 I ape       I dark lady  I broken nose I totem-head I sideburns I mustache I
+
+         7           8             9            10          11          12
+A1 I sword     I big eye    I old man     I cruel      I skull     I cap      I 
+A2 I red mouth I scary face I tongue      I dagger     I skull     I cap      I
+
+        13          14            15                       
+A1 I 1 eyeflag I blond      I grey hair   I 
+A2 I 1 pimple  I baby face  I scabby face I
+
+
+            I  0   I  1   I  2   I  3   I  4   I  5   I  6   I  7   I
+ -----------+------+------+------+------+------+------+------+------I
+ Antiqua    I 1701 I 1651 I 1679 I 1719 I 1694 I 1632 I 1668 I 1703 I
+ Barbados   I 1725 I 1630 I 1709 I 1594 I 1614 I 1653 I 1649 I 1693 I 
+ Jamaica    I 1613 I 1580 I 1723 I 1717 I 1684 I 1628 I 1643 I 1559 I
+ Montserrat I 1692 I 1656 I 1567 I 1674 I 1662 I 1655 I 1646 I 1671 I
+ Nebraska   I 1665 I 1706 I 1506 I 1722 I 1716 I 1584 I 1551 I 1627 I
+ St.Kitts   I 1712 I 1542 I 1565 I 1720 I 1664 I 1566 I 1592 I 1654 I
+ Tortuga    I 1604 I 1653 I 1641 I 1690 I 1682 I 1601 I 1619 I 1680 I
+ 
+
+    8   I  9   I  10  I  11  I  12  I  13  I  14  I
+--------+------+------+------+------+------+------I
+   1726 I 1564 I 1615 I 1599 I 1669 I 1660 I 1687 I 
+   1577 I 1678 I 1686 I 1597 I 1718 I 1658 I 1702 I
+   1573 I 1708 I 1701 I 1724 I 1667 I 1691 I 1685 I 
+   1611 I 1672 I 1562 I 1721 I 1666 I 1673 I 1670 I
+   1707 I 1688 I 1699 I 1568 I 1705 I 1579 I 1585 I 
+   1635 I 1639 I 1695 I 1704 I 1711 I 1609 I 1681 I
+   1621 I 1652 I 1689 I 1713 I 1697 I 1696 I 1624 I 
+
+
+  A1-A2=A3   (if A3 is negative then add it to 14)
+
+ EXAMPLE :
+ Skull (11) - dagger (10) = 1,in tortuga (in this case,column 1) code = 1653
+ once more :(11-10=1)
+ EXAMPLE :dark lady (2) - skull (11) = -9, in jamaica (-9 + 14 = 5 , 
+ indicating col 5 to be used in this case) code = 1628 
+ once more :(2-11=-9+14=5!)
+ 
+ Happy calculating hopes: STT of Pure-Byte and DDT of ACCESSION !
+
+
