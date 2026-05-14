@@ -172,6 +172,11 @@ SCUMMVM_ENGINE_SRCS = $(filter-out $(SCUMM_EXCLUDE), $(wildcard $(SCUMMVM)/engin
 # ── ScummVM engine framework ───────────────────────────────────────
 SCUMMVM_ENGINES_SRCS = $(wildcard $(SCUMMVM)/engines/*.cpp)
 
+# ── ScummVM math sources (needed by WMA/WMA-Pro audio decoders) ────
+# MDCT pulls in fft, cosinetables, sinetables, sinewindows.  We add
+# the whole math/ tree and let --gc-sections drop the rest.
+SCUMMVM_MATH_SRCS = $(wildcard $(SCUMMVM)/math/*.cpp)
+
 # ── ScummVM backends infrastructure ─────────────────────────────────
 SCUMMVM_BACKEND_SRCS = \
 	$(SCUMMVM)/backends/base-backend.cpp \
@@ -209,7 +214,8 @@ SCUMMVM_SRCS = $(SCUMMVM_COMMON_SRCS) $(SCUMMVM_BASE_SRCS) \
                $(SCUMMVM_GRAPHICS_SRCS) $(SCUMMVM_AUDIO_SRCS) \
                $(SCUMMVM_ENGINE_SRCS) $(SCUMMVM_ENGINES_SRCS) \
                $(SCUMMVM_BACKEND_SRCS) $(SCUMMVM_GUI_SRCS) \
-               $(SCUMMVM_IMAGE_SRCS) $(SCUMMVM_VIDEO_SRCS)
+               $(SCUMMVM_IMAGE_SRCS) $(SCUMMVM_VIDEO_SRCS) \
+               $(SCUMMVM_MATH_SRCS)
 
 # ── Object files ────────────────────────────────────────────────────
 
