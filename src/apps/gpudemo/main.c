@@ -1,27 +1,48 @@
 /*
- * openfpgaOS GPU Accelerator Demo
+ * gpudemo — exercise every public GPU primitive
  *
- * Showcases every GPU feature:
- *   Mode 0 — Wolfenstein-style raycaster maze with an auto-walking
- *            camera (right-hand wall follower). Wall columns and
- *            floor/ceiling use colormap-lit horizontal spans (column
- *            walking is selected by fb_stride, not by a flag bit).
- *   Mode 1 — Perspective-correct textured triangle (software rasterised,
- *            using SPAN_PERSP horizontal scanlines for the inner loop —
- *            the GPU does the 1/z reciprocal + multiply per 16-pixel
- *            sub-segment in hardware).
- *   Mode 2 — Rotating 3D cube via the hardware triangle rasteriser
- *            (one DRAW_TRIANGLES command per face).
- *   Mode 3 — Pinwheel of 32 triangles drawn in a single batched
- *            DRAW_TRIANGLES command (of_gpu_draw_triangles_batch).
+ * Canonical example of:
+ *   - of_gpu_init + the GPU_CTRL soft-reset preamble (clears any
+ *     boot-time garbage out of the ring before the first real cmd)
+ *   - of_gpu_palookup_upload + of_gpu_set_colormap_id for distance-fade
+ *     "Doom-style" colour-mapped spans, with a hue-preserving colormap
+ *     (build_colormap below) that keeps each band stable as light grows
+ *   - of_gpu_draw_span (struct-driven; column-walked spans use
+ *     fb_stride = SCREEN_W, row-walked use fb_stride = 1)
+ *   - of_gpu_draw_triangles + of_gpu_draw_triangles_batch for
+ *     hardware-rasterised triangles, including the batched form which
+ *     submits N triangles in one ring command for cmd-decode savings
+ *   - SPAN_PERSP for perspective-correct textured spans (CPU computes
+ *     edge interpolants, GPU does the 1/z reciprocal per sub-segment)
+ *   - cache discipline: textures live in malloc'd SDRAM, flushed once
+ *     at startup with of_cache_clean_range so the GPU's AXI master
+ *     reads committed bytes; the framebuffer is GPU-written so the CPU
+ *     never needs to flush it back
+ *
+ * Modes (cycle with A):
+ *   0  Wolfenstein-style raycaster maze, auto-walking camera, lit by
+ *      a baked light grid + per-frame flicker
+ *   1  Perspective-correct textured triangle, software rasterised
+ *      with SPAN_PERSP for the inner-loop math
+ *   2  Rotating 3D cube via the hardware triangle rasteriser, one
+ *      face per DRAW_TRIANGLES
+ *   3  Pinwheel of 32 textured triangles in a single batched
+ *      DRAW_TRIANGLES command
+ *   4  Translucent overlay over the maze
+ *   5  Tessellated triangle version of mode 4 overlay
+ *   6  Two-triangle version of mode 5 using the largest possible
+ *      triangles for the same overlay footprint
  *
  * Controls:
- *   A button — cycle through demo modes
+ *   A   cycle modes
+ *   B   run the GPU benchmark suite, including unpaced mode 5/6
+ *       triangle-overlay throughput
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <math.h>
 #include "of.h"
 #include "of_cache.h"
@@ -50,6 +71,16 @@ static uint8_t *persp_tex;          /* 64×64 grid for the perspective demo */
 /* Colormap: 64 light levels */
 static uint8_t colormap[64 * 256];
 
+/* RGB mirror of the palette — populated by set_palette so the
+ * translucency-table builder doesn't need to recompute the ramp. */
+static uint32_t pal_rgb[256];
+
+/* 256x256 translucency LUT (Build/Doom convention).  transluc_table[s*256+d]
+ * = palette index whose RGB is closest to (RGB(s) + RGB(d)) / 2.  Uploaded
+ * to the GPU's transluc[] BRAM at startup; spans with OF_GPU_SPAN_TRANSLUC
+ * use it to blend their source pixel against whatever's already in the FB. */
+static uint8_t transluc_table[65536];
+
 /* Simple sin/cos LUT (8-bit fixed-point, 256 entries = full circle) */
 static int16_t sin_lut[256];
 static int16_t cos_lut[256];
@@ -63,21 +94,44 @@ static void build_sin_table(void) {
 }
 
 static void build_colormap(void) {
-    /* Generate a simple colormap: each light level dims the palette.
+    /* Hue-preserving distance-fade colormap.  Each (light, texel) cell
+     * outputs a palette entry IN THE SAME BAND as the texel — it just
+     * darkens within that band as light grows.  This keeps colours
+     * stable with distance: red walls fade to dark red, blue floor
+     * fades to dark blue, etc.  A naive linear-fade-to-16 would walk
+     * through other bands mid-distance (e.g. blue → red → gray) and
+     * read as colour-shifting fog.
      *
-     * IMPORTANT: the output index must never fall below 16 — palette
-     * entries 0..15 are reserved for the OS terminal's VGA 16-colour
-     * set (see set_palette), so a heavily-dimmed texel that lands on
-     * index 6 would render as terminal-red, not dark grey. Clamp the
-     * low end to 16 and rescale the ramp into [16, i] so distant
-     * surfaces fade smoothly into the reserved-safe greyscale band
-     * instead of flashing VGA primaries. */
+     * Bands (must match set_palette):
+     *   0x00..0x0F   pass-through (OS terminal VGA, do not touch)
+     *   0x10..0x7F   gray ramp; fades linearly to index 16
+     *   0x80..0x9F   red brick;   fades within band [0x80..0x9F]
+     *   0xA0..0xBF   warm brown;  fades within band
+     *   0xC0..0xDF   green;       fades within band
+     *   0xE0..0xFF   blue;        fades within band
+     *
+     * Per-band fade math: pos = i & 0x1F (0..31 within band), then
+     * out = band_base + pos * (63 - light) / 63.  At light=0 the
+     * output equals the input (full brightness); at light=63 the
+     * output is the band's darkest entry.  Light values >= 32 saturate
+     * one bit shy of the very-dark end so heavily-shaded surfaces
+     * still show some hue rather than collapsing to a single index. */
     for (int light = 0; light < 64; light++) {
         for (int i = 0; i < 256; i++) {
-            int base = (i < 16) ? i : 16;
-            int dimmed = base + ((i - base) * (63 - light)) / 63;
+            int dimmed;
+            if (i < 16) {
+                dimmed = i;                                     /* terminal pass-through */
+            } else if (i < 128) {
+                /* Gray ramp 16..127 fades to 16.  Same math as the
+                 * previous grayscale-only colormap. */
+                dimmed = 16 + ((i - 16) * (63 - light)) / 63;
+            } else {
+                /* Coloured bands: stay in band, fade within it. */
+                int band = i & 0xE0;        /* 0x80, 0xA0, 0xC0, 0xE0 */
+                int pos  = i & 0x1F;        /* 0..31 within the band */
+                dimmed = band + (pos * (63 - light)) / 63;
+            }
             if (dimmed > 255) dimmed = 255;
-            if (dimmed < 16 && i >= 16) dimmed = 16;
             colormap[light * 256 + i] = (uint8_t)dimmed;
         }
     }
@@ -150,15 +204,84 @@ static void build_persp_texture(void) {
 }
 
 static void set_palette(void) {
-    /* Simple grayscale + warm tint for upper half.
+    /* Multi-band coloured ramp.  Bands match build_colormap so each
+     * (texel, shade) cell maps to a darker shade of the SAME hue.
      *
-     * IMPORTANT: skip indexes 0-15 — those are the OS terminal's VGA
-     * 16-color palette (used for white text in OF_DISPLAY_OVERLAY mode).
-     * Overwriting them blanks the overlay text. */
+     *   0x10..0x7F   gray ramp (used by colormap fade-to-16 path)
+     *   0x80..0x9F   red brick: dark red → bright red
+     *   0xA0..0xBF   warm brown / mortar / wood
+     *   0xC0..0xDF   green: moss / vegetation
+     *   0xE0..0xFF   blue: sky / water / floor tile
+     *
+     * Each band's index 0 is the band's darkest entry (where heavily
+     * shaded texels land) and index 31 is its brightest.  Channels
+     * scale linearly within the band so the fade reads as a pure
+     * brightness change with no hue shift.
+     *
+     * IMPORTANT: skip 0..15 — those are the OS terminal VGA palette
+     * used by OF_DISPLAY_OVERLAY mode. */
     for (int i = 16; i < 256; i++) {
-        uint8_t r = i, g = i, b = i;
-        if (i >= 0x80) { r = i; g = (i * 7) >> 3; b = (i * 5) >> 3; }
-        of_video_palette(i, ((uint32_t)r << 16) | ((uint32_t)g << 8) | b);
+        uint8_t r, g, b;
+        if (i < 0x80) {                                /* 16..127: gray */
+            r = g = b = (uint8_t)i;
+        } else if (i < 0xA0) {                         /* 128..159: red brick */
+            int t = i - 0x80;                          /* 0..31 */
+            r = (uint8_t)(0x40 + (191 * t) / 31);
+            g = (uint8_t)(0x10 + ( 60 * t) / 31);
+            b = (uint8_t)(0x08 + ( 24 * t) / 31);
+        } else if (i < 0xC0) {                         /* 160..191: warm brown */
+            int t = i - 0xA0;
+            r = (uint8_t)(0x30 + (175 * t) / 31);
+            g = (uint8_t)(0x18 + (110 * t) / 31);
+            b = (uint8_t)(0x08 + ( 56 * t) / 31);
+        } else if (i < 0xE0) {                         /* 192..223: green */
+            int t = i - 0xC0;
+            r = (uint8_t)(0x10 + ( 50 * t) / 31);
+            g = (uint8_t)(0x40 + (190 * t) / 31);
+            b = (uint8_t)(0x10 + ( 50 * t) / 31);
+        } else {                                       /* 224..255: blue */
+            int t = i - 0xE0;
+            r = (uint8_t)(0x10 + ( 80 * t) / 31);
+            g = (uint8_t)(0x30 + (130 * t) / 31);
+            b = (uint8_t)(0x60 + (155 * t) / 31);
+        }
+        uint32_t rgb = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        of_video_palette(i, rgb);
+        pal_rgb[i] = rgb;
+    }
+}
+
+/* Build the 64 KB translucency LUT.  For each (src, dst) palette index
+ * pair, average the RGB values and find the palette index closest to
+ * the average (Euclidean in RGB space), restricted to indices 16..255
+ * so the blend never lands on the OS terminal's reserved 0..15 band.
+ *
+ * ~16M iterations total → roughly 3-5 seconds on this CPU.  Run once
+ * at startup; the table is then valid for the lifetime of the app
+ * since the palette doesn't change. */
+static void build_translu_table(void) {
+    for (int s = 0; s < 256; s++) {
+        int sr = (pal_rgb[s] >> 16) & 0xFF;
+        int sg = (pal_rgb[s] >>  8) & 0xFF;
+        int sb =  pal_rgb[s]        & 0xFF;
+        for (int d = 0; d < 256; d++) {
+            int dr = (pal_rgb[d] >> 16) & 0xFF;
+            int dg = (pal_rgb[d] >>  8) & 0xFF;
+            int db =  pal_rgb[d]        & 0xFF;
+            int ar = (sr + dr) >> 1;
+            int ag = (sg + dg) >> 1;
+            int ab = (sb + db) >> 1;
+            int best = 16, best_d2 = 0x7FFFFFFF;
+            for (int i = 16; i < 256; i++) {
+                int pr = (pal_rgb[i] >> 16) & 0xFF;
+                int pg = (pal_rgb[i] >>  8) & 0xFF;
+                int pb =  pal_rgb[i]        & 0xFF;
+                int dx = pr - ar, dy = pg - ag, dz = pb - ab;
+                int dist = dx*dx + dy*dy + dz*dz;
+                if (dist < best_d2) { best_d2 = dist; best = i; }
+            }
+            transluc_table[s * 256 + d] = (uint8_t)best;
+        }
     }
 }
 
@@ -252,8 +375,10 @@ static int _flicker_256;
 static inline int sample_light(float wx, float wy) {
     int gx = (int)(wx * LGRID_SCALE);
     int gy = (int)(wy * LGRID_SCALE);
-    if (gx < 0) gx = 0; if (gx >= LGRID_SIZE) gx = LGRID_SIZE - 1;
-    if (gy < 0) gy = 0; if (gy >= LGRID_SIZE) gy = LGRID_SIZE - 1;
+    if (gx < 0) gx = 0;
+    if (gx >= LGRID_SIZE) gx = LGRID_SIZE - 1;
+    if (gy < 0) gy = 0;
+    if (gy >= LGRID_SIZE) gy = LGRID_SIZE - 1;
     return (light_grid[gy][gx] * _flicker_256) >> 8;
 }
 
@@ -359,7 +484,7 @@ static unsigned int _stat_gpu_us = 0;
  * bytes when it reads the framebuffer back from M0/M1. */
 static void prepare_fb(uint8_t *fb, uint8_t color) {
     memset(fb, color, SCREEN_W * SCREEN_H);
-    OF_SVC->cache_clean_range(fb, SCREEN_W * SCREEN_H);
+    of_cache_clean_range(fb, SCREEN_W * SCREEN_H);
     of_gpu_set_framebuffer((uint32_t)(uintptr_t)fb, SCREEN_W);
 }
 
@@ -532,6 +657,7 @@ static void draw_maze_demo(int frame) {
     unsigned int _t1 = of_time_us();
     of_gpu_finish();
     unsigned int _t2 = of_time_us();
+
     _stat_cpu_us += _t1 - _t0;
     _stat_gpu_us += _t2 - _t1;
 }
@@ -558,14 +684,8 @@ static uint8_t *face_tex;
 
 static void draw_triangle_demo(int frame) {
     uint8_t *fb = of_video_surface();
-
     unsigned int _t0 = of_time_us();
-    prepare_fb(fb, 0x08);
-
-    /* Initialise per-face texels and flush to SDRAM before GPU draws */
-    for (int i = 0; i < 6; i++)
-        face_tex[i] = face_colors[i];
-    OF_SVC->cache_clean_range(face_tex, 6);
+    prepare_fb(fb, 0x10);
 
     int angle_y = frame * 2;
     int angle_x = frame;
@@ -591,21 +711,20 @@ static void draw_triangle_demo(int frame) {
         proj_y[i] = (int16_t)(SCREEN_H / 2 + (ry * 200) / d);
     }
 
-    /* Draw each face as 2 triangles */
+    /* Per-face: bind a 1×1 solid-colour texture and draw the
+     * triangle via the per-triangle helper — the natural shape for
+     * a "one face = one colour" cube. */
     for (int f = 0; f < 12; f++) {
         int i0 = cube_faces[f][0];
         int i1 = cube_faces[f][1];
         int i2 = cube_faces[f][2];
-
-        /* Simple backface cull via cross product */
         int dx1 = proj_x[i1] - proj_x[i0], dy1 = proj_y[i1] - proj_y[i0];
         int dx2 = proj_x[i2] - proj_x[i0], dy2 = proj_y[i2] - proj_y[i0];
-        if (dx1 * dy2 - dx2 * dy1 <= 0) continue;
+        if (dx1 * dy2 - dx2 * dy1 <= 0) continue;   /* backface cull */
 
-        /* Bind per-face 1-texel texture (no race: each face has its own) */
         of_gpu_texture_t solid_tex = {
-            .addr = (uint32_t)(uintptr_t)&face_tex[f / 2],
-            .width = 1, .height = 1,
+            .addr   = (uint32_t)(uintptr_t)&face_tex[f / 2],
+            .width  = 1, .height = 1,
         };
         of_gpu_bind_texture(&solid_tex);
 
@@ -727,7 +846,10 @@ static int32_t fdiv16(int32_t num, int32_t den) {
     /* signed 16.16 division: (num << 16) / den, clamped */
     if (den == 0) return 0;
     int64_t n = ((int64_t)num) << 16;
-    return (int32_t)(n / den);
+    int64_t q = n / den;
+    if (q > INT32_MAX) return INT32_MAX;
+    if (q < INT32_MIN) return INT32_MIN;
+    return (int32_t)q;
 }
 
 static void draw_persp_demo(int frame) {
@@ -735,6 +857,13 @@ static void draw_persp_demo(int frame) {
     uint32_t fb_addr = (uint32_t)(uintptr_t)fb;
 
     unsigned int _t0 = of_time_us();
+    /* Defensive: the rotation-1-broken-rotation-2-clean symptom on hardware
+     * recurs on every mode-1 entry, points at GPU state surviving from the
+     * prior mode.  Flush tex cache + reassert the colormap slot we want; if
+     * the bug disappears, the survivor was either tex_cache contents or a
+     * stale st_colormap_id from a different SET_COLORMAP_ID call. */
+    GPU_TEX_FLUSH = 1;
+    of_gpu_set_colormap_id(0);
     prepare_fb(fb, 0x10);
 
     /* Three vertices of a triangle in world space, rotating about the
@@ -750,8 +879,8 @@ static void draw_persp_demo(int frame) {
     };
     static const int16_t tex[3][2] = {
         {   0,   0 },
-        {  64,   0 },
-        {  32,  64 },
+        {  63,   0 },
+        {  31,  63 },
     };
     for (int i = 0; i < 3; i++) {
         /* Rotate base[i] about Y so the triangle tilts in/out of the screen */
@@ -765,17 +894,43 @@ static void draw_persp_demo(int frame) {
         verts[i].t = (int32_t)tex[i][1] << 16;
     }
 
-    /* Project to screen + compute per-vertex (s/z, t/z, 1/z) */
+    /* Project to screen + compute per-vertex (s/z, t/z, 1/z).
+     *
+     * z_min raised from 16 to 128.  At z=16 the per-vertex 1/z spans
+     * a 13x range vs the back vertex (z≈200), and the GPU's per-16-px
+     * 1/(1/z) reciprocal can't track that gradient — visible as
+     * texture-coord wrap and "shattered" surfaces at sharp angles.
+     *
+     * SPAN_PERSP's s/z and t/z inputs are signed 16.16 values.  With a
+     * 64x64 texture, the last valid texel coordinate is 63; keeping
+     * z >= 128 ensures (63/z) fits the signed projection-space format.
+     * The old demo used coord 64 at z=127/128, which wrapped sdivz
+     * negative and made the GPU fetch before the texture base near the
+     * high-angle apex. */
     int32_t sx[3], sy[3];
     int32_t sZ[3], tZ[3], oZ[3];   /* projection-space attributes (16.16) */
     for (int i = 0; i < 3; i++) {
-        if (verts[i].z < 16) verts[i].z = 16;
+        if (verts[i].z < 128) verts[i].z = 128;
         int32_t zi = verts[i].z;
         sx[i] = (verts[i].x * 200) / zi + (SCREEN_W / 2);
         sy[i] = (verts[i].y * 200) / zi + (SCREEN_H / 2);
         sZ[i] = fdiv16(verts[i].s, zi << 0);  /* s/z, 16.16 */
         tZ[i] = fdiv16(verts[i].t, zi << 0);
         oZ[i] = fdiv16(1 << 16,    zi);       /* 1/z, 16.16 */
+    }
+
+    /* Skip degenerate triangles — at sharp angles the projected
+     * area shrinks below a few pixels and edge interpolation
+     * produces extreme gradients.  Using the 2D cross product as a
+     * signed area: 2 × area = |dx1·dy2 - dx2·dy1|. */
+    {
+        int32_t a = (sx[1] - sx[0]) * (sy[2] - sy[0])
+                  - (sx[2] - sx[0]) * (sy[1] - sy[0]);
+        if (a < 0) a = -a;
+        if (a < 32) {
+            of_gpu_finish();
+            return;
+        }
     }
 
     /* Sort vertices by Y (top, mid, bot) */
@@ -868,6 +1023,650 @@ static void draw_persp_demo(int frame) {
 }
 
 /* ================================================================
+ * Translucent overlay demo: maze background + a moving translucent
+ * rectangle on top.  Demonstrates OF_GPU_SPAN_TRANSLUC blending the
+ * source pixel against whatever's already in the framebuffer using
+ * the uploaded transluc[src][dst] LUT.
+ * ================================================================ */
+
+#define TESS_RECT_W 96
+#define TESS_RECT_H 64
+#define TESS_COLS   12
+#define TESS_ROWS   8
+#define TESS_VERTS  (TESS_COLS * TESS_ROWS * 6)
+
+/* Solid-fill texel for the overlay — set once, never changes. */
+static uint8_t translu_solid_tex[16];
+static int     translu_solid_tex_built;
+
+static void ensure_overlay_texture(void) {
+    if (translu_solid_tex_built)
+        return;
+    for (int i = 0; i < 16; i++) translu_solid_tex[i] = 0xE8;
+    of_cache_clean_range(translu_solid_tex, sizeof(translu_solid_tex));
+    translu_solid_tex_built = 1;
+}
+
+static void overlay_rect_for_frame(int frame, int *rx_out, int *ry_out) {
+    int amp_x = (SCREEN_W - TESS_RECT_W) / 2;
+    int amp_y = (SCREEN_H - TESS_RECT_H) / 2;
+    int rx = (SCREEN_W - TESS_RECT_W) / 2 +
+             (sin_lut[(frame * 3) & 255] * amp_x) / 256;
+    int ry = (SCREEN_H - TESS_RECT_H) / 2 +
+             (cos_lut[(frame * 5) & 255] * amp_y) / 256;
+    if (rx < 0) rx = 0;
+    if (ry < 0) ry = 0;
+    if (rx + TESS_RECT_W > SCREEN_W) rx = SCREEN_W - TESS_RECT_W;
+    if (ry + TESS_RECT_H > SCREEN_H) ry = SCREEN_H - TESS_RECT_H;
+    *rx_out = rx;
+    *ry_out = ry;
+}
+
+static void draw_translu_demo(int frame) {
+    /* Step 1: render the maze full-screen as the background.  This
+     * leaves the colormap-lit walls/floor/ceiling in the FB. */
+    draw_maze_demo(frame);
+
+    /* Step 2: lazily build a 16-byte solid texture filled with one
+     * palette index.  Picking 0xE8 = the brighter blue band gives a
+     * cool-tone overlay that contrasts visibly with the warm maze. */
+    ensure_overlay_texture();
+
+    /* Step 3: animate a 96x64 rectangle bouncing in a Lissajous path. */
+    uint8_t *fb = of_video_surface();
+    uint32_t fb_addr = (uint32_t)(uintptr_t)fb;
+    int rx, ry;
+    overlay_rect_for_frame(frame, &rx, &ry);
+
+    /* Step 4: submit translucent spans, one per row.  No COLORMAP flag
+     * — the source is a constant palette index, not a texel needing
+     * shade-LUT.  The GPU reads each FB byte under the rectangle, looks
+     * up transluc_table[0xE8][fb_byte], and writes the blended index. */
+    for (int y = 0; y < TESS_RECT_H; y++) {
+        of_gpu_span_t s = {
+            .fb_addr   = fb_addr + (ry + y) * SCREEN_W + rx,
+            .tex_addr  = (uint32_t)(uintptr_t)translu_solid_tex,
+            .s         = 0,
+            .t         = 0,
+            .sstep     = 0,
+            .tstep     = 0,
+            .count     = TESS_RECT_W,
+            .light     = 0,
+            .flags     = OF_GPU_SPAN_TRANSLUC,
+            .fb_stride = 1,
+            .tex_width = 16,
+        };
+        of_gpu_draw_span(&s);
+    }
+    of_gpu_finish();
+}
+
+/* ================================================================
+ * Tessellated triangle overlay demo: same maze background and moving
+ * rectangle as mode 4, but the rectangle is emitted as a grid of
+ * hardware triangles instead of row spans.  The current triangle path
+ * does not support OF_GPU_SPAN_TRANSLUC, so this is an opaque/tinted
+ * geometry-throughput comparison rather than a byte-identical blend.
+ * ================================================================ */
+
+static of_gpu_vertex_t tess_verts[TESS_VERTS];
+
+typedef struct {
+    uint32_t pixels;
+    uint32_t triangles;
+    uint32_t draw_commands;
+} overlay_stats_t;
+
+static uint32_t _stat_overlay_pixels;
+static uint32_t _stat_overlay_triangles;
+static uint32_t _stat_overlay_commands;
+static uint32_t _stat_overlay_submit_us;
+static uint32_t _stat_overlay_finish_us;
+
+static void bind_overlay_triangle_state(uint32_t fb_addr) {
+    ensure_overlay_texture();
+    of_gpu_set_framebuffer(fb_addr, SCREEN_W);
+    of_gpu_set_colormap_id(0);
+    of_gpu_texture_t tex = {
+        .addr = (uint32_t)(uintptr_t)translu_solid_tex,
+        .width = 1,
+        .height = 1,
+    };
+    of_gpu_bind_texture(&tex);
+}
+
+static void emit_tessellated_overlay(int frame, uint32_t fb_addr,
+                                     overlay_stats_t *stats) {
+    int rx, ry;
+    overlay_rect_for_frame(frame, &rx, &ry);
+    bind_overlay_triangle_state(fb_addr);
+
+    int vi = 0;
+    for (int gy = 0; gy < TESS_ROWS; gy++) {
+        int y0 = ry + (gy * TESS_RECT_H) / TESS_ROWS;
+        int y1 = ry + ((gy + 1) * TESS_RECT_H) / TESS_ROWS;
+        for (int gx = 0; gx < TESS_COLS; gx++) {
+            int x0 = rx + (gx * TESS_RECT_W) / TESS_COLS;
+            int x1 = rx + ((gx + 1) * TESS_RECT_W) / TESS_COLS;
+            of_gpu_vertex_t v00 = { .x = (int16_t)(x0 * 16), .y = (int16_t)(y0 * 16), .w = 0x10000, .r = 0 };
+            of_gpu_vertex_t v10 = { .x = (int16_t)(x1 * 16), .y = (int16_t)(y0 * 16), .w = 0x10000, .r = 0 };
+            of_gpu_vertex_t v01 = { .x = (int16_t)(x0 * 16), .y = (int16_t)(y1 * 16), .w = 0x10000, .r = 0 };
+            of_gpu_vertex_t v11 = { .x = (int16_t)(x1 * 16), .y = (int16_t)(y1 * 16), .w = 0x10000, .r = 0 };
+
+            tess_verts[vi++] = v00;
+            tess_verts[vi++] = v10;
+            tess_verts[vi++] = v01;
+            tess_verts[vi++] = v10;
+            tess_verts[vi++] = v11;
+            tess_verts[vi++] = v01;
+        }
+    }
+
+    of_gpu_draw_triangles_batch(tess_verts, (uint32_t)vi);
+    if (stats) {
+        stats->pixels += TESS_RECT_W * TESS_RECT_H;
+        stats->triangles += (uint32_t)vi / 3u;
+        stats->draw_commands++;
+    }
+}
+
+static void emit_large_tri_overlay(int frame, uint32_t fb_addr,
+                                   overlay_stats_t *stats) {
+    int rx, ry;
+    overlay_rect_for_frame(frame, &rx, &ry);
+    bind_overlay_triangle_state(fb_addr);
+
+    int x0 = rx;
+    int y0 = ry;
+    int x1 = rx + TESS_RECT_W;
+    int y1 = ry + TESS_RECT_H;
+    of_gpu_vertex_t v00 = { .x = (int16_t)(x0 * 16), .y = (int16_t)(y0 * 16), .w = 0x10000, .r = 0 };
+    of_gpu_vertex_t v10 = { .x = (int16_t)(x1 * 16), .y = (int16_t)(y0 * 16), .w = 0x10000, .r = 0 };
+    of_gpu_vertex_t v01 = { .x = (int16_t)(x0 * 16), .y = (int16_t)(y1 * 16), .w = 0x10000, .r = 0 };
+    of_gpu_vertex_t v11 = { .x = (int16_t)(x1 * 16), .y = (int16_t)(y1 * 16), .w = 0x10000, .r = 0 };
+    of_gpu_vertex_t verts[6] = { v00, v10, v01, v10, v11, v01 };
+
+    of_gpu_draw_triangles_batch(verts, 6);
+    if (stats) {
+        stats->pixels += TESS_RECT_W * TESS_RECT_H;
+        stats->triangles += 2;
+        stats->draw_commands++;
+    }
+}
+
+static void draw_tessellated_translu_demo(int frame) {
+    /* Same background as mode 4. draw_maze_demo() drains before returning,
+     * giving the triangle overlay coherent FB contents to draw over. */
+    draw_maze_demo(frame);
+
+    uint8_t *fb = of_video_surface();
+    uint32_t fb_addr = (uint32_t)(uintptr_t)fb;
+    overlay_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    unsigned int _t0 = of_time_us();
+    emit_tessellated_overlay(frame, fb_addr, &stats);
+    unsigned int _t1 = of_time_us();
+    of_gpu_finish();
+    unsigned int _t2 = of_time_us();
+    _stat_cpu_us += _t1 - _t0;
+    _stat_gpu_us += _t2 - _t1;
+    _stat_overlay_pixels += stats.pixels;
+    _stat_overlay_triangles += stats.triangles;
+    _stat_overlay_commands += stats.draw_commands;
+    _stat_overlay_submit_us += _t1 - _t0;
+    _stat_overlay_finish_us += _t2 - _t1;
+}
+
+/* Same overlay as mode 5, but with the minimum tessellation for an
+ * axis-aligned rectangle: two large triangles.  This keeps the visual
+ * footprint the same while maximizing horizontal run length per triangle
+ * row and minimizing triangle setup/decode overhead. */
+static void draw_large_tri_translu_demo(int frame) {
+    draw_maze_demo(frame);
+
+    uint8_t *fb = of_video_surface();
+    uint32_t fb_addr = (uint32_t)(uintptr_t)fb;
+    overlay_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    unsigned int _t0 = of_time_us();
+    emit_large_tri_overlay(frame, fb_addr, &stats);
+    unsigned int _t1 = of_time_us();
+    of_gpu_finish();
+    unsigned int _t2 = of_time_us();
+    _stat_cpu_us += _t1 - _t0;
+    _stat_gpu_us += _t2 - _t1;
+    _stat_overlay_pixels += stats.pixels;
+    _stat_overlay_triangles += stats.triangles;
+    _stat_overlay_commands += stats.draw_commands;
+    _stat_overlay_submit_us += _t1 - _t0;
+    _stat_overlay_finish_us += _t2 - _t1;
+}
+
+/* ================================================================
+ * Saturated GPU Benchmark Suite
+ * ================================================================
+ *
+ * B in the main loop runs this suite.  Each case emits a large chunk of
+ * homogeneous GPU work, publishes enough of it to keep the command ring
+ * non-empty, drains it with one fence, and repeats until it has accumulated
+ * a useful timing window.  There are no printf calls inside the timed
+ * section; UART is synchronous and would dominate the result.
+ */
+
+#define BENCH_TARGET_US       750000u
+#define BENCH_MAX_ROUNDS      24u
+#define BENCH_FB_BYTES        (SCREEN_W * SCREEN_H)
+#define BENCH_SPAN_MAX_COUNT  4095u
+
+typedef struct {
+    uint32_t pixels;
+    uint32_t triangles;
+    uint32_t commands;
+    uint32_t submit_us;
+    uint32_t drain_us;
+    uint32_t rounds;
+    uint32_t min_ring_free;
+    uint32_t dma_waits;
+    uint32_t ring_waits;
+} bench_result_t;
+
+typedef void (*bench_emit_fn)(uint32_t fb_addr, bench_result_t *r);
+
+static of_gpu_vertex_t bench_verts[64 * 6];
+
+static void bench_publish_gpu_work(void) {
+    of_gpu_kick();
+    _gpu_wait_dma_idle_debug();
+}
+
+static void bench_add_span_pixels(uint32_t fb_addr, uint32_t tex_addr,
+                                  uint16_t tex_w, uint16_t tex_mask,
+                                  uint8_t flags, uint32_t screens,
+                                  bench_result_t *r) {
+    uint32_t pending_cmds = 0;
+
+    for (uint32_t pass = 0; pass < screens; pass++) {
+        uint32_t off = 0;
+        while (off < BENCH_FB_BYTES) {
+            uint32_t n = BENCH_FB_BYTES - off;
+            if (n > BENCH_SPAN_MAX_COUNT) n = BENCH_SPAN_MAX_COUNT;
+
+            of_gpu_span_t s = {
+                .fb_addr    = fb_addr + off,
+                .tex_addr   = tex_addr,
+                .s          = (int32_t)((off & tex_mask) << 16),
+                .t          = (int32_t)(((off / tex_w) & tex_mask) << 16),
+                .sstep      = 0x10000,
+                .tstep      = 0,
+                .count      = (uint16_t)n,
+                .light      = (uint8_t)((pass + (off >> 12)) & 63),
+                .flags      = flags,
+                .colormap_id = 0,
+                .fb_stride  = 1,
+                .tex_width  = tex_w,
+                .tex_w_mask = tex_mask,
+                .tex_h_mask = tex_mask,
+            };
+            of_gpu_draw_span(&s);
+            r->pixels += n;
+            r->commands++;
+            if (++pending_cmds == 160u) {
+                bench_publish_gpu_work();
+                pending_cmds = 0;
+            }
+            off += n;
+        }
+    }
+    bench_publish_gpu_work();
+}
+
+static void bench_emit_clear(uint32_t fb_addr, bench_result_t *r) {
+    for (uint32_t i = 0; i < 512; i++) {
+        of_gpu_clear_rect_strided(fb_addr, SCREEN_W, SCREEN_H, SCREEN_W,
+                                  (uint8_t)(0x10 + (i & 0x1F)));
+        r->pixels += BENCH_FB_BYTES;
+        r->commands++;
+        if ((i & 255u) == 255u)
+            bench_publish_gpu_work();
+    }
+}
+
+static void bench_emit_affine(uint32_t fb_addr, bench_result_t *r) {
+    bench_add_span_pixels(fb_addr, (uint32_t)(uintptr_t)checkerboard_tex,
+                          64, 63, 0, 32, r);
+}
+
+static void bench_emit_colormap(uint32_t fb_addr, bench_result_t *r) {
+    bench_add_span_pixels(fb_addr, (uint32_t)(uintptr_t)wall_tex,
+                          64, 63, OF_GPU_SPAN_COLORMAP, 32, r);
+}
+
+static void bench_emit_masked(uint32_t fb_addr, bench_result_t *r) {
+    bench_add_span_pixels(fb_addr, (uint32_t)(uintptr_t)sprite_tex,
+                          16, 15, OF_GPU_SPAN_SKIP_ZERO, 32, r);
+}
+
+static void bench_emit_translucent(uint32_t fb_addr, bench_result_t *r) {
+    bench_add_span_pixels(fb_addr, (uint32_t)(uintptr_t)checkerboard_tex,
+                          64, 63, OF_GPU_SPAN_TRANSLUC, 16, r);
+}
+
+static void bench_emit_persp_spans(uint32_t fb_addr, bench_result_t *r) {
+    uint32_t pending_cmds = 0;
+
+    for (uint32_t pass = 0; pass < 24; pass++) {
+        uint32_t off = 0;
+        while (off < BENCH_FB_BYTES) {
+            uint32_t n = BENCH_FB_BYTES - off;
+            if (n > 1024u) n = 1024u;
+
+            int32_t phase = (int32_t)((pass * 97u + off) & 0xFFFFu);
+            of_gpu_span_t s = {
+                .fb_addr    = fb_addr + off,
+                .tex_addr   = (uint32_t)(uintptr_t)persp_tex,
+                .s          = 0,
+                .t          = 0,
+                .sstep      = 0,
+                .tstep      = 0,
+                .count      = (uint16_t)n,
+                .light      = (uint8_t)((pass + (off >> 10)) & 63),
+                .flags      = OF_GPU_SPAN_COLORMAP | OF_GPU_SPAN_PERSP,
+                .colormap_id = 0,
+                .fb_stride  = 1,
+                .tex_width  = 64,
+                .tex_w_mask = 63,
+                .tex_h_mask = 63,
+                .sdivz      = phase,
+                .tdivz      = (int32_t)(((off >> 8) & 63u) << 16),
+                .zi_persp   = 0x00018000,
+                .sdivz_step = 0x00000180,
+                .tdivz_step = 0x00000040,
+                .zi_step    = -8,
+            };
+            of_gpu_draw_span(&s);
+            r->pixels += n;
+            r->commands++;
+            if (++pending_cmds == 160u) {
+                bench_publish_gpu_work();
+                pending_cmds = 0;
+            }
+            off += n;
+        }
+    }
+    bench_publish_gpu_work();
+}
+
+static void bench_emit_span_groups(uint32_t fb_addr, bench_result_t *r) {
+    uint32_t pending_cmds = 0;
+
+    for (uint32_t pass = 0; pass < 40; pass++) {
+        for (uint32_t x = 0; x < SCREEN_W; x += 4) {
+            of_gpu_span_group_t g;
+            memset(&g, 0, sizeof(g));
+            g.fb_addr = fb_addr + x;
+            g.count = SCREEN_H;
+            g.flags = OF_GPU_SPAN_COLORMAP;
+            g.colormap_id = 0;
+            g.lane_count = 4;
+            g.fb_stride = SCREEN_W;
+            g.lane_delta = 1;
+            g.tex_width = 64;
+            g.tex_w_mask = 63;
+            g.tex_h_mask = 63;
+            for (uint32_t lane = 0; lane < 4; lane++) {
+                g.tex_addr[lane] = (uint32_t)(uintptr_t)wall_tex + ((x + lane) & 63u);
+                g.t[lane] = (int32_t)((pass & 63u) << 16);
+                g.tstep[lane] = 0x10000;
+                g.light[lane] = (uint8_t)((pass + x + lane) & 63u);
+            }
+            of_gpu_draw_span_group(&g);
+            r->pixels += SCREEN_H * 4u;
+            r->commands++;
+            if (++pending_cmds == 160u) {
+                bench_publish_gpu_work();
+                pending_cmds = 0;
+            }
+        }
+    }
+    bench_publish_gpu_work();
+}
+
+static void bench_make_quad(of_gpu_vertex_t *v, int inset, uint8_t light,
+                            int perspective) {
+    int x0 = inset;
+    int y0 = inset;
+    int x1 = SCREEN_W - 1 - inset;
+    int y1 = SCREEN_H - 1 - inset;
+    int32_t w0 = perspective ? 0x00018000 : 0x00010000;
+    int32_t w1 = perspective ? 0x00008000 : 0x00010000;
+    int32_t w2 = perspective ? 0x00012000 : 0x00010000;
+    int32_t w3 = perspective ? 0x00006000 : 0x00010000;
+
+    v[0] = (of_gpu_vertex_t){ .x = (int16_t)(x0 * 16), .y = (int16_t)(y0 * 16),
+                              .s = 0, .t = 0, .w = w0, .r = light };
+    v[1] = (of_gpu_vertex_t){ .x = (int16_t)(x1 * 16), .y = (int16_t)(y0 * 16),
+                              .s = 63 << 16, .t = 0, .w = w1, .r = light };
+    v[2] = (of_gpu_vertex_t){ .x = (int16_t)(x0 * 16), .y = (int16_t)(y1 * 16),
+                              .s = 0, .t = 63 << 16, .w = w2, .r = light };
+    v[3] = v[1];
+    v[4] = (of_gpu_vertex_t){ .x = (int16_t)(x1 * 16), .y = (int16_t)(y1 * 16),
+                              .s = 63 << 16, .t = 63 << 16, .w = w3, .r = light };
+    v[5] = v[2];
+}
+
+static void bench_emit_triangles_single(uint32_t fb_addr, bench_result_t *r) {
+    (void)fb_addr;
+    of_gpu_texture_t tex = {
+        .addr = (uint32_t)(uintptr_t)wall_tex,
+        .width = 64,
+        .height = 64,
+    };
+    of_gpu_bind_texture(&tex);
+
+    for (uint32_t i = 0; i < 128; i++) {
+        of_gpu_vertex_t v[6];
+        bench_make_quad(v, (int)(i & 7), (uint8_t)(i & 63), 0);
+        of_gpu_draw_triangles(v, 6);
+        r->pixels += BENCH_FB_BYTES;
+        r->triangles += 2;
+        r->commands += 2;
+        if ((i & 31u) == 31u)
+            bench_publish_gpu_work();
+    }
+}
+
+static void bench_emit_triangles_batch(uint32_t fb_addr, bench_result_t *r) {
+    (void)fb_addr;
+    of_gpu_texture_t tex = {
+        .addr = (uint32_t)(uintptr_t)wall_tex,
+        .width = 64,
+        .height = 64,
+    };
+    of_gpu_bind_texture(&tex);
+
+    for (uint32_t i = 0; i < 64; i++)
+        bench_make_quad(&bench_verts[i * 6], (int)(i & 7), (uint8_t)(i & 63), 0);
+
+    for (uint32_t repeat = 0; repeat < 4; repeat++) {
+        of_gpu_draw_triangles_batch(bench_verts, 64 * 6);
+        r->pixels += BENCH_FB_BYTES * 64u;
+        r->triangles += 64u * 2u;
+        r->commands++;
+        bench_publish_gpu_work();
+    }
+}
+
+static void bench_emit_triangles_persp(uint32_t fb_addr, bench_result_t *r) {
+    (void)fb_addr;
+    of_gpu_texture_t tex = {
+        .addr = (uint32_t)(uintptr_t)persp_tex,
+        .width = 64,
+        .height = 64,
+    };
+    of_gpu_bind_texture(&tex);
+
+    for (uint32_t i = 0; i < 32; i++)
+        bench_make_quad(&bench_verts[i * 6], (int)(i & 7), (uint8_t)(i & 63), 1);
+
+    for (uint32_t repeat = 0; repeat < 8; repeat++) {
+        of_gpu_draw_triangles_batch(bench_verts, 32 * 6);
+        r->pixels += BENCH_FB_BYTES * 32u;
+        r->triangles += 32u * 2u;
+        r->commands++;
+        if ((repeat & 1u) == 1u)
+            bench_publish_gpu_work();
+    }
+}
+
+static void bench_print_result(const char *name, const bench_result_t *r) {
+    uint32_t total_us = r->submit_us + r->drain_us;
+    if (total_us == 0) total_us = 1;
+
+    uint32_t mpix_x10 = (uint32_t)(((uint64_t)r->pixels * 10u) / total_us);
+    uint32_t kcmd_s = (uint32_t)(((uint64_t)r->commands * 1000u) / total_us);
+    uint32_t ktri_s = (uint32_t)(((uint64_t)r->triangles * 1000u) / total_us);
+    uint32_t submit_pct = (r->submit_us * 100u) / total_us;
+    uint32_t drain_pct = 100u - submit_pct;
+
+    printf("[bench] %-14s %3u.%u Mpix/s  px=%u tri=%u cmds=%u rounds=%u "
+           "submit=%uus drain=%uus tail=%u%% minfree=%u dmaw=%u ringw=%u kcmd/s=%u ktri/s=%u\n",
+           name, mpix_x10 / 10u, mpix_x10 % 10u,
+           r->pixels, r->triangles, r->commands, r->rounds,
+           r->submit_us, r->drain_us, drain_pct,
+           r->min_ring_free, r->dma_waits, r->ring_waits, kcmd_s, ktri_s);
+}
+
+#define OVERLAY_BENCH_TARGET_US 500000u
+#define OVERLAY_BENCH_MAX_FRAMES 4096u
+
+static void bench_overlay_tri_case(const char *name, int large_triangles) {
+    uint8_t *fb = of_video_surface();
+    uint32_t fb_addr = (uint32_t)(uintptr_t)fb;
+    of_gpu_debug_snapshot_t snap;
+    overlay_stats_t totals;
+    uint32_t submit_us = 0;
+    uint32_t finish_us = 0;
+    uint32_t frames = 0;
+
+    memset(&totals, 0, sizeof(totals));
+
+    /* Render one coherent maze background, then repeatedly submit only
+     * the overlay geometry without flips/acquire_next.  That isolates
+     * triangle command/raster throughput from present pacing. */
+    draw_maze_demo(0);
+    of_gpu_finish();
+    of_gpu_debug_snapshot(&snap, 1);
+
+    do {
+        overlay_stats_t one;
+        memset(&one, 0, sizeof(one));
+
+        uint32_t t0 = of_time_us();
+        if (large_triangles)
+            emit_large_tri_overlay((int)frames, fb_addr, &one);
+        else
+            emit_tessellated_overlay((int)frames, fb_addr, &one);
+        uint32_t t1 = of_time_us();
+        of_gpu_finish();
+        uint32_t t2 = of_time_us();
+
+        totals.pixels += one.pixels;
+        totals.triangles += one.triangles;
+        totals.draw_commands += one.draw_commands;
+        submit_us += t1 - t0;
+        finish_us += t2 - t1;
+        frames++;
+    } while ((submit_us + finish_us) < OVERLAY_BENCH_TARGET_US &&
+             frames < OVERLAY_BENCH_MAX_FRAMES);
+
+    of_gpu_debug_snapshot(&snap, 1);
+
+    uint32_t total_us = submit_us + finish_us;
+    if (total_us == 0) total_us = 1;
+    if (frames == 0) frames = 1;
+
+    uint32_t mpix_x10 = (uint32_t)(((uint64_t)totals.pixels * 10u) / total_us);
+    uint32_t ktri_s = (uint32_t)(((uint64_t)totals.triangles * 1000u) / total_us);
+    uint32_t px_f = totals.pixels / frames;
+    uint32_t tri_f = totals.triangles / frames;
+    uint32_t cmd_f_x100 = (totals.draw_commands * 100u) / frames;
+
+    printf("[tri-bench] %-10s frames=%u us/f=%u submit=%u finish=%u "
+           "pix/f=%u tri/f=%u drawcmd/f=%u.%02u mpix/s=%u.%u ktri/s=%u "
+           "minfree=%u dma=%u/%u ring=%u/%u\n",
+           name, frames, total_us / frames, submit_us / frames,
+           finish_us / frames, px_f, tri_f, cmd_f_x100 / 100u,
+           cmd_f_x100 % 100u, mpix_x10 / 10u, mpix_x10 % 10u, ktri_s,
+           snap.min_ring_free, snap.dma_waits, snap.dma_spin_iters,
+           snap.ring_waits, snap.ring_spin_iters);
+}
+
+static void bench_run_case(const char *name, bench_emit_fn emit) {
+    bench_result_t r;
+    of_gpu_debug_snapshot_t snap;
+    uint8_t *fb = of_video_surface();
+    uint32_t fb_addr = (uint32_t)(uintptr_t)fb;
+
+    memset(&r, 0, sizeof(r));
+    r.min_ring_free = OF_GPU_RING_SIZE;
+
+    of_gpu_finish();
+    of_gpu_set_framebuffer(fb_addr, SCREEN_W);
+    of_gpu_set_colormap_id(0);
+    of_gpu_debug_snapshot(&snap, 1);
+
+    do {
+        uint32_t t0 = of_time_us();
+        emit(fb_addr, &r);
+        uint32_t t1 = of_time_us();
+        of_gpu_finish();
+        uint32_t t2 = of_time_us();
+
+        r.submit_us += t1 - t0;
+        r.drain_us  += t2 - t1;
+        r.rounds++;
+    } while ((r.submit_us + r.drain_us) < BENCH_TARGET_US &&
+             r.rounds < BENCH_MAX_ROUNDS);
+
+    of_gpu_debug_snapshot(&snap, 1);
+    r.min_ring_free = snap.min_ring_free;
+    r.dma_waits = snap.dma_waits;
+    r.ring_waits = snap.ring_waits;
+    bench_print_result(name, &r);
+}
+
+static void run_gpu_benchmarks(void) {
+    uint8_t *fb = of_video_surface();
+    uint32_t fb_addr = (uint32_t)(uintptr_t)fb;
+
+    printf("[bench] start saturated GPU suite target=%uus\n", BENCH_TARGET_US);
+
+    of_gpu_finish();
+    GPU_TEX_FLUSH = 1;
+    of_gpu_set_framebuffer(fb_addr, SCREEN_W);
+    of_gpu_set_colormap_id(0);
+    of_gpu_clear_rect_strided(fb_addr, SCREEN_W, SCREEN_H, SCREEN_W, 0x10);
+    of_gpu_finish();
+
+    bench_run_case("clear_rect", bench_emit_clear);
+    bench_run_case("span_raw", bench_emit_affine);
+    bench_run_case("span_cmap", bench_emit_colormap);
+    bench_run_case("span_mask", bench_emit_masked);
+    bench_run_case("span4_cmap", bench_emit_span_groups);
+    bench_run_case("span_persp", bench_emit_persp_spans);
+    bench_run_case("span_trans", bench_emit_translucent);
+    bench_run_case("tri_single", bench_emit_triangles_single);
+    bench_run_case("tri_batch", bench_emit_triangles_batch);
+    bench_run_case("tri_persp", bench_emit_triangles_persp);
+    bench_overlay_tri_case("mode5_tess", 0);
+    bench_overlay_tri_case("mode6_big", 1);
+
+    of_gpu_clear_rect_strided(fb_addr, SCREEN_W, SCREEN_H, SCREEN_W, 0x10);
+    of_gpu_finish();
+    printf("[bench] done\n");
+}
+
+/* ================================================================
  * Main
  * ================================================================ */
 int main(void) {
@@ -896,14 +1695,18 @@ int main(void) {
     build_sprite_texture();
     build_persp_texture();
     build_light_grid();
+    /* Populate the 1×1 face textures (one byte per face) consumed by
+     * draw_triangle_demo.  malloc'd 8 bytes at line above — six are
+     * used, padding rounds to 8 for alignment. */
+    for (int f = 0; f < 6; f++) face_tex[f] = face_colors[f];
     printf("[gpudemo] textures + lightgrid built\n");
 
     /* Flush texture data from CPU D-cache to SDRAM so the GPU can read it */
-    OF_SVC->cache_clean_range(checkerboard_tex, 64 * 64);
-    OF_SVC->cache_clean_range(wall_tex,         64 * 64);
-    OF_SVC->cache_clean_range(sprite_tex,       16 * 16);
-    OF_SVC->cache_clean_range(persp_tex,        64 * 64);
-    OF_SVC->cache_clean_range(face_tex,         8);
+    of_cache_clean_range(checkerboard_tex, 64 * 64);
+    of_cache_clean_range(wall_tex,         64 * 64);
+    of_cache_clean_range(sprite_tex,       16 * 16);
+    of_cache_clean_range(persp_tex,        64 * 64);
+    of_cache_clean_range(face_tex,         8);
     printf("[gpudemo] cache_clean done\n");
 
     /* The stock of_gpu_init() only pulses ring_reset (GPU_CTRL=4). On real
@@ -921,21 +1724,35 @@ int main(void) {
     of_gpu_palookup_upload(0, colormap, sizeof(colormap));
     printf("[gpudemo] colormap uploaded\n");
 
+    /* Translucency LUT — see transluc_table comment.  Slow to build
+     * (~3-5 sec) so do it once after the palette is final and upload
+     * to the GPU's transluc[] BRAM. */
+    printf("[gpudemo] building translucency table...\n");
+    build_translu_table();
+    of_gpu_translucency_upload(transluc_table, sizeof(transluc_table));
+    printf("[gpudemo] translucency table uploaded\n");
+
     {
         uint8_t *fb0 = of_video_surface();
         printf("[gpudemo] surface[0] = %p\n", fb0);
     }
 
-    printf("[gpudemo] entering main loop — A = cycle mode\n");
+    printf("[gpudemo] entering main loop — A = cycle mode, B = benchmark\n");
 
     /* Mode 0 — Auto-walking raycaster maze (textured spans + colormap)
      * Mode 1 — Perspective-correct textured triangle (SPAN_PERSP)
      * Mode 2 — Rotating 3D cube (per-triangle DRAW_TRIANGLES)
      * Mode 3 — Pinwheel of 32 triangles in one batched DRAW_TRIANGLES
-     *          command (of_gpu_draw_triangles_batch) */
+     *          command (of_gpu_draw_triangles_batch)
+     * Mode 4 — Translucent overlay over the maze
+     * Mode 5 — Tessellated triangle version of mode 4 overlay
+     * Mode 6 — Two-triangle version of mode 5, same overlay footprint */
     int mode = 0;
     int frame = 0;
-    int auto_switch_at = 600;  /* swap modes every ~10s */
+
+    /* Initial draw slot — kernel hands back whichever slot is currently
+     * free; subsequent acquire_next calls rotate based on just_flipped. */
+    int draw_idx = of_video_acquire_next(-1, 0);
 
     /* CPU% vs GPU% is computed from _stat_cpu_us / _stat_gpu_us, which
      * the draw functions update internally. No timing or finish calls
@@ -943,12 +1760,23 @@ int main(void) {
      * flip) is preserved, which is what the GPU was happy with. */
     unsigned int fps_last_ms = of_time_ms();
     int fps_frames = 0;
-
     while (1) {
         of_input_poll();
         if (of_btn_pressed(OF_BTN_A)) {
-            mode = (mode + 1) % 4;
+            mode = (mode + 1) % 7;
             printf("[gpudemo] mode -> %d\n", mode);
+        }
+        if (of_btn_pressed(OF_BTN_B)) {
+            run_gpu_benchmarks();
+            fps_last_ms = of_time_ms();
+            fps_frames = 0;
+            _stat_cpu_us = 0;
+            _stat_gpu_us = 0;
+            _stat_overlay_pixels = 0;
+            _stat_overlay_triangles = 0;
+            _stat_overlay_commands = 0;
+            _stat_overlay_submit_us = 0;
+            _stat_overlay_finish_us = 0;
         }
 
         switch (mode) {
@@ -956,8 +1784,17 @@ int main(void) {
             case 1: draw_persp_demo(frame);    break;
             case 2: draw_triangle_demo(frame); break;
             case 3: draw_multitri_demo(frame); break;
+            case 4: draw_translu_demo(frame);  break;
+            case 5: draw_tessellated_translu_demo(frame); break;
+            case 6: draw_large_tri_translu_demo(frame); break;
         }
-        of_video_flip();
+        /* GPU-triggered flip path: emit CMD_FLIP into the ring, kick,
+         * then ask the kernel for the next free draw slot.  CMD_FLIP's
+         * RTL drain stalls on slave_swap_pending so the CPU never
+         * blocks on vsync (kernel acquire_next is non-blocking). */
+        uint32_t flip_token = of_gpu_flip_to(draw_idx);
+        of_gpu_kick();
+        draw_idx = of_video_acquire_next(draw_idx, flip_token);
         fps_frames++;
 
         unsigned int now_ms = of_time_ms();
@@ -970,10 +1807,35 @@ int main(void) {
             unsigned int gpu_pct = 100u - cpu_pct;
             printf("[gpudemo] fps=%u.%u cpu=%u%% gpu=%u%% mode=%d\n",
                    fps_x10 / 10, fps_x10 % 10, cpu_pct, gpu_pct, mode);
+            if ((mode == 5 || mode == 6) && _stat_overlay_pixels != 0) {
+                unsigned int frames = fps_frames ? (unsigned int)fps_frames : 1u;
+                unsigned int overlay_us = _stat_overlay_submit_us + _stat_overlay_finish_us;
+                if (overlay_us == 0) overlay_us = 1;
+                unsigned int mpix_x10 =
+                    (unsigned int)(((uint64_t)_stat_overlay_pixels * 10u) / overlay_us);
+                unsigned int ktri_s =
+                    (unsigned int)(((uint64_t)_stat_overlay_triangles * 1000u) / overlay_us);
+                unsigned int cmd_f_x100 =
+                    (unsigned int)((_stat_overlay_commands * 100u) / frames);
+                printf("[gpudemo-tri] mode=%d us/f=%u submit=%u finish=%u "
+                       "pix/f=%u tri/f=%u drawcmd/f=%u.%02u mpix/s=%u.%u ktri/s=%u\n",
+                       mode, overlay_us / frames,
+                       _stat_overlay_submit_us / frames,
+                       _stat_overlay_finish_us / frames,
+                       _stat_overlay_pixels / frames,
+                       _stat_overlay_triangles / frames,
+                       cmd_f_x100 / 100u, cmd_f_x100 % 100u,
+                       mpix_x10 / 10u, mpix_x10 % 10u, ktri_s);
+            }
             fps_last_ms  = now_ms;
             fps_frames   = 0;
             _stat_cpu_us = 0;
             _stat_gpu_us = 0;
+            _stat_overlay_pixels = 0;
+            _stat_overlay_triangles = 0;
+            _stat_overlay_commands = 0;
+            _stat_overlay_submit_us = 0;
+            _stat_overlay_finish_us = 0;
         }
 
         frame++;

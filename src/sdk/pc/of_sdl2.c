@@ -75,9 +75,6 @@ static SDL_mutex *g_audio_mutex;
 /* ---- Timer ---- */
 static uint64_t g_start_us;
 
-/* ---- Save files ---- */
-#define SAVE_SIZE (64 * 1024)
-
 static uint64_t get_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -209,9 +206,10 @@ uint8_t *of_video_surface(void) {
     return g_fb[g_draw_buf];
 }
 
-void of_video_flip(void) {
+uint8_t *of_video_flip(void) {
     composite_and_present();
     g_draw_buf ^= 1;
+    return g_fb[g_draw_buf];
 }
 
 void of_video_sync(void) {
@@ -414,31 +412,6 @@ int of_audio_free(void) {
  * Timer
  * ====================================================================== */
 
-
-/* ======================================================================
- * Save Files (file-backed)
- * ====================================================================== */
-
-static void save_path(int slot, char *buf, int buflen) {
-    snprintf(buf, buflen, "save_%d.bin", slot);
-}
-
-
-
-void of_save_flush(int slot) { (void)slot; }
-
-void of_save_erase(int slot) {
-    char path[64];
-    save_path(slot, path, sizeof(path));
-    uint8_t *data = malloc(SAVE_SIZE);
-    memset(data, 0xFF, SAVE_SIZE);
-    FILE *f = fopen(path, "wb");
-    if (f) {
-        fwrite(data, 1, SAVE_SIZE, f);
-        fclose(f);
-    }
-    free(data);
-}
 
 /* ======================================================================
  * File I/O

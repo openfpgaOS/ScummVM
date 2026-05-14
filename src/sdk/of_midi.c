@@ -364,11 +364,8 @@ int of_midi_play(const uint8_t *data, uint32_t len, int loop) {
     M.paused       = 0;
     M.last_pump_us = of_time_us();
 
-    /* DEBUG: 100 Hz still hangs occasionally (~3 demo loops between
-     * crashes).  Drop to 50 Hz to test whether even fewer trap entries
-     * eliminates the accumulation.  Combined with the 2 ms PUMP_BUDGET_US
-     * cap below, total ISR CPU load is at most 50 × 2 ms = 100 ms/sec
-     * = 10 % CPU. */
+    /* Run the MIDI pump at 50 Hz. Combined with the 2 ms PUMP_BUDGET_US
+     * cap below, timer callback CPU load is bounded to 100 ms/sec. */
     of_timer_set_callback(of_midi_pump, 50);
     return OF_MIDI_OK;
 }

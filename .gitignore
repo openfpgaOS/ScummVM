@@ -1,6 +1,10 @@
 *.o
 *.elf
+._*
 app_pc
 save_*.bin
 build/
+.obj/
 releases/
+src/tools/phdp/phdp
+src/tools/phdp/phdpd

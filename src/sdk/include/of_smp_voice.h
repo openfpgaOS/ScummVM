@@ -16,12 +16,12 @@ extern "C" {
 #include <stdint.h>
 #include "of_smp_bank.h"
 
-/* Cut from 28→12 so smp_voice_tick's ISR loop finishes fast enough
- * for Doom's renderer to get the CPU back.  Dense MIDI passages lose
- * the quietest couple of voices to the stealer; audible but acceptable
- * tradeoff.  Sits well under OF_MIXER_MAX_VOICES (32) so the allocator
- * never has to re-steal. */
+/* Conservative SDK default.  Apps with their own BRAM budget can raise this
+ * at compile time, as long as they stay below OF_MIXER_MAX_VOICES (32) and
+ * keep smp_voice_tick comfortably inside the 1 kHz timer budget. */
+#ifndef SMP_MAX_VOICES
 #define SMP_MAX_VOICES 12
+#endif
 
 typedef enum {
     ENV_OFF = 0, ENV_DELAY, ENV_ATTACK, ENV_HOLD,
@@ -57,11 +57,6 @@ typedef struct {
     lfo_state_t mod_lfo;
     lfo_state_t vib_lfo;
     uint32_t base_rate_fp16; /* base 16.16 playback rate (no bend/LFO) */
-    int16_t cur_filter_fc;
-    int16_t cur_filter_q;
-    uint16_t cur_cutoff_hw;   /* last HW FC value written (skip redundant writes
-                                 from fine-grained cents changes that round to
-                                 the same Q0.16 HW cutoff) */
     uint32_t age;
     /* Countdown of smp_voice_tick calls until the underlying non-looping
      * sample has played to its natural end.  0 = not tracked (looping
@@ -87,7 +82,7 @@ void smp_voice_note_off(int midi_ch, int note);
 void smp_voice_tick(void);  /* 1 kHz ISR */
 
 /* Diagnostic stats for smp_voice_tick cost.  Task #10 probe: detect
- * whether the tick exceeds its 2 ms budget (500 Hz tick rate).
+ * whether a 1 kHz voice tick exceeds the 2 ms pump cap.
  * Fields are named cycles_* but actually hold microseconds — the
  * VexRiscv here does not expose rdcycle to user mode, so of_time_us()
  * (kernel ecall) is used instead. */
@@ -158,47 +153,6 @@ void smp_voice_set_master_volume(int vol);
  * voice engine is the only backend now. */
 void smp_voice_enable_awe_backend(int on);
 int  smp_voice_awe_backend_enabled(void);
-
-/* ------------------------------------------------------------------ */
-/* Mixer-write trace (OF_TRACE_MIXER_WRITES)                          */
-/* ------------------------------------------------------------------ */
-/* Compile with -DOF_TRACE_MIXER_WRITES to log every rate / vol / filter
- * mixer write the voice engine performs into an in-memory ring buffer.
- * Used for bit-identical pre/post-refactor verification by replaying a
- * deterministic MIDI clip before and after a change and diffing the
- * dumped traces.
- *
- * Zero overhead when the flag is not defined — the API symbols exist
- * but are no-ops. */
-
-#define SMP_TRACE_OP_RATE        1u   /* arg0=rate_fp16 */
-#define SMP_TRACE_OP_VOL_LR      2u   /* arg0=vol_l, arg1=vol_r */
-#define SMP_TRACE_OP_VOICE_RAW   3u   /* arg0=rate_fp16, arg1=vol_l, arg2=vol_r */
-#define SMP_TRACE_OP_FILTER      4u   /* arg0=cutoff_q016, arg1=q, arg2=enable */
-
-typedef struct {
-    uint32_t seq;       /* monotonic sequence number since last reset */
-    uint8_t  op;        /* SMP_TRACE_OP_* */
-    uint8_t  voice;     /* hardware mixer voice index */
-    uint16_t _pad;
-    uint32_t arg0;
-    uint32_t arg1;
-    uint32_t arg2;
-} smp_mixer_trace_entry_t;
-
-/* Zero the ring and the sequence counter. */
-void smp_mixer_trace_reset(void);
-
-/* Copy up to `max` oldest-first entries into `out`.  Returns the number
- * copied (0 if out==NULL or tracing is disabled).  Entries older than
- * the ring capacity are dropped; the returned count never exceeds the
- * smaller of `max` and the ring capacity. */
-uint32_t smp_mixer_trace_dump(smp_mixer_trace_entry_t *out, uint32_t max);
-
-/* Total entries recorded since reset (including ones overwritten by
- * ring wrap) — lets the caller detect wrap so it can warn / run a
- * shorter clip. */
-uint32_t smp_mixer_trace_total(void);
 
 #ifdef __cplusplus
 }

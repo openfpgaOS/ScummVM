@@ -1,7 +1,23 @@
 /*
- * openfpgaOS Kernel Test Suite
- * Tests syscalls, malloc, file I/O, terminal, timer, cache.
- * Two-column display. On failure: pauses, then shows summary page.
+ * testdemo — kernel acceptance test suite
+ *
+ * Canonical example of:
+ *   - Multi-file SDK app (test_*.c each cover one subsystem and
+ *     export a single test_<name>(void) entry point)
+ *   - PASS/FAIL counter + failure log + two-column terminal layout
+ *     for fitting many tests on a single 40x30 screen
+ *   - Subsystem coverage you'd want from a smoke test before tagging
+ *     a kernel build: syscalls, malloc, file I/O via fopen/fread,
+ *     terminal, timer, cache, audio, PSRAM, MIDI, networking, save
+ *     subsystem, GPU triangle/span dispatch
+ *
+ * Behaviour:
+ *   - Tests print one row per assertion in the active column.
+ *   - First failure pauses; pressing any button continues.
+ *   - At the end, the summary page lists every recorded failure with
+ *     its "name" and a short detail string.
+ *
+ * This file is the harness; the actual tests live in test_*.c.
  */
 
 #include "test.h"

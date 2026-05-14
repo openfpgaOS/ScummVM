@@ -1,67 +1,46 @@
 /*
- * openfpga_save.h -- Save file manager for openfpgaOS
+ * openfpga_save.h -- Save-file manager for openfpgaOS.
  *
- * Maps ScummVM save files to APF save slots (10 slots, 256KB each).
- * Each slot stores one save file with a simple header.
+ * Backs ScummVM's Common::SaveFileManager with the 10 nonvolatile APF
+ * save slots exposed by the SDK as POSIX paths "save:0".."save:9".
+ * Each slot stores one save under a fixed-size header that records
+ * the original ScummVM filename (e.g. "monkey-001.s00") so engine code
+ * doesn't have to know about slot IDs.
  */
 
 #ifndef OPENFPGA_SAVE_H
 #define OPENFPGA_SAVE_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-#include <of.h>
-#include <stdint.h>
-#ifdef __cplusplus
-}
-#endif
+#include "common/savefile.h"
 
-#define OPENFPGA_MAX_SAVES 10
-#define OPENFPGA_SAVE_SIZE (256 * 1024)
-
-#define SAVE_MAGIC      0x53564D53  /* 'SVMS' */
-#define SAVE_NAME_MAX   64
-#define SAVE_HEADER_SIZE (4 + SAVE_NAME_MAX + 4)  /* magic + name + data_len */
-#define SAVE_DATA_MAX   (OPENFPGA_SAVE_SIZE - SAVE_HEADER_SIZE)
+#define OPENFPGA_MAX_SAVES   10
+#define OPENFPGA_SAVE_SIZE   (256 * 1024)
+#define SAVE_MAGIC           0x53564D53u   /* 'SVMS' */
+#define SAVE_NAME_MAX        64
+#define SAVE_HEADER_SIZE     (4 + SAVE_NAME_MAX + 4)
+#define SAVE_DATA_MAX        (OPENFPGA_SAVE_SIZE - SAVE_HEADER_SIZE)
 
 struct SaveSlotHeader {
-    uint32_t magic;
-    char     filename[SAVE_NAME_MAX];
-    uint32_t dataLen;
+    uint32 magic;
+    char   filename[SAVE_NAME_MAX];
+    uint32 dataLen;
 };
 
-/*
- * OpenFPGASaveManager — manages save file I/O via APF save slots.
- *
- * Will eventually implement ScummVM's Common::SaveFileManager.
- */
-class OpenFPGASaveManager {
+/* ScummVM-facing SaveFileManager backed by APF save slots. */
+class OpenFPGASaveFileManager : public Common::SaveFileManager {
 public:
-    OpenFPGASaveManager();
-    ~OpenFPGASaveManager();
-
-    /* Find a slot containing the given filename, or -1 */
-    int findSlot(const char *filename) const;
-
-    /* Find an empty slot, or the oldest one to overwrite */
-    int findFreeSlot() const;
-
-    /* Read a save file into a malloc'd buffer. Returns data length, or -1. */
-    int loadSave(const char *filename, uint8_t **outData);
-
-    /* Write a save file to a slot. Returns 0 on success. */
-    int writeSave(const char *filename, const uint8_t *data, uint32_t len);
-
-    /* Delete a save file */
-    int deleteSave(const char *filename);
-
-    /* List all save files matching a pattern (e.g. "tentacle.s*") */
-    int listSaves(const char *pattern, char names[][SAVE_NAME_MAX], int maxEntries);
+    Common::InSaveFile  *openRawFile(const Common::String &name) override;
+    Common::InSaveFile  *openForLoading(const Common::String &name) override;
+    Common::OutSaveFile *openForSaving(const Common::String &name, bool compress = true) override;
+    bool                 removeSavefile(const Common::String &name) override;
+    Common::StringArray  listSavefiles(const Common::String &pattern) override;
+    void                 updateSavefilesList(Common::StringArray &lockedFiles) override;
+    bool                 exists(const Common::String &name) override;
 
 private:
-    /* Read the header of a save slot */
-    bool readHeader(int slot, SaveSlotHeader *hdr) const;
+    static bool   readHeader(int slot, SaveSlotHeader *hdr);
+    static int    findSlotByName(const char *name);
+    static int    findFreeSlot();
 };
 
 #endif /* OPENFPGA_SAVE_H */

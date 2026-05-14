@@ -39,7 +39,7 @@ void test_file_io(void) {
 
     /* Unregistered filenames should return NULL */
     ASSERT("bad name", fopen("nonexistent.xyz", "rb") == NULL);
-    ASSERT("bad .grp", fopen("DUKE3D.GRP", "rb") == NULL);
+    ASSERT("bad .grp", fopen("GAME.GRP", "rb") == NULL);
     ASSERT("bad path", fopen("/data/file.bin", "rb") == NULL);
     ASSERT("empty", fopen("", "rb") == NULL);
 
@@ -158,9 +158,9 @@ void test_file_io(void) {
         }
     }
 
-    /* Sequential read coherency: read multiple chunks into same
-     * buffer (like Duke3D reading GRP entries), verify each
-     * read returns correct data, not stale from previous read */
+    /* Sequential read coherency: read multiple chunks into the same
+     * buffer, verify each read returns correct data, not stale bytes
+     * from the previous read. */
     {
         static uint8_t seq_buf[4096];
 
@@ -226,9 +226,9 @@ void test_file_io(void) {
         ASSERT("dma after write", memcmp(buf_a, buf_b, 4096) == 0);
     }
 
-    /* Direct DMA coherency: simulate Duke3D pattern —
-     * write to buffer, then DMA over it, read back. Tests
-     * that cache flush before/after DMA works correctly. */
+    /* Direct DMA coherency: write to a buffer, then DMA over it and
+     * read back. Tests that cache flush before/after DMA works
+     * correctly. */
     {
         static uint8_t dma_buf[65536];
 
@@ -258,7 +258,7 @@ void test_file_io(void) {
             ASSERT("direct DMA 64K", ok);
         }
 
-        /* Repeated lseek+read pattern (GRP file access) */
+        /* Repeated lseek+read pattern for packed-file access */
         f = fopen("slot:1", "rb");
         if (f) {
             uint8_t a[256], b[256], c[256];
@@ -335,7 +335,7 @@ void test_posix_file_io(void) {
     ASSERT_EQ("read idx", n, 256);
     /* File position should now be 272 */
 
-    /* Step 4: rewind — Duke does this after loading the index */
+    /* Step 4: rewind after loading the index */
     lseek(fd, 0, SEEK_SET);
 
     /* Verify rewind: re-read header must match */

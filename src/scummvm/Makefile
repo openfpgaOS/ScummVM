@@ -47,7 +47,10 @@ CXXFLAGS  = $(COMMON_FLAGS)
 # enabled so POSIX functions like usleep() remain declared.
 CXXFLAGS += -std=gnu++11
 CXXFLAGS += -fno-exceptions -fno-rtti -fno-threadsafe-statics
-CXXFLAGS += -fno-use-cxa-atexit
+# Leave -fuse-cxa-atexit (the GCC default) on: the SDK's of_cxxabi.cpp
+# provides __cxa_atexit/__cxa_finalize/__dso_handle. -fno-use-cxa-atexit
+# would emit atexit() calls instead, pulling in musl's atexit.o which
+# also defines __cxa_atexit and triggers a multiple-definition link error.
 CXXFLAGS += -Icompat/cxx_includes
 
 # ScummVM-specific defines
@@ -84,7 +87,9 @@ LIBS = -Wl,--start-group -lc -lm -lgcc -Wl,--end-group
 # C++ runtime (SDK-provided minimal C++ ABI shim)
 CXX_RT_SRCS = $(SDK_DIR)/of_cxxabi.cpp
 
-# Backend
+# Backend.  ISO 9660 reads now go through the kernel mount API
+# (of_iso_mount + POSIX fopen/opendir under /cd) -- no vendored
+# lib9660, no app-side sector cache.
 BACKEND_SRCS = \
 	backend/openfpga_osystem.cpp \
 	backend/openfpga_mixer.cpp \
@@ -212,9 +217,20 @@ LOCAL_OBJS    = $(LOCAL_SRCS:.cpp=.o)
 SCUMMVM_OBJS  = $(SCUMMVM_SRCS:.cpp=.o)
 ALL_OBJS      = $(LOCAL_OBJS) $(SCUMMVM_OBJS) $(OF_INIT_OBJ) $(OF_SDK_C_OBJS)
 
+# ── Release / deploy paths ──────────────────────────────────────────
+# Match the SDK custom-core template: dist/<app>/ is the source tree,
+# build/<app>/ is the assembled SD-card image consumed by copy.sh /
+# package.sh.
+APP       = scummvm
+TARGET    = pocket
+ROOT      = $(realpath $(CURDIR)/../..)
+DIST      = $(ROOT)/dist/$(APP)
+OUT       = $(ROOT)/build/$(APP)
+RUNTIME   = $(ROOT)/runtime
+
 # ── Targets ─────────────────────────────────────────────────────────
 
-all: app.elf
+all: app.elf release
 	$(SIZE) $<
 
 app.elf: $(CRT_OBJS) $(ALL_OBJS) $(APP_LD)
@@ -236,8 +252,42 @@ $(SDK_DIR)/%.o: $(SDK_DIR)/%.cpp
 $(SCUMMVM)/%.o: $(SCUMMVM)/%.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
+# ── SD-card image assembly ──────────────────────────────────────────
+# Copies dist/scummvm/ to build/scummvm/, then layers in the runtime
+# bitstream + loader (per-Core), os.bin + scummvm.elf (per-platform
+# common), so the result is a tree the user can drop straight onto
+# the Pocket SD card.
+release: app.elf
+	@rm -rf $(OUT)
+	@mkdir -p $(dir $(OUT))
+	@cp -r $(DIST) $(OUT)
+	@for d in $(OUT)/Cores/*/; do \
+		cp $(RUNTIME)/bitstream.rbf_r $(RUNTIME)/loader.bin "$$d"; \
+	done
+	@for d in $(OUT)/Assets/*/; do \
+		mkdir -p "$$d/common"; \
+		cp $(RUNTIME)/os.bin "$$d/common/"; \
+		cp app.elf "$$d/common/$(APP).elf"; \
+		[ -f $(RUNTIME)/bank.ofsf ] && cp $(RUNTIME)/bank.ofsf "$$d/common/" || true; \
+	done
+	@echo "Ready: build/$(APP)/"
+
+# ── Deploy / package wrappers ───────────────────────────────────────
+copy: release
+	@$(SDK_DIR)/platforms/$(TARGET)/copy.sh "$(APP)" "$$(ls -d $(OUT)/Assets/*/common)/$(APP).elf"
+
+package: release
+	@$(ROOT)/scripts/package.sh $(APP)
+
+# ── UART push + console (single-app debug) ──────────────────────────
+debug: app.elf
+	@$(ROOT)/scripts/debug.sh app.elf
+
 clean:
 	rm -f $(ALL_OBJS) app.elf
 	find . -name '*.o' -delete
+	rm -rf $(OUT)
+
+.PHONY: all release copy package debug clean
 
 .PHONY: all clean

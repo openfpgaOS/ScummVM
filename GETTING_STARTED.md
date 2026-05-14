@@ -145,6 +145,7 @@ To add data files (up to 4), add entries for slots 3-6:
 ```
 
 Place the data files in your app directory alongside `main.c`. They get copied to the SD card automatically.
+Slot 7 is reserved for an optional `.ofsf` SoundFont bank. Slot 8 is SDK/system shared config; do not use it for app data or saves.
 
 ## Writing your app
 
@@ -179,7 +180,7 @@ Add more `.c` or `.cpp` files — they're picked up automatically.
 ## What's available
 
 - **Video:** 320x240, 6 color modes (8/4/2-bit indexed, RGB565/555/RGBA5551), double-buffered
-- **Audio:** 48 kHz stereo PCM, 18-channel OPL3 FM synthesis, MIDI playback, PCM mixer
+- **Audio:** 48 kHz stereo PCM, 32-voice hardware PCM mixer, sample-based MIDI playback
 - **Input:** D-pad, face buttons, shoulders, triggers, analog sticks, 2 players
 - **Files:** Standard `fopen`/`fread`/`fwrite` with 4 data slots
 - **Saves:** 10 persistent save slots (256 KB each)

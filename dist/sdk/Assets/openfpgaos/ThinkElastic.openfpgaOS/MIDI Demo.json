@@ -1,0 +1,27 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": {
+            "id": 666,
+            "select": false
+        },
+        "data_slots": [
+            {
+                "id": 1,
+                "filename": "os.bin"
+            },
+            {
+                "id": 2,
+                "filename": "mididemo.elf"
+            },
+            {
+                "id": 3,
+                "filename": "music.mid"
+            },
+            {
+                "id": 4,
+                "filename": "bank.ofsf"
+            }
+        ]
+    }
+}

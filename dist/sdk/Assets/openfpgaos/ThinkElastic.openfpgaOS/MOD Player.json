@@ -1,0 +1,31 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": {
+            "id": 666,
+            "select": false
+        },
+        "data_slots": [
+            {
+                "id": 1,
+                "filename": "os.bin"
+            },
+            {
+                "id": 2,
+                "filename": "moddemo.elf"
+            },
+            {
+                "id": 3,
+                "filename": "spacermx.mod"
+            },
+            {
+                "id": 4,
+                "filename": "popcorn.mod"
+            },
+            {
+                "id": 10,
+                "filename": "MODPlayer.sav"
+            }
+        ]
+    }
+}

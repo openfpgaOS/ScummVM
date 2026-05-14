@@ -14,6 +14,7 @@
                 "name": "OS Binary",
                 "required": false,
                 "parameters": 0,
+                "filename": "os.bin",
                 "extensions": ["bin"],
                 "deferload": true
             },
@@ -22,59 +23,46 @@
                 "name": "Application",
                 "required": false,
                 "parameters": 0,
+                "filename": "scummvm.elf",
                 "extensions": ["elf"],
                 "deferload": true
             },
             {
                 "id": 3,
-                "name": "Data 1",
+                "name": "Game Data",
                 "required": false,
                 "parameters": 0,
-                "extensions": ["mid", "mod", "dat", "png", "bin", "grp", "pak", "wad", "rom", "nes"],
+                "extensions": ["iso", "zip"],
                 "deferload": true
             },
             {
                 "id": 4,
-                "name": "Data 2",
+                "name": "Sound Bank",
                 "required": false,
                 "parameters": 0,
-                "extensions": ["mid", "dat", "png", "bin", "grp", "pak", "wad", "rom", "nes"],
+                "filename": "bank.ofsf",
+                "extensions": ["ofsf", "dat"],
                 "deferload": true
             },
             {
                 "id": 5,
-                "name": "Data 3",
+                "name": "Game Config",
                 "required": false,
                 "parameters": 0,
-                "extensions": ["mid", "dat", "png", "bin", "grp", "pak", "wad", "rom", "nes"],
+                "extensions": ["cfg", "txt"],
                 "deferload": true
             },
-            {
-                "id": 6,
-                "name": "Data 4",
-                "required": false,
-                "parameters": 0,
-                "extensions": ["mid", "dat", "png", "bin", "grp", "pak", "wad", "rom", "nes"],
-                "deferload": true
-            },
-            {
-                "id": 7,
-                "name": "Sound Bank",
-                "required": false,
-                "parameters": 0,
-                "extensions": ["ofsf"],
-                "deferload": true
-            },
-            { "id": 10, "name": "Save 0", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20100000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 11, "name": "Save 1", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20140000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 12, "name": "Save 2", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20180000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 13, "name": "Save 3", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x201C0000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 14, "name": "Save 4", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20200000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 15, "name": "Save 5", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20240000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 16, "name": "Save 6", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20280000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 17, "name": "Save 7", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x202C0000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 18, "name": "Save 8", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20300000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 19, "name": "Save 9", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20340000", "size_maximum": "0x40000", "extensions": ["sav"] }
+            { "id": 9,  "name": "Settings", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x200C0000", "size_maximum": "0x40000", "extensions": ["ini"] },
+            { "id": 10, "name": "Save 0",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20100000", "size_maximum": "0x40000", "extensions": ["sav"] },
+            { "id": 11, "name": "Save 1",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20140000", "size_maximum": "0x40000", "extensions": ["sav"] },
+            { "id": 12, "name": "Save 2",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20180000", "size_maximum": "0x40000", "extensions": ["sav"] },
+            { "id": 13, "name": "Save 3",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x201C0000", "size_maximum": "0x40000", "extensions": ["sav"] },
+            { "id": 14, "name": "Save 4",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20200000", "size_maximum": "0x40000", "extensions": ["sav"] },
+            { "id": 15, "name": "Save 5",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20240000", "size_maximum": "0x40000", "extensions": ["sav"] },
+            { "id": 16, "name": "Save 6",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20280000", "size_maximum": "0x40000", "extensions": ["sav"] },
+            { "id": 17, "name": "Save 7",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x202C0000", "size_maximum": "0x40000", "extensions": ["sav"] },
+            { "id": 18, "name": "Save 8",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20300000", "size_maximum": "0x40000", "extensions": ["sav"] },
+            { "id": 19, "name": "Save 9",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20340000", "size_maximum": "0x40000", "extensions": ["sav"] }
         ]
     }
 }

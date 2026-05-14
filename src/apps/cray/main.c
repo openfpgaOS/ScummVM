@@ -1,14 +1,32 @@
+/*
+ * cray — software ray tracer
+ *
+ * Canonical example of:
+ *   - A pure-CPU compute workload running unmodified from an SDK-app
+ *     ELF (no GPU, no mixer, no input — just `printf` for output)
+ *   - Using <math.h> from musl's libm (sin, cos, sqrt, pow): the SDK
+ *     bundles enough of musl that ported third-party code "just works"
+ *     so long as it doesn't touch threads, locales, dynamic linking
+ *     or filesystem paths beyond the slot:N convention
+ *
+ * Source is John Tsiombikas's c-ray-1.1 with minimal openfpgaOS glue.
+ * The renderer reads a scene from slot:3 (or built-in default) and
+ * writes a PPM to UART, which a host capture script can save.  Useful
+ * as a baseline for "how fast is the CPU when not waiting for HW".
+ *
+ * Controls: none — runs to completion, then parks.
+ */
 
-#include "of.h"
+#include <ctype.h>
+#include <errno.h>
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
-#include <ctype.h>
-#include <errno.h>
-#include <stdint.h>
-#include <time.h>
 #include <unistd.h>
+
+#include "of.h"
 
 struct vec3 {
 	float x, y, z;

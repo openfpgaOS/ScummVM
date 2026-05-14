@@ -122,7 +122,7 @@ Comprehensive positive, negative, and edge case tests for all SDK functions.
 
 ---
 
-## Save (`of_save_*`, `fopen("save_N")`)
+## Save Files (`fopen("save_N")`, `fopen("save:N")`, registered names)
 
 ### fopen("save_0", "wb") / fwrite / fclose
 - **Positive**: Write 32 bytes → fclose flushes to SD
@@ -133,40 +133,17 @@ Comprehensive positive, negative, and edge case tests for all SDK functions.
 ### fopen("save_0", "rb") / fread
 - **Positive**: Read back written data → matches
 - **Positive**: Read 4 bytes → returns 4
-- **Edge**: Read from empty/new save → returns whatever is in CRAM1
+- **Edge**: Read from empty/new save → returns current persisted slot bytes
 
 ### fopen("save_9", "wb")
 - **Positive**: Last save slot works
 - **Negative**: fopen("save_10") → returns NULL (only 0-9)
 - **Negative**: fopen("save_-1") → returns NULL
 
-### of_save_read(slot, buf, offset, len)
-- **Positive**: Read 32 bytes at offset 0 → returns 32
-- **Positive**: Read at offset 1000 → returns data from that offset
-- **Negative**: slot=-1 → returns -1
-- **Negative**: slot=10 → returns -1
-- **Edge**: offset=0x3FFFC, len=4 → reads last 4 bytes of 256KB slot
-- **Edge**: offset=0x40000, len=1 → out of bounds, returns -1
-
-### of_save_write(slot, buf, offset, len)
-- **Positive**: Write 32 bytes → returns 32
-- **Negative**: slot=10 → returns -1
-- **Edge**: Write at offset 0x40000-4, len=4 → writes last 4 bytes
-- **Edge**: Write at offset 0x40000 → out of bounds, returns -1
-
-### of_save_flush(slot)
-- **Positive**: Flush after write → data persists across reboot
-- **Negative**: slot=-1 → no crash
-
-### of_save_flush_size(slot, size)
-- **Positive**: Flush with size=32 → only 32 bytes written to SD
-- **Positive**: Flush with size=0x40000 → full slot
-- **Edge**: size=0 → no flush
-
-### of_save_erase(slot)
-- **Positive**: Erase → all bytes become 0xFF
-- **Positive**: Read after erase → 0xFF
-- **Negative**: slot=10 → no crash
+### Slot aliases
+- **Positive**: Registered filename, `save:0`, `save_0`, and `slot:10` read the same save
+- **Negative**: `slot:2` rejects write open because app/data slots are read-only
+- **Edge**: Slot 8 is shared config, not an app save slot
 
 ---
 
@@ -217,7 +194,7 @@ Comprehensive positive, negative, and edge case tests for all SDK functions.
 - **Positive**: Register slot 3 as "game.dat" → fopen("game.dat") works
 - **Positive**: Register multiple slots → all accessible
 - **Edge**: Register same slot twice with different name → last wins
-- **Edge**: Register 16 slots (MAX_FILE_SLOTS) → all work
+- **Edge**: Register 32 slots (MAX_FILE_SLOTS) → all work
 - **Edge**: Register 17th slot → silently ignored
 
 ### of_file_read(slot_id, offset, dest, length)
@@ -239,11 +216,11 @@ Comprehensive positive, negative, and edge case tests for all SDK functions.
 ### fopen("save_0", "wb")
 - **Positive**: Open for write → returns FILE*
 - **Positive**: fwrite data → write_max tracks high water mark
-- **Positive**: fclose → calls of_save_flush_size with write_max
+- **Positive**: fclose → persists the written high-water range
 
 ### fopen("save_0", "rb")
 - **Positive**: Open for read → returns FILE*
-- **Positive**: fread → reads from CRAM1
+- **Positive**: fread → reads persisted save bytes
 
 ### fopen("save_0", "r+b")
 - **Positive**: Open for read+write → returns FILE*
@@ -257,13 +234,13 @@ Comprehensive positive, negative, and edge case tests for all SDK functions.
 
 ## Mixer (`of_mixer_*`)
 
-### of_mixer_init(sample_rate, channels)
-- **Positive**: Init with 11025, 8 → mixer ready
+### of_mixer_init(max_voices, output_rate)
+- **Positive**: Init with 32, 48000 → mixer ready
 - **Edge**: Init twice → reinitializes
 
-### of_mixer_play(data, len, rate, loop, vol)
-- **Positive**: Play WAV data → audio output
-- **Positive**: loop=1 → loops continuously
+### of_mixer_play(data, sample_count, rate, priority, vol)
+- **Positive**: Play signed 16-bit mono sample-pool data → audio output
+- **Positive**: of_mixer_set_loop(start,end) → loops continuously
 - **Positive**: vol=128 → half volume
 - **Negative**: data=NULL → returns -1
 - **Edge**: len=0 → returns -1

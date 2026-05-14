@@ -4,7 +4,7 @@
  * Test codes:
  *   CS.xx  = Cache SDRAM tests
  *   C0.xx  = Cache CRAM0 tests
- *   C1.xx  = Cache CRAM1 tests (the critical ones for mixer)
+ *   C1.xx  = Legacy CRAM1 alias tests (skipped on v2 memory arch)
  */
 
 #include "test.h"
@@ -20,7 +20,7 @@
 /* Test offsets — avoid colliding with app code/data */
 #define SDRAM_TEST_OFF   0x03E00000  /* 62 MB into SDRAM */
 #define CRAM0_TEST_OFF   0x00800000  /* 8 MB into CRAM0 */
-#define CRAM1_TEST_OFF   0x00400000  /* 4 MB into CRAM1 (above mixer pool) */
+#define CRAM1_TEST_OFF   0x00400000  /* legacy CRAM1 probe offset */
 
 /* Cache parameters */
 #define DCACHE_LINE      64
@@ -578,11 +578,10 @@ void test_cache_cram0(void) {
 }
 
 /* ================================================================
- * CRAM1 "uncached" alias coherency (C1.xx)
+ * Legacy CRAM1 "uncached" alias coherency (C1.xx)
  *
- * THE critical tests. CRAM1 at 0x39 is supposed to bypass the
- * D-cache, but PMA enforcement is broken on VexiiRiscv. These
- * tests determine which flush strategies actually work.
+ * Retained as skipped pre-v2 reference code. Current mixer samples
+ * live in SDRAM and are covered by the SDRAM cache tests.
  * ================================================================ */
 void test_cache_cram1(void) {
     section_start("Cache CRAM1");

@@ -1,8 +1,20 @@
 /*
- * openfpgaOS Memory Performance Demo
+ * memdemo — characterise SDRAM bandwidth
  *
- * Benchmarks memset, memcpy, random access at various buffer sizes
- * to characterize throughput and cache behavior across SDRAM, PSRAM, and BRAM.
+ * Canonical example of:
+ *   - Comparing cached vs uncached SDRAM throughput by aliasing the
+ *     same physical bytes via 0x10xxxxxx (cached) and 0x50xxxxxx
+ *     (uncached) — the diff measures the L1 D-cache + writeback path
+ *   - of_time_us-driven microbenchmarks with a `volatile sink` to
+ *     stop the compiler eliding the loop
+ *
+ * Output is a table of MB/s for sequential read/write, memset, memcpy,
+ * and random access at four sizes (256 B, 1 KB, 16 KB, 256 KB).  Run
+ * after kernel changes to the cache policy or SDRAM controller and
+ * compare to the previous numbers — large regressions mean a path
+ * dropped its burst capability or fell off the FIFO.
+ *
+ * Controls: any button to exit after the table prints.
  */
 
 #include "of.h"
@@ -10,31 +22,20 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
 
 /* Aligned source buffer in SDRAM (used as memcpy source) */
 static uint8_t src_buf[1024 * 1024] __attribute__((aligned(64)));
 /* SDRAM destination buffer */
 static uint8_t dst_buf[1024 * 1024] __attribute__((aligned(64)));
+/* Random-access index table in SDRAM */
+static uint32_t idx_buf[262144 / 4] __attribute__((aligned(64)));
 
 /* Prevent the compiler from optimizing away the operations */
 static volatile uint8_t sink;
 
-/* CRAM0 is i_axi-only under the current PMA (see
- * GenOpenFpgaVexii.scala — CRAM0 excluded from d_axi so the sync-burst
- * refill path stays single-master).  All data-plane access to CRAM0
- * must use the 0x38xxxxxx uncached alias, which routes through p_axi.
- * Cached stores to 0x30xxxxxx trap with store-access-fault.
- *
- * The OS kernel occupies 0x30000000-0x30100000; we test at 0x38200000
- * to leave 1MB headroom for the kernel and any app PIE fallback. */
-#define PSRAM_BASE  0x38200000   /* uncached alias — cached is forbidden */
 /* Uncached SDRAM mirror — bypass D-cache for raw bus throughput measurement.
- * PSRAM no longer has a separate cached/uncached distinction at the CPU
- * level (PMA-forbidden), so UNCACHED_PSRAM_OFF is 0 and the srd/u rows
- * measure the same path as seq_rd. */
+ * 0x10xxxxxx cached SDRAM aliases to 0x50xxxxxx uncached SDRAM. */
 #define UNCACHED_SDRAM_OFF  0x40000000
-#define UNCACHED_PSRAM_OFF  0           /* PSRAM is always uncached now */
 
 /* Test sizes: 256, 1K, 16K, 256K */
 static const uint32_t sizes[]  = { 256, 1024, 16384, 262144 };
@@ -107,18 +108,17 @@ static uint32_t bench_memcpy(void *dst, const void *src, uint32_t size, int r) {
     return t1 - t0;
 }
 
-static uint32_t bench_random(void *buf, uint32_t size, int r, void *idx_store) {
+static uint32_t bench_random(void *buf, uint32_t size, int r) {
     volatile uint32_t *p = (volatile uint32_t *)buf;
     uint32_t n_words = size / 4;
-    /* Pre-calculate random indices into separate memory region */
-    uint32_t *idx_tbl = (uint32_t *)idx_store;
+    /* Pre-calculate random indices into a separate SDRAM buffer. */
     xor_state = 0x12345678;
     for (uint32_t j = 0; j < n_words; j++)
-        idx_tbl[j] = xorshift32() % n_words;
+        idx_buf[j] = xorshift32() % n_words;
     uint32_t t0 = of_time_us();
     for (int i = 0; i < r; i++) {
         for (uint32_t j = 0; j < n_words; j++)
-            p[idx_tbl[j]] = j;
+            p[idx_buf[j]] = j;
     }
     uint32_t t1 = of_time_us();
     sink = *(volatile uint8_t *)buf;
@@ -177,171 +177,20 @@ static void run_sdram(void) {
     print_row("swr/u", r, NUM_SIZES);
 
     for (int i = 0; i < NUM_SIZES; i++)
-        fmt_mbps(r[i], 16, sizes[i], bench_random(dst, sizes[i], reps[i], (void *)PSRAM_BASE), reps[i]);
+        fmt_mbps(r[i], 16, sizes[i], bench_random(dst, sizes[i], reps[i]), reps[i]);
     print_row("random", r, NUM_SIZES);
 
     for (int i = 0; i < NUM_SIZES; i++)
-        fmt_mbps(r[i], 16, sizes[i], bench_random(udst, sizes[i], reps[i], (void *)PSRAM_BASE), reps[i]);
+        fmt_mbps(r[i], 16, sizes[i], bench_random(udst, sizes[i], reps[i]), reps[i]);
     print_row("rand/u", r, NUM_SIZES);
 
-}
-
-static void run_psram(void) {
-    void *dst = (void *)PSRAM_BASE;
-    void *src = (void *)(PSRAM_BASE + 1024 * 1024);
-    char r[NUM_SIZES][16];
-
-    print_header("PSRAM");
-
-    for (int i = 0; i < NUM_SIZES; i++)
-        fmt_mbps(r[i], 16, sizes[i], bench_memset(dst, sizes[i], reps[i]), reps[i]);
-    print_row("memset", r, NUM_SIZES);
-
-    for (int i = 0; i < NUM_SIZES; i++)
-        fmt_mbps(r[i], 16, sizes[i], bench_memcpy(dst, src, sizes[i], reps[i]), reps[i]);
-    print_row("memcpy", r, NUM_SIZES);
-
-    for (int i = 0; i < NUM_SIZES; i++)
-        fmt_mbps(r[i], 16, sizes[i], bench_seq_read(dst, sizes[i], reps[i]), reps[i]);
-    print_row("seq_rd", r, NUM_SIZES);
-
-    for (int i = 0; i < NUM_SIZES; i++)
-        fmt_mbps(r[i], 16, sizes[i], bench_seq_write(dst, sizes[i], reps[i]), reps[i]);
-    print_row("seq_wr", r, NUM_SIZES);
-
-    void *udst = (void *)((uintptr_t)dst + UNCACHED_PSRAM_OFF);
-
-    for (int i = 0; i < NUM_SIZES; i++)
-        fmt_mbps(r[i], 16, sizes[i], bench_seq_read(udst, sizes[i], reps[i]), reps[i]);
-    print_row("srd/u", r, NUM_SIZES);
-
-    for (int i = 0; i < NUM_SIZES; i++)
-        fmt_mbps(r[i], 16, sizes[i], bench_seq_write(udst, sizes[i], reps[i]), reps[i]);
-    print_row("swr/u", r, NUM_SIZES);
-
-    for (int i = 0; i < NUM_SIZES; i++)
-        fmt_mbps(r[i], 16, sizes[i], bench_random(dst, sizes[i], reps[i], src_buf), reps[i]);
-    print_row("random", r, NUM_SIZES);
-
-    for (int i = 0; i < NUM_SIZES; i++)
-        fmt_mbps(r[i], 16, sizes[i], bench_random(udst, sizes[i], reps[i], src_buf), reps[i]);
-    print_row("rand/u", r, NUM_SIZES);
-}
-
-// run_sram removed — SRAM is GPU-exclusive (Z-buffer)
-
-static void run_bram(void) {
-    void *dst = (void *)0x00002000;
-    void *src = (void *)0x00004C00;
-    /* BRAM app window is 22KB [0x2000,0x7800). Two non-overlapping buffers
-     * of up to 11KB each: dst [0x2000,0x4C00), src [0x4C00,0x7800).
-     * 16KB test dropped — src+16K aliases past 0x8000 back to 0x0000,
-     * overwriting the trap handler. */
-    static const uint32_t bram_sizes[] = { 256, 1024, 8192 };
-    static const int      bram_reps[]  = { 1000, 1000, 200 };
-    #define NUM_BRAM 3
-    char r[NUM_SIZES][16];
-
-    print_header("BRAM");
-
-    for (int i = 0; i < NUM_BRAM; i++)
-        fmt_mbps(r[i], 16, bram_sizes[i], bench_memset(dst, bram_sizes[i], bram_reps[i]), bram_reps[i]);
-    snprintf(r[3], 16, "  ---");
-    print_row("memset", r, NUM_SIZES);
-
-    for (int i = 0; i < NUM_BRAM; i++)
-        fmt_mbps(r[i], 16, bram_sizes[i], bench_memcpy(dst, src, bram_sizes[i], bram_reps[i]), bram_reps[i]);
-    snprintf(r[3], 16, "  ---");
-    print_row("memcpy", r, NUM_SIZES);
-
-    for (int i = 0; i < NUM_BRAM; i++)
-        fmt_mbps(r[i], 16, bram_sizes[i], bench_random(dst, bram_sizes[i], bram_reps[i], src_buf), bram_reps[i]);
-    snprintf(r[3], 16, "  ---");
-    print_row("random", r, NUM_SIZES);
-}
-
-static void run_cross(void) {
-    void *sdram = dst_buf;
-    void *psram = (void *)PSRAM_BASE;
-    char r[NUM_SIZES][16];
-
-    /* P->S (PSRAM to SDRAM) */
-    print_header("P->S");
-
-    for (int i = 0; i < NUM_SIZES; i++) {
-        memset(psram, 0xBB, sizes[i]);
-        uint32_t t0 = of_time_us();
-        for (int j = 0; j < reps[i]; j++)
-            memcpy(sdram, psram, sizes[i]);
-        uint32_t t1 = of_time_us();
-        sink = *(volatile uint8_t *)sdram;
-        fmt_mbps(r[i], 16, sizes[i], t1 - t0, reps[i]);
-    }
-    print_row("memcpy", r, NUM_SIZES);
-
-    for (int i = 0; i < NUM_SIZES; i++) {
-        /* random read from psram, write to sdram — indices in SDRAM */
-        volatile uint32_t *ps = (volatile uint32_t *)psram;
-        volatile uint32_t *sd = (volatile uint32_t *)sdram;
-        uint32_t n_words = sizes[i] / 4;
-        uint32_t *idx_tbl = (uint32_t *)src_buf;
-        xor_state = 0x12345678;
-        for (uint32_t k = 0; k < n_words; k++)
-            idx_tbl[k] = xorshift32() % n_words;
-        uint32_t t0 = of_time_us();
-        for (int j = 0; j < reps[i]; j++) {
-            for (uint32_t k = 0; k < n_words; k++)
-                sd[k] = ps[idx_tbl[k]];
-        }
-        uint32_t t1 = of_time_us();
-        sink = *(volatile uint8_t *)sdram;
-        fmt_mbps(r[i], 16, sizes[i], t1 - t0, reps[i]);
-    }
-    print_row("random", r, NUM_SIZES);
-
-    /* S->P (SDRAM to PSRAM) */
-    print_header("S->P");
-
-    for (int i = 0; i < NUM_SIZES; i++) {
-        memset(sdram, 0xCC, sizes[i]);
-        uint32_t t0 = of_time_us();
-        for (int j = 0; j < reps[i]; j++)
-            memcpy(psram, sdram, sizes[i]);
-        uint32_t t1 = of_time_us();
-        sink = *(volatile uint8_t *)psram;
-        fmt_mbps(r[i], 16, sizes[i], t1 - t0, reps[i]);
-    }
-    print_row("memcpy", r, NUM_SIZES);
-
-    for (int i = 0; i < NUM_SIZES; i++) {
-        /* indices in SDRAM */
-        volatile uint32_t *sd = (volatile uint32_t *)sdram;
-        volatile uint32_t *ps = (volatile uint32_t *)psram;
-        uint32_t n_words = sizes[i] / 4;
-        uint32_t *idx_tbl = (uint32_t *)src_buf;
-        xor_state = 0x12345678;
-        for (uint32_t k = 0; k < n_words; k++)
-            idx_tbl[k] = xorshift32() % n_words;
-        uint32_t t0 = of_time_us();
-        for (int j = 0; j < reps[i]; j++) {
-            for (uint32_t k = 0; k < n_words; k++)
-                ps[k] = sd[idx_tbl[k]];
-        }
-        uint32_t t1 = of_time_us();
-        sink = *(volatile uint8_t *)psram;
-        fmt_mbps(r[i], 16, sizes[i], t1 - t0, reps[i]);
-    }
-    print_row("random", r, NUM_SIZES);
 }
 
 int main(void) {
     printf("\033[2J\033[H");
-    printf("Memory  Benchmark (MB/s)\n");
+    printf("SDRAM Benchmark (MB/s)\n");
 
     run_sdram();
-    run_psram();
-    run_bram();
-    run_cross();
 
     printf("\n Done. Press any button.\n");
 

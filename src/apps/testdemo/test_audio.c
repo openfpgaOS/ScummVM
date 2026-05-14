@@ -68,12 +68,26 @@ void test_mixer(void) {
         of_mixer_set_loop(v4, 0, MIX_TONE_LEN);
         usleep(20 * 1000);
         int pos = of_mixer_get_position(v4);
-        ASSERT("MX.09 pos rd", pos > 0 && pos < MIX_TONE_LEN);
+        /* After 20ms at 11025Hz playing into a 551-sample loop, pos
+         * should be ~220 samples (well within [0, MIX_TONE_LEN)). */
+        if (pos > 0 && pos < MIX_TONE_LEN) {
+            test_pass("MX.09 pos rd");
+        } else {
+            snprintf(__buf, sizeof(__buf), "v=%d pos=%d", v4, pos);
+            test_fail("MX.09 pos rd", __buf);
+        }
+
         of_mixer_set_position(v4, 0);
         usleep(5 * 1000);
         int pos2 = of_mixer_get_position(v4);
-        /* After seek to 0 + 5ms at 11025Hz, pos2 ≈ 55 samples */
-        ASSERT("MX.10 pos wr", pos2 < MIX_TONE_LEN / 4);
+        /* After seek-to-0 + 5ms at 11025Hz, pos2 ≈ 55 samples (well
+         * under MIX_TONE_LEN/4 = 137). */
+        if (pos2 < MIX_TONE_LEN / 4) {
+            test_pass("MX.10 pos wr");
+        } else {
+            snprintf(__buf, sizeof(__buf), "v=%d pos=%d", v4, pos2);
+            test_fail("MX.10 pos wr", __buf);
+        }
     }
 
     of_mixer_stop_all();
@@ -93,7 +107,7 @@ void test_mixer_adv(void) {
     of_mixer_poll_ended();
     of_mixer_free_samples();
 
-    /* Generate tone in CRAM1 */
+    /* Generate tone in the SDRAM mixer sample pool */
     #define ADV_TONE_LEN 551
     static int16_t adv_tone_src[ADV_TONE_LEN];
     for (int i = 0; i < ADV_TONE_LEN; i++)
@@ -185,7 +199,8 @@ void test_mixer_adv(void) {
         }
     }
 
-    /* MA.07: bidi looping — play with bidi, verify stays active */
+    /* MA.07: bidi compatibility surface -- current firmware ignores bidi,
+     * but the call must remain harmless while a forward loop stays active. */
     {
         int v = of_mixer_play((const uint8_t *)s16_buf, ADV_TONE_LEN, 11025, 0, 100);
         if (v >= 0) {
@@ -244,8 +259,14 @@ void test_mixer_adv(void) {
                 of_mixer_set_loop(v, 0, RATE_TONE_LEN);
                 usleep(10 * 1000);  /* 10ms */
                 int pos = of_mixer_get_position(v);
-                /* At 48kHz, 10ms = 480 samples. Allow 384-576 (±20%) */
-                ASSERT("MA.10b rate", pos >= 384 && pos <= 576);
+                /* At 48 kHz × 10 ms = 480 source samples.  Allow
+                 * 384-576 (±20%) for timer + scheduler jitter. */
+                if (pos >= 384 && pos <= 576) {
+                    test_pass("MA.10b rate");
+                } else {
+                    snprintf(__buf, sizeof(__buf), "v=%d pos=%d (want 384..576)", v, pos);
+                    test_fail("MA.10b rate", __buf);
+                }
                 of_mixer_stop(v);
             }
         }
@@ -266,8 +287,16 @@ void test_mixer_adv(void) {
                 of_mixer_set_loop(v, 0, RATE_TONE_LEN);
                 usleep(10 * 1000);
                 int pos = of_mixer_get_position(v);
-                /* At 24kHz, 10ms = 240 samples. Allow ±20%: 192-288 */
-                ASSERT("MA.11 half", pos >= 192 && pos <= 288);
+                /* At 24 kHz × 10 ms = 240 source samples.  Allow
+                 * 192-288 (±20%).  If this returns ~480 the rate
+                 * field is being ignored and the voice is playing
+                 * at the output rate (= 48 kHz). */
+                if (pos >= 192 && pos <= 288) {
+                    test_pass("MA.11 half");
+                } else {
+                    snprintf(__buf, sizeof(__buf), "v=%d pos=%d (want 192..288)", v, pos);
+                    test_fail("MA.11 half", __buf);
+                }
                 of_mixer_stop(v);
             }
         }
@@ -356,11 +385,11 @@ void test_mixer_adv(void) {
 }
 
 /* ================================================================
- * Stress test: 31 PCM voices + OPL3 simultaneously
+ * Stress test: many PCM voices simultaneously
  *
- * This simulates a worst-case Duke3D scenario: many SFX playing
- * while MIDI music runs on OPL3. Tests mixer FSM timing budget,
- * CRAM1 bus bandwidth, and audio FIFO underrun.
+ * This simulates a worst-case game-audio scenario: many SFX playing
+ * while music owns other mixer voices. Tests mixer FSM timing budget,
+ * SDRAM sample bandwidth, and audio FIFO underrun.
  * ================================================================ */
 void test_mixer_stress(void) {
     section_start("Mixer Strss");

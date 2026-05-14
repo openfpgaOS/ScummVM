@@ -12,11 +12,7 @@
             },
             {
                 "id": 2,
-                "filename": "celeste.elf"
-            },
-            {
-                "id": 10,
-                "filename": "Celeste.sav"
+                "filename": "cxxdemo.elf"
             }
         ]
     }

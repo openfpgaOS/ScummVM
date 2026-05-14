@@ -1,41 +1,45 @@
 /*
- * freadalign — minimal reproducer for the fread-alignment bug.
+ * freadalign — regression reproducer for fread() destination alignment
  *
- * Background:
- *   fread() on an SDK-opened FILE* silently returns 0 bytes when the
- *   destination pointer is not 512-byte aligned. Aligned destinations
- *   read correctly. See docs/bug-fread-alignment.md for the full
- *   context and proposed fix.
+ * Canonical example of:
+ *   - Acceptance test for a kernel bug fix (run before/after the kernel
+ *     change to confirm the fix takes hold)
+ *   - opendir/readdir/stat for "find any file" without depending on
+ *     a specific slot mapping
+ *   - Why long-lived stack buffers are a footgun on this target
+ *
+ * The bug:
+ *   fread() of an SDK-opened FILE* used to silently return 0 bytes when
+ *   the destination pointer was not 512-byte aligned.  Root cause was
+ *   a kernel DMA path that latched the destination's low bits to zero
+ *   and dropped the read.  See docs/bug-fread-alignment.md if you want
+ *   the gory details.
  *
  * What this app does:
- *   1. Opens the first real file on the card (via opendir/readdir).
- *   2. Reads the first 16 bytes into a 512-byte-aligned buffer.
- *   3. Reads the first 16 bytes into a stack-local buffer (usually
- *      4- or 8-byte aligned, never 512-aligned).
- *   4. Prints both return values and the first 16 bytes of each dest.
+ *   1. opendir("/"), pick the first non-app file >= 512 bytes
+ *   2. fread the first 16 bytes into a 512-aligned static buffer
+ *   3. fread the first 16 bytes into a stack-local buffer (4- or
+ *      8-byte aligned, never 512-aligned)
+ *   4. Print both byte counts and the first 16 bytes of each dest, and
+ *      compare
  *
- * Expected POSIX-conformant behavior:
- *   aligned   -> got=16 buf=<first 16 bytes of file>
- *   unaligned -> got=16 buf=<first 16 bytes of file>   (same data)
+ * PASS  — both reads return 16 bytes with identical contents.
+ * FAIL  — aligned returns 16, unaligned returns 0 (classic dropped DMA),
+ *         or any other mismatch.
  *
- * Observed on current kernel (2026-04-22):
- *   aligned   -> got=16 buf=<first 16 bytes of file>
- *   unaligned -> got=0  buf=00 00 00 00 ...            (DMA silently dropped)
- *
- * A passing run of this test is the acceptance criterion for the
- * kernel-side fix. Build with the standard SDK app toolchain, copy to
- * the Pocket, run.
+ * Controls: none — runs once and parks on the verdict line.
  */
 
-#include "of.h"
+#include <dirent.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
-#include <dirent.h>
 #include <sys/stat.h>
-#include <stdint.h>
+#include <unistd.h>
 
-/* 512-byte aligned destination (known-good). */
+#include "of.h"
+
+/* 512-aligned static buffer — known-good destination for the bug. */
 static uint8_t aligned_buf[512] __attribute__((aligned(512)));
 
 static void hexdump16(const uint8_t *b, int got) {
@@ -43,13 +47,15 @@ static void hexdump16(const uint8_t *b, int got) {
     for (int i = got; i < 16; i++)          printf(".. ");
 }
 
+/* Find any readable file on the card with size >= 512.  Avoids hard-
+ * coding "slot:N" so this app runs against whatever instance.json the
+ * launcher gave us. */
 static const char *pick_file(char *out, size_t outsz) {
     DIR *d = opendir("/");
     if (!d) return NULL;
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
         struct stat st;
-        /* Skip the app's own ELF and any file too small to probe. */
         if (stat(e->d_name, &st) != 0) continue;
         if (st.st_size < 512) continue;
         snprintf(out, outsz, "%s", e->d_name);
@@ -60,59 +66,53 @@ static const char *pick_file(char *out, size_t outsz) {
     return NULL;
 }
 
+static void park(void) {
+    for (;;) usleep(1000 * 1000);
+}
+
 int main(void) {
     of_video_init();
     of_video_set_display_mode(OF_DISPLAY_TERMINAL);
     printf("\033[2J\033[H");
-    printf("freadalign — fread destination-alignment bug reproducer\n\n");
+    printf("freadalign — fread destination-alignment regression test\n\n");
 
     char fname[64];
     if (!pick_file(fname, sizeof(fname))) {
-        printf("No suitable file found on card.\n");
-        for (;;) usleep(1000000);
+        printf("No suitable file found on card (need >= 512 B).\n");
+        park();
     }
     printf("Using file: %s\n\n", fname);
 
-    /* ---------- Test 1: aligned destination ---------- */
+    /* Test 1: aligned destination — must always work. */
     FILE *f = fopen(fname, "rb");
-    if (!f) {
-        printf("fopen('%s') failed\n", fname);
-        for (;;) usleep(1000000);
-    }
+    if (!f) { printf("fopen('%s') failed\n", fname); park(); }
     memset(aligned_buf, 0, sizeof(aligned_buf));
     int g1 = (int)fread(aligned_buf, 1, 16, f);
     fclose(f);
-
-    printf("aligned   (dst=%p): got=%d buf=", (void *)aligned_buf, g1);
+    printf("aligned   (dst=%p): got=%2d buf=", (void *)aligned_buf, g1);
     hexdump16(aligned_buf, g1);
     printf("\n");
 
-    /* ---------- Test 2: unaligned (stack) destination ---------- */
-    uint8_t stack_buf[16];   /* stack — 4 or 8 byte aligned, not 512. */
+    /* Test 2: unaligned (stack) destination — what the bug used to break. */
+    uint8_t stack_buf[16];
     memset(stack_buf, 0, sizeof(stack_buf));
-
     f = fopen(fname, "rb");
-    if (!f) {
-        printf("fopen('%s') failed (second open)\n", fname);
-        for (;;) usleep(1000000);
-    }
+    if (!f) { printf("fopen('%s') failed (re-open)\n", fname); park(); }
     int g2 = (int)fread(stack_buf, 1, 16, f);
     fclose(f);
-
-    printf("unaligned (dst=%p): got=%d buf=", (void *)stack_buf, g2);
+    printf("unaligned (dst=%p): got=%2d buf=", (void *)stack_buf, g2);
     hexdump16(stack_buf, g2);
     printf("\n\n");
 
-    /* ---------- Verdict ---------- */
-    if (g1 == g2 && g1 == 16 && memcmp(aligned_buf, stack_buf, 16) == 0) {
-        printf("PASS — reads match. Kernel handles unaligned fread correctly.\n");
+    if (g1 == 16 && g2 == 16 && memcmp(aligned_buf, stack_buf, 16) == 0) {
+        printf("PASS — kernel handles unaligned fread correctly.\n");
     } else if (g1 == 16 && g2 == 0) {
         printf("FAIL — unaligned fread returned 0 bytes (classic alignment bug).\n");
         printf("       See docs/bug-fread-alignment.md for the fix.\n");
     } else {
-        printf("FAIL — unexpected mismatch between aligned and unaligned reads.\n");
+        printf("FAIL — unexpected mismatch (g1=%d g2=%d).\n", g1, g2);
     }
 
-    for (;;) usleep(1000000);
+    park();
     return 0;
 }

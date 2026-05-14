@@ -2,38 +2,13 @@
 #include "of_mixer.h"
 #include <time.h>
 
-/* PSRAM / SRAM memory map.
+/* Legacy PSRAM / SRAM probes.
  *
- * CRAM0 is strictly i_axi-only on the data plane (see
- * GenOpenFpgaVexii.scala — CRAM0 is excluded from the d_axi PMA so
- * the D$ can never reach it; that's the prerequisite for sync-burst
- * CRAM0 refills to not corrupt under multi-master contention).
- * Apps that need to touch CRAM0 as data MUST use the uncached alias
- * 0x38xxxxxx, which routes through p_axi (uncached IO bus).  A
- * cached 0x30xxxxxx store will trap with "store access fault".
- *
- *   CRAM0 cached:    0x30000000 – 0x30FFFFFF (16 MB) — I-fetch only
- *   CRAM0 uncached:  0x38000000 – 0x38FFFFFF (16 MB) — d/IO access
- *   CRAM1 uncached:  0x39000000 – 0x39FFFFFF (16 MB, bridge-accessible)
- *   SRAM:            0x3A000000 – 0x3A03FFFF (256 KB)
- *
- * CRAM1 is FULLY partitioned by the OS:
- *   0x000000 – 0x27FFFF  saves (10 slots × 256 KB) — bridge-persisted
- *   0x280000 – 0x28FFFF  FTAB (filename table) — bridge-written
- *   0x290000 – 0x2FFFFF  file-IO scratch (~448 KB)
- *   0x300000 – 0x3FFFFF  I/O cache
- *   0x400000 – 0xEFFFFF  audio samples (11 MB)
- *   0xF00000 – 0xFFFFFF  AUDIO_SCRATCH_CRAM1 (1 MB) — mixer scratch
- *
- * Picking ANY region the bridge / mixer / file layer touches is
- * non-idempotent across iterations: the original test wrote slot 0
- * (saves) which the bridge then re-read on the next pass; the unused
- * tail turned out to be the audio scratch buffer.
- *
- * file-IO scratch is the only region that is (a) not bridge-managed
- * and (b) only touched during user-initiated file ops. test_psram_memory
- * runs BEFORE any file test, so its readback can't race the OS — and
- * between iterations the test's own pattern is the last write to land. */
+ * v2 memory arch retires CRAM1 and CPU-visible SRAM. The active test
+ * path skips these probes; the old address constants remain below only
+ * so the pre-v2 reference code still compiles when the skip is removed
+ * for hardware archaeology. Current mixer samples and I/O cache data
+ * live in SDRAM, not CRAM1. */
 #define CRAM0_CACHED_BASE   0x30000000  /* I-fetch only */
 #define CRAM0_UNCACHED_BASE 0x38000000  /* d-side access */
 #define CRAM0_TEST_OFFSET   0x00800000  /* 8 MB offset — avoids slot table at base */

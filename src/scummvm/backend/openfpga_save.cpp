@@ -1,32 +1,101 @@
 /*
- * openfpga_save.cpp -- Save file manager implementation
+ * openfpga_save.cpp -- SaveFileManager backed by APF save slots.
  *
- * The new SDK exposes APF save slots through POSIX paths of the form
- * "save:N". fopen("save:N", "rb"/"wb") reads/writes the slot; fclose()
- * auto-flushes a write back to SD card with the actual byte count.
+ * Slot path is "save:N" (N=0..9).  Each slot opens up as a normal POSIX
+ * file via the SDK; fclose() on a write-opened slot auto-flushes the
+ * actual byte count back to SD card.
  */
 
+#define FORBIDDEN_SYMBOL_ALLOW_ALL
 #include "openfpga_save.h"
 
+#include "common/memstream.h"
+#include "common/stream.h"
+#include "common/str.h"
+
 extern "C" {
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 }
 
-OpenFPGASaveManager::OpenFPGASaveManager() {
-}
+namespace {
 
-OpenFPGASaveManager::~OpenFPGASaveManager() {
-}
-
-static FILE *openSlot(int slot, const char *mode) {
+FILE *openSlot(int slot, const char *mode) {
     char path[16];
     snprintf(path, sizeof(path), "save:%d", slot);
     return fopen(path, mode);
 }
 
-bool OpenFPGASaveManager::readHeader(int slot, SaveSlotHeader *hdr) const {
+/* Trailing-'*' wildcard match.  Matches the simple patterns ScummVM
+ * uses for listSavefiles ("monkey.s##" gets translated by the engine
+ * to specific names, "scummvm-*" style patterns also occur). */
+bool patternMatch(const char *name, const char *pat) {
+    while (*pat && *name) {
+        if (*pat == '*') return true;
+        if (*pat == '?') { pat++; name++; continue; }
+        if (*pat != *name) return false;
+        pat++; name++;
+    }
+    if (*pat == '*') return true;
+    return *pat == '\0' && *name == '\0';
+}
+
+/* In-memory write stream that flushes its accumulated bytes to a slot
+ * on finalize() / destruction.  ScummVM expects writes to succeed
+ * immediately, and we don't want to interleave seeks with slot I/O. */
+class SlotOutStream : public Common::MemoryWriteStreamDynamic {
+public:
+    SlotOutStream(int slot, const Common::String &name)
+        : Common::MemoryWriteStreamDynamic(DisposeAfterUse::YES),
+          _slot(slot), _name(name), _flushed(false), _err(false) {}
+
+    ~SlotOutStream() override { flushToSlot(); }
+
+    bool flush() override {
+        flushToSlot();
+        return !_err;
+    }
+
+    bool err() const override {
+        return _err || Common::MemoryWriteStreamDynamic::err();
+    }
+
+private:
+    void flushToSlot() {
+        if (_flushed) return;
+        _flushed = true;
+
+        uint32 dataLen = size();
+        if (dataLen > SAVE_DATA_MAX) { _err = true; return; }
+
+        FILE *f = openSlot(_slot, "wb");
+        if (!f) { _err = true; return; }
+
+        SaveSlotHeader hdr;
+        hdr.magic = SAVE_MAGIC;
+        memset(hdr.filename, 0, SAVE_NAME_MAX);
+        strncpy(hdr.filename, _name.c_str(), SAVE_NAME_MAX - 1);
+        hdr.dataLen = dataLen;
+
+        if (fwrite(&hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
+            (dataLen && fwrite(getData(), 1, dataLen, f) != dataLen)) {
+            _err = true;
+        }
+        fclose(f);
+    }
+
+    int             _slot;
+    Common::String  _name;
+    bool            _flushed;
+    bool            _err;
+};
+
+} // namespace
+
+/* ── Slot helpers ─────────────────────────────────────────────────── */
+
+bool OpenFPGASaveFileManager::readHeader(int slot, SaveSlotHeader *hdr) {
     FILE *f = openSlot(slot, "rb");
     if (!f) return false;
     size_t n = fread(hdr, 1, sizeof(SaveSlotHeader), f);
@@ -35,126 +104,96 @@ bool OpenFPGASaveManager::readHeader(int slot, SaveSlotHeader *hdr) const {
     return hdr->magic == SAVE_MAGIC;
 }
 
-int OpenFPGASaveManager::findSlot(const char *filename) const {
+int OpenFPGASaveFileManager::findSlotByName(const char *name) {
     SaveSlotHeader hdr;
     for (int i = 0; i < OPENFPGA_MAX_SAVES; i++) {
-        if (readHeader(i, &hdr)) {
-            if (strncmp(hdr.filename, filename, SAVE_NAME_MAX) == 0)
-                return i;
-        }
+        if (readHeader(i, &hdr) && strncmp(hdr.filename, name, SAVE_NAME_MAX) == 0)
+            return i;
     }
     return -1;
 }
 
-int OpenFPGASaveManager::findFreeSlot() const {
+int OpenFPGASaveFileManager::findFreeSlot() {
     SaveSlotHeader hdr;
     for (int i = 0; i < OPENFPGA_MAX_SAVES; i++) {
-        if (!readHeader(i, &hdr))
-            return i;
+        if (!readHeader(i, &hdr)) return i;
     }
-    /* All slots used — overwrite slot 0 (could be smarter) */
-    return 0;
+    return -1;
 }
 
-int OpenFPGASaveManager::loadSave(const char *filename, uint8_t **outData) {
-    int slot = findSlot(filename);
-    if (slot < 0)
-        return -1;
+/* ── SaveFileManager interface ────────────────────────────────────── */
+
+Common::InSaveFile *OpenFPGASaveFileManager::openRawFile(const Common::String &name) {
+    return openForLoading(name);
+}
+
+Common::InSaveFile *OpenFPGASaveFileManager::openForLoading(const Common::String &name) {
+    int slot = findSlotByName(name.c_str());
+    if (slot < 0) return nullptr;
 
     FILE *f = openSlot(slot, "rb");
-    if (!f) return -1;
+    if (!f) return nullptr;
 
     SaveSlotHeader hdr;
-    if (fread(&hdr, 1, sizeof(SaveSlotHeader), f) != sizeof(SaveSlotHeader) ||
+    if (fread(&hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
         hdr.magic != SAVE_MAGIC || hdr.dataLen > SAVE_DATA_MAX) {
         fclose(f);
-        return -1;
+        return nullptr;
     }
 
-    uint8_t *data = (uint8_t *)malloc(hdr.dataLen);
-    if (!data) { fclose(f); return -1; }
+    byte *data = (byte *)malloc(hdr.dataLen);
+    if (!data) { fclose(f); return nullptr; }
 
-    if (fread(data, 1, hdr.dataLen, f) != hdr.dataLen) {
+    if (hdr.dataLen && fread(data, 1, hdr.dataLen, f) != hdr.dataLen) {
         free(data);
         fclose(f);
-        return -1;
+        return nullptr;
     }
     fclose(f);
 
-    *outData = data;
-    return (int)hdr.dataLen;
+    /* MemoryReadStream takes ownership of `data`; it will free() it. */
+    return new Common::MemoryReadStream(data, hdr.dataLen, DisposeAfterUse::YES);
 }
 
-int OpenFPGASaveManager::writeSave(const char *filename, const uint8_t *data, uint32_t len) {
-    if (len > SAVE_DATA_MAX)
-        return -1;
+Common::OutSaveFile *OpenFPGASaveFileManager::openForSaving(const Common::String &name, bool compress) {
+    int slot = findSlotByName(name.c_str());
+    if (slot < 0) slot = findFreeSlot();
+    if (slot < 0) {
+        setError(Common::kWritingFailed, "All save slots are full");
+        return nullptr;
+    }
+    /* zlib is stubbed in this build, so `compress` is a no-op even via
+     * wrapCompressedWriteStream — skip it entirely and write raw. */
+    (void)compress;
+    return new Common::OutSaveFile(new SlotOutStream(slot, name));
+}
 
-    /* Find existing slot or allocate new one */
-    int slot = findSlot(filename);
-    if (slot < 0)
-        slot = findFreeSlot();
-
+bool OpenFPGASaveFileManager::removeSavefile(const Common::String &name) {
+    int slot = findSlotByName(name.c_str());
+    if (slot < 0) return false;
+    /* Open for write, close immediately: produces a 0-byte slot that
+     * fails the magic check on next read. */
     FILE *f = openSlot(slot, "wb");
-    if (!f) return -1;
-
-    /* Write header */
-    SaveSlotHeader hdr;
-    hdr.magic = SAVE_MAGIC;
-    memset(hdr.filename, 0, SAVE_NAME_MAX);
-    strncpy(hdr.filename, filename, SAVE_NAME_MAX - 1);
-    hdr.dataLen = len;
-
-    if (fwrite(&hdr, 1, sizeof(SaveSlotHeader), f) != sizeof(SaveSlotHeader)) {
-        fclose(f);
-        return -1;
-    }
-
-    /* Write data */
-    if (fwrite(data, 1, len, f) != len) {
-        fclose(f);
-        return -1;
-    }
-
-    /* fclose() auto-flushes to SD with the actual write size */
+    if (!f) return false;
     fclose(f);
-    return 0;
+    return true;
 }
 
-int OpenFPGASaveManager::deleteSave(const char *filename) {
-    int slot = findSlot(filename);
-    if (slot < 0)
-        return -1;
-    /* Truncate by opening for write and immediately closing — writes
-     * a zero-byte save, which clears the magic and effectively erases. */
-    FILE *f = openSlot(slot, "wb");
-    if (!f) return -1;
-    fclose(f);
-    return 0;
+Common::StringArray OpenFPGASaveFileManager::listSavefiles(const Common::String &pattern) {
+    Common::StringArray out;
+    SaveSlotHeader hdr;
+    for (int i = 0; i < OPENFPGA_MAX_SAVES; i++) {
+        if (!readHeader(i, &hdr)) continue;
+        if (patternMatch(hdr.filename, pattern.c_str()))
+            out.push_back(Common::String(hdr.filename));
+    }
+    return out;
 }
 
-int OpenFPGASaveManager::listSaves(const char *pattern, char names[][SAVE_NAME_MAX], int maxEntries) {
-    int count = 0;
-    SaveSlotHeader hdr;
+void OpenFPGASaveFileManager::updateSavefilesList(Common::StringArray &lockedFiles) {
+    (void)lockedFiles;
+}
 
-    for (int i = 0; i < OPENFPGA_MAX_SAVES && count < maxEntries; i++) {
-        if (readHeader(i, &hdr)) {
-            /* Simple wildcard match: only support trailing '*' */
-            const char *star = strchr(pattern, '*');
-            if (star) {
-                int prefixLen = (int)(star - pattern);
-                if (strncmp(hdr.filename, pattern, prefixLen) == 0) {
-                    strncpy(names[count], hdr.filename, SAVE_NAME_MAX - 1);
-                    names[count][SAVE_NAME_MAX - 1] = '\0';
-                    count++;
-                }
-            } else {
-                if (strcmp(hdr.filename, pattern) == 0) {
-                    strncpy(names[count], hdr.filename, SAVE_NAME_MAX - 1);
-                    names[count][SAVE_NAME_MAX - 1] = '\0';
-                    count++;
-                }
-            }
-        }
-    }
-    return count;
+bool OpenFPGASaveFileManager::exists(const Common::String &name) {
+    return findSlotByName(name.c_str()) >= 0;
 }

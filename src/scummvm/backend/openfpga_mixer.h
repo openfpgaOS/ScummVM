@@ -1,45 +1,44 @@
 /*
- * openfpga_mixer.h -- Audio mixer for openfpgaOS
+ * openfpga_mixer.h -- ScummVM MixerManager backed by the SDK's
+ *                     of_audio_stream_* PCM streaming API.
  *
- * Wraps ScummVM's Audio::MixerImpl and pumps PCM samples
- * to the hardware via the of_audio_stream_* API (gapless
- * double-buffered streaming on the new SDK).
+ * Sample format: interleaved stereo signed 16-bit @ 48 kHz (the
+ * SDK's only stream rate, OF_AUDIO_RATE).  The pump pulls mixed
+ * frames from Audio::MixerImpl and writes them to the hardware
+ * FIFO while it has room (~21 ms = 1024 stereo frames deep).
+ *
+ * update() is driven from OSystem_OpenFPGA::pollEvent so the audio
+ * FIFO is kept topped up at frame rate; mixCallback itself is the
+ * expensive part (decodes WMA/MP3/ADPCM into mixed PCM) and is
+ * intentionally NOT moved into the timer ISR.
  */
 
 #ifndef OPENFPGA_MIXER_H
 #define OPENFPGA_MIXER_H
 
-#ifdef __cplusplus
+#include "backends/mixer/mixer.h"
+
 extern "C" {
-#endif
 #include <of.h>
 #include <stdint.h>
-#ifdef __cplusplus
 }
-#endif
 
-#define OPENFPGA_MIX_BUF_SAMPLES 1024
-
-/*
- * OpenFPGAMixer — bridges ScummVM's audio mixer to openfpgaOS PCM output.
- *
- * Will eventually wrap Audio::MixerImpl. For now, manages the PCM
- * ring buffer interface.
- */
-class OpenFPGAMixer {
+class OpenFPGAMixerManager : public MixerManager {
 public:
-    OpenFPGAMixer();
-    ~OpenFPGAMixer();
+    OpenFPGAMixerManager();
+    ~OpenFPGAMixerManager() override;
 
-    void init(int sampleRate);
-    void pump();
+    void init() override;
+    void update();          /* called from pollEvent — non-blocking */
 
-    int getSampleRate() const { return _sampleRate; }
+    void suspendAudio() override;
+    int  resumeAudio() override;
 
 private:
-    int     _sampleRate;
-    bool    _streamOpen;
-    int16_t _buffer[OPENFPGA_MIX_BUF_SAMPLES * 2];  /* Stereo */
+    bool      _streamOpen;
+    uint32_t  _outputRate;
+    uint32_t  _framesPerBlock;
+    int16_t  *_buffer;     /* _framesPerBlock * 2 (stereo) int16 */
 };
 
 #endif /* OPENFPGA_MIXER_H */

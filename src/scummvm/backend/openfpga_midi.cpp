@@ -6,6 +6,7 @@
 #include "openfpga_midi.h"
 
 #include "common/error.h"
+#include "common/timer.h"
 
 extern "C" {
 #include <of.h>
@@ -13,6 +14,51 @@ extern "C" {
 #include <of_smp_voice.h>
 #include <string.h>
 }
+
+namespace {
+/* IRQ-side state for the multiplexed timer tick.
+ *
+ *  - smp_voice_tick advances voice envelopes every tick (~1 kHz).
+ *  - The MidiParser timer proc, when installed, fires every
+ *    MIDI_TICK_US microseconds of wall-clock time (matches
+ *    MidiDriver_MPU401::getBaseTempo() == 10000 us, i.e. 100 Hz).
+ *
+ * We drive the MIDI dispatch from of_time_us() instead of an IRQ
+ * counter so the music tempo stays correct even if the SDK quantises
+ * or jitters the requested 1 kHz timer rate -- a counter-only
+ * dispatch was producing half-speed playback on hardware, which is
+ * the classic symptom of the actual IRQ rate being lower than
+ * requested.
+ *
+ * send() and smp_voice_* are single-threaded with respect to this
+ * ISR (the SDK voice engine is already designed to be driven from
+ * it), so dispatching MIDI events directly from here is safe and
+ * gives sample-accurate timing -- Note Off lands at exactly the
+ * scheduled tick instead of waiting for the next pollEvent. */
+#define MIDI_TICK_US  10000u   /* must match MidiDriver_MPU401::getBaseTempo() */
+
+Common::TimerManager::TimerProc g_midiTimerProc  = nullptr;
+void                           *g_midiTimerParam = nullptr;
+uint32_t                        g_midiNextDispatchUs = 0;
+
+void midi_tick_irq(void) {
+    smp_voice_tick();
+    if (!g_midiTimerProc) return;
+
+    uint32_t now = of_time_us();
+    /* Compare via signed delta so wrap-around at ~71 minutes is
+     * handled naturally. */
+    if ((int32_t)(now - g_midiNextDispatchUs) >= 0) {
+        g_midiTimerProc(g_midiTimerParam);
+        g_midiNextDispatchUs += MIDI_TICK_US;
+        /* If we fell behind by more than one slot (e.g. due to a
+         * long-running send()), resync to the current time to avoid
+         * spamming back-to-back dispatches. */
+        if ((int32_t)(now - g_midiNextDispatchUs) > (int32_t)MIDI_TICK_US)
+            g_midiNextDispatchUs = now + MIDI_TICK_US;
+    }
+}
+} // namespace
 
 OpenFPGAMidiDriver::OpenFPGAMidiDriver() : _open(false) {
     memset(_program, 0, sizeof(_program));
@@ -39,10 +85,11 @@ int OpenFPGAMidiDriver::open() {
     if (of_smp_bank_get() == nullptr)
         return MERR_DEVICE_NOT_AVAILABLE;
 
-    /* Drive envelopes at 1 kHz from the machine-timer ISR. of_midi_init()
-     * itself doesn't install a callback (that's of_midi_play()'s job for
-     * file-based playback); for streamed events we own the timer. */
-    of_timer_set_callback(smp_voice_tick, 1000);
+    /* Single 1 kHz IRQ drives both voice envelopes and the MidiParser
+     * tempo callback (see midi_tick_irq in the anon namespace above).
+     * of_midi_init() itself doesn't install a callback -- that's
+     * of_midi_play()'s job for file-based playback. */
+    of_timer_set_callback(midi_tick_irq, 1000);
 
     _open = true;
     return 0;
@@ -51,8 +98,23 @@ int OpenFPGAMidiDriver::open() {
 void OpenFPGAMidiDriver::close() {
     if (!_open) return;
     of_timer_stop();
+    g_midiTimerProc  = nullptr;
+    g_midiTimerParam = nullptr;
     smp_voice_all_off_global();
     _open = false;
+}
+
+void OpenFPGAMidiDriver::setTimerCallback(void *timer_param,
+                                          Common::TimerManager::TimerProc timer_proc) {
+    /* Don't go through DefaultTimerManager; route the proc straight
+     * to our hardware-timer ISR so events fire on the cycle they're
+     * scheduled on.  Seed the next-dispatch deadline relative to
+     * the current wall clock so the very first tick fires roughly
+     * one base-tempo period after install (avoids back-to-back
+     * dispatches if of_time_us happened to be near zero). */
+    g_midiTimerParam     = timer_param;
+    g_midiTimerProc      = timer_proc;
+    g_midiNextDispatchUs = of_time_us() + MIDI_TICK_US;
 }
 
 void OpenFPGAMidiDriver::send(uint32 b) {

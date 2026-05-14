@@ -38,7 +38,7 @@ struct of_services_table {
     uint32_t version;
     uint32_t count;         /* Number of function pointers */
 
-    /* -- Video (12) -- */
+    /* -- Video (14) -- */
     void      (*video_init)(void);
     uint8_t * (*video_get_surface)(void);
     uint8_t * (*video_flip)(void);
@@ -51,6 +51,17 @@ struct of_services_table {
     void      (*video_flush_cache)(void);
     void      (*video_set_display_mode)(int mode);
     void      (*video_set_color_mode)(int mode);
+    /* GPU-triggered flip (cr-gpu-triggered-flip.md):
+     * acquire_next(just_flipped_idx, fence_token) — caller passes idx
+     * of the buffer they just emitted CMD_FLIP for and the fence
+     * token the SDK helper returned (or -1, 0 on first call).  Kernel
+     * waits for fence_reached >= token (proves CMD_FLIP retired and
+     * fb_swap_pending=1 was latched), then returns the third buffer:
+     * not current scanout and not queued for next vsync.  It does not
+     * wait for vsync.  buffer_addr(idx) — returns FB address of the
+     * given idx. */
+    int       (*video_acquire_next)(int just_flipped_idx, uint32_t fence_token);
+    uint8_t * (*video_buffer_addr)(int idx);
 
     /* -- Input (4) -- */
     void      (*input_poll)(void);
@@ -210,6 +221,12 @@ struct of_services_table {
      * Older firmware leaves this NULL; callers should fall back to
      * cache_flush() (full sweep) when this is absent. */
     void      (*cache_flush_range)(void *addr, uint32_t size);
+
+    /* -- Input HID extensions (append-only) --
+     * Dock keyboard and mouse are APF Player 3/4 special controller
+     * reports, exposed separately from the two gamepad player snapshots. */
+    void      (*input_get_keyboard_state)(void *out);
+    void      (*input_read_mouse_state)(void *out);
 };
 
 #ifndef OF_PC

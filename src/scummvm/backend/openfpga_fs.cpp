@@ -1,5 +1,5 @@
 /*
- * openfpga_fs.cpp -- Filesystem implementation for openfpgaOS
+ * openfpga_fs.cpp -- POSIX-backed FS factory rooted at the ISO mount.
  */
 
 #define FORBIDDEN_SYMBOL_ALLOW_ALL
@@ -7,61 +7,38 @@
 #include "common/stream.h"
 
 extern "C" {
-#include <string.h>
+#include <dirent.h>
 #include <stdio.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/stat.h>
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * Global file registry
- * ═══════════════════════════════════════════════════════════════════ */
+/* ScummVM points us at "/cd" (see main.cpp), but the engine also asks
+ * for the current dir via "."  We treat them as the same root. */
+#define OPENFPGA_FS_ROOT  "/cd"
 
-static OpenFPGAFileReg g_files[OPENFPGA_MAX_FILES];
-static int g_fileCount = 0;
+namespace {
 
-void openfpga_fs_register(uint32 slotId, const char *filename) {
-    if (g_fileCount >= OPENFPGA_MAX_FILES) return;
-    OpenFPGAFileReg *e = &g_files[g_fileCount];
-    e->slotId = slotId;
-    strncpy(e->filename, filename, 63);
-    e->filename[63] = '\0';
-    e->used = true;
-    of_file_slot_register(slotId, filename);
-    g_fileCount++;
+bool pathIsRoot(const Common::String &p) {
+    return p.empty() || p == "." || p == "/" || p == OPENFPGA_FS_ROOT;
 }
 
-int openfpga_fs_count() { return g_fileCount; }
-
-const OpenFPGAFileReg *openfpga_fs_get(int index) {
-    if (index < 0 || index >= g_fileCount) return nullptr;
-    return &g_files[index];
-}
-
-const OpenFPGAFileReg *openfpga_fs_find(const char *name) {
-    for (int i = 0; i < g_fileCount; i++) {
-        if (strcasecmp(g_files[i].filename, name) == 0)
-            return &g_files[i];
-    }
-    return nullptr;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * StdioReadStream — wraps FILE* for ScummVM
- * ═══════════════════════════════════════════════════════════════════ */
-
-class OpenFPGAReadStream : public Common::SeekableReadStream {
+/* Stream wrapper around a stdio FILE*. */
+class StdioReadStream : public Common::SeekableReadStream {
 public:
-    OpenFPGAReadStream(FILE *f, long size) : _f(f), _size(size) {}
-    ~OpenFPGAReadStream() override { if (_f) fclose(_f); }
+    StdioReadStream(FILE *f, long sz) : _f(f), _size(sz) {}
+    ~StdioReadStream() override { if (_f) fclose(_f); }
 
-    bool eos() const override { return feof(_f) != 0; }
-    bool err() const override { return ferror(_f) != 0; }
-    void clearErr() override { clearerr(_f); }
+    bool eos() const override   { return feof(_f) != 0; }
+    bool err() const override   { return ferror(_f) != 0; }
+    void clearErr() override    { clearerr(_f); }
 
     uint32 read(void *buf, uint32 cnt) override {
         return (uint32)fread(buf, 1, cnt, _f);
     }
 
-    int64 pos() const override { return ftell(_f); }
+    int64 pos()  const override { return ftell(_f); }
     int64 size() const override { return _size; }
 
     bool seek(int64 offset, int whence = SEEK_SET) override {
@@ -73,89 +50,173 @@ private:
     long  _size;
 };
 
-/* ═══════════════════════════════════════════════════════════════════
- * OpenFPGAFSNode
- * ═══════════════════════════════════════════════════════════════════ */
+} // namespace
 
-OpenFPGAFSNode::OpenFPGAFSNode() : _path("."), _name("."), _isDir(true) {}
+OpenFPGAFSNode::OpenFPGAFSNode()
+    : _path(OPENFPGA_FS_ROOT), _name(OPENFPGA_FS_ROOT), _isDir(true) {}
 
-OpenFPGAFSNode::OpenFPGAFSNode(const Common::String &path)
-    : _path(path), _isDir(false) {
-    /* Extract filename from path */
-    const char *slash = strrchr(path.c_str(), '/');
-    _name = slash ? Common::String(slash + 1) : path;
+OpenFPGAFSNode::OpenFPGAFSNode(const Common::String &path,
+                               const Common::String &name, bool isDir)
+    : _path(path), _name(name), _isDir(isDir) {}
 
-    /* Check if it's the root/current dir */
-    if (path == "." || path == "/" || path.empty()) {
+OpenFPGAFSNode::OpenFPGAFSNode(const Common::String &path) {
+    if (pathIsRoot(path)) {
+        _path  = OPENFPGA_FS_ROOT;
+        _name  = OPENFPGA_FS_ROOT;
         _isDir = true;
-        _name = ".";
+        return;
+    }
+    /* Engine handed us either "FOO.LFL" (relative to the game dir) or
+     * "/cd/FOO.LFL" (absolute under the mount).  Normalise to the
+     * latter so stat/fopen against the kernel mount works either way. */
+    if (path.hasPrefix("/")) {
+        _path = path;
+    } else {
+        _path = Common::String(OPENFPGA_FS_ROOT) + "/" + path;
+    }
+    const char *slash = strrchr(_path.c_str(), '/');
+    _name  = slash ? Common::String(slash + 1) : _path;
+
+    /* stat() may leave st_mode at 0 on this kernel mount; fall back
+     * to probing with opendir() so subdirs are recognized. */
+    struct stat st;
+    _isDir = (::stat(_path.c_str(), &st) == 0) && S_ISDIR(st.st_mode);
+    if (!_isDir) {
+        DIR *probe = opendir(_path.c_str());
+        if (probe) { _isDir = true; closedir(probe); }
     }
 }
 
 bool OpenFPGAFSNode::exists() const {
-    if (_isDir) return true;
-    return openfpga_fs_find(_name.c_str()) != nullptr;
+    struct stat st;
+    if (::stat(_path.c_str(), &st) == 0) return true;
+
+    /* Case-insensitive fallback for ISO 9660 uppercased names. */
+    const char *slash = strrchr(_path.c_str(), '/');
+    Common::String parent = slash
+        ? Common::String(_path.c_str(), slash - _path.c_str())
+        : Common::String(".");
+    if (parent.empty()) parent = "/";
+
+    DIR *d = opendir(parent.c_str());
+    if (!d) return false;
+    bool found = false;
+    struct dirent *e;
+    while ((e = readdir(d)) != nullptr) {
+        if (strcasecmp(e->d_name, _name.c_str()) == 0) { found = true; break; }
+    }
+    closedir(d);
+    return found;
 }
 
-bool OpenFPGAFSNode::getChildren(AbstractFSList &list, ListMode mode, bool hidden) const {
+bool OpenFPGAFSNode::getChildren(AbstractFSList &list, ListMode mode, bool /*hidden*/) const {
     if (!_isDir) return false;
 
-    /* List all registered files */
-    for (int i = 0; i < openfpga_fs_count(); i++) {
-        const OpenFPGAFileReg *e = openfpga_fs_get(i);
-        if (e && e->used) {
-            if (mode == Common::FSNode::kListDirectoriesOnly)
-                continue; /* No subdirectories */
-            list.push_back(new OpenFPGAFSNode(Common::String(e->filename)));
+    DIR *d = opendir(_path.c_str());
+    if (!d) return false;
+
+    struct dirent *e;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] == '.' &&
+            (e->d_name[1] == '\0' ||
+             (e->d_name[1] == '.' && e->d_name[2] == '\0')))
+            continue;
+
+        Common::String childPath = _path + "/" + e->d_name;
+
+        /* Determine dir-ness conservatively.  The kernel's ISO mount
+         * leaves d_type=DT_UNKNOWN and st_mode=0 for everything, so
+         * neither hint is reliable; fall back to probing with
+         * opendir().  SearchMan needs this to recurse so the engine
+         * can find files inside subdirectories of the ISO. */
+        bool entryIsDir = false;
+        if (e->d_type == DT_DIR) {
+            entryIsDir = true;
+        } else if (e->d_type == DT_REG) {
+            entryIsDir = false;
+        } else {
+            struct stat st;
+            if (::stat(childPath.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                entryIsDir = true;
+            } else {
+                DIR *probe = opendir(childPath.c_str());
+                if (probe) { entryIsDir = true; closedir(probe); }
+            }
         }
+
+        if (mode == Common::FSNode::kListDirectoriesOnly && !entryIsDir) continue;
+        if (mode == Common::FSNode::kListFilesOnly       && entryIsDir)  continue;
+
+        list.push_back(new OpenFPGAFSNode(childPath, e->d_name, entryIsDir));
     }
+    closedir(d);
     return true;
 }
 
-Common::U32String OpenFPGAFSNode::getDisplayName() const {
-    return Common::U32String(_name);
-}
-
-Common::String OpenFPGAFSNode::getName() const { return _name; }
-Common::String OpenFPGAFSNode::getPath() const { return _path; }
-bool OpenFPGAFSNode::isDirectory() const { return _isDir; }
-bool OpenFPGAFSNode::isReadable() const { return exists(); }
-bool OpenFPGAFSNode::isWritable() const { return false; }
+Common::U32String OpenFPGAFSNode::getDisplayName() const { return Common::U32String(_name); }
+Common::String    OpenFPGAFSNode::getName() const        { return _name; }
+Common::String    OpenFPGAFSNode::getPath() const        { return _path; }
+bool              OpenFPGAFSNode::isDirectory() const    { return _isDir; }
+bool              OpenFPGAFSNode::isReadable() const     { return exists(); }
+bool              OpenFPGAFSNode::isWritable() const     { return false; }
 
 AbstractFSNode *OpenFPGAFSNode::getChild(const Common::String &name) const {
     if (!_isDir) return nullptr;
-    /* Return a node for a file in this directory */
-    return new OpenFPGAFSNode(name);
+    Common::String childPath = _path;
+    if (!childPath.empty() && childPath.lastChar() != '/') childPath += '/';
+    childPath += name;
+    return new OpenFPGAFSNode(childPath);
 }
 
 AbstractFSNode *OpenFPGAFSNode::getParent() const {
-    return new OpenFPGAFSNode(); /* Always return root */
+    if (pathIsRoot(_path)) return nullptr;
+    const char *slash = strrchr(_path.c_str(), '/');
+    if (!slash || slash == _path.c_str()) return new OpenFPGAFSNode();
+    return new OpenFPGAFSNode(Common::String(_path.c_str(), slash - _path.c_str()));
 }
 
 Common::SeekableReadStream *OpenFPGAFSNode::createReadStream() {
     if (_isDir) return nullptr;
 
-    FILE *f = fopen(_name.c_str(), "rb");
-    if (!f) return nullptr;
+    FILE *f = fopen(_path.c_str(), "rb");
 
+    /* ISO 9660 stores names upper-case but ScummVM asks lower-case.
+     * If exact open failed, walk the parent dir for a case-insensitive
+     * match and open that.  Cheap enough for the few-files-per-dir
+     * structure SCUMM games have. */
+    if (!f) {
+        const char *slash = strrchr(_path.c_str(), '/');
+        Common::String parent = slash
+            ? Common::String(_path.c_str(), slash - _path.c_str())
+            : Common::String(".");
+        if (parent.empty()) parent = "/";
+
+        DIR *d = opendir(parent.c_str());
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)) != nullptr) {
+                if (strcasecmp(e->d_name, _name.c_str()) == 0) {
+                    Common::String alt = parent + "/" + e->d_name;
+                    f = fopen(alt.c_str(), "rb");
+                    break;
+                }
+            }
+            closedir(d);
+        }
+    }
+
+    if (!f) return nullptr;
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
-
-    return new OpenFPGAReadStream(f, sz);
+    return new StdioReadStream(f, sz);
 }
 
-Common::SeekableWriteStream *OpenFPGAFSNode::createWriteStream(bool atomic) {
-    return nullptr; /* Read-only filesystem */
+Common::SeekableWriteStream *OpenFPGAFSNode::createWriteStream(bool /*atomic*/) {
+    return nullptr;            /* mount is read-only */
 }
 
-bool OpenFPGAFSNode::createDirectory() {
-    return false;
-}
-
-/* ═══════════════════════════════════════════════════════════════════
- * OpenFPGAFilesystemFactory
- * ═══════════════════════════════════════════════════════════════════ */
+bool OpenFPGAFSNode::createDirectory() { return false; }
 
 AbstractFSNode *OpenFPGAFilesystemFactory::makeCurrentDirectoryFileNode() const {
     return new OpenFPGAFSNode();

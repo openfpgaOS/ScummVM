@@ -30,6 +30,13 @@ public:
     bool isOpen() const override { return _open; }
     void send(uint32 b) override;
 
+    /* Pin the MidiParser onto the same 1 kHz hardware-timer ISR that
+     * advances smp_voice envelopes, instead of letting MPU401 install
+     * it on DefaultTimerManager (which only ticks from pollEvent and
+     * causes Note Off events to land late = stuck voices). */
+    void setTimerCallback(void *timer_param,
+                          Common::TimerManager::TimerProc timer_proc) override;
+
 private:
     bool    _open;
     uint8_t _program[16];     /* GM program (0..127) per channel */

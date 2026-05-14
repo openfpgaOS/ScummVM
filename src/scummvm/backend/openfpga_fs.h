@@ -1,8 +1,10 @@
 /*
- * openfpga_fs.h -- Filesystem for openfpgaOS
+ * openfpga_fs.h -- ScummVM filesystem for openfpgaOS.
  *
- * Minimal AbstractFSNode/FilesystemFactory that expose registered
- * APF data slot files as a flat directory at ".".
+ * Backed by the kernel's mount API: main() calls of_iso_mount() on the
+ * game ISO and the engine uses standard POSIX paths under the mount
+ * (e.g. "/cd/000.LFL").  This factory just adapts AbstractFSNode to
+ * fopen / opendir / stat -- there's no app-side ISO reader anymore.
  */
 
 #ifndef OPENFPGA_FS_H
@@ -13,30 +15,10 @@
 #include "backends/fs/abstract-fs.h"
 #include "backends/fs/fs-factory.h"
 
-extern "C" {
-#include <of.h>
-}
-
-#define OPENFPGA_MAX_FILES 16
-
-struct OpenFPGAFileReg {
-    uint32 slotId;
-    char   filename[64];
-    bool   used;
-};
-
-/* Global file registry */
-void openfpga_fs_register(uint32 slotId, const char *filename);
-int  openfpga_fs_count();
-const OpenFPGAFileReg *openfpga_fs_get(int index);
-const OpenFPGAFileReg *openfpga_fs_find(const char *name);
-
-/* ── FSNode ──────────────────────────────────────────────────────── */
-
 class OpenFPGAFSNode : public AbstractFSNode {
 public:
-    OpenFPGAFSNode();                            /* Root / current dir "." */
-    OpenFPGAFSNode(const Common::String &path);  /* File or dir by path */
+    OpenFPGAFSNode();                            /* root of the mount */
+    OpenFPGAFSNode(const Common::String &path);
 
     bool exists() const override;
     bool getChildren(AbstractFSList &list, ListMode mode, bool hidden) const override;
@@ -55,12 +37,12 @@ public:
     bool createDirectory() override;
 
 private:
+    OpenFPGAFSNode(const Common::String &path, const Common::String &name, bool isDir);
+
     Common::String _path;
     Common::String _name;
-    bool _isDir;
+    bool           _isDir;
 };
-
-/* ── Factory ─────────────────────────────────────────────────────── */
 
 class OpenFPGAFilesystemFactory : public FilesystemFactory {
 public:

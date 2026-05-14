@@ -2,7 +2,7 @@
 
 Build games for the [Analogue Pocket](https://www.analogue.co/pocket) in C or C++.
 
-**Hardware:** VexiiRiscv rv32imafc @ 100 MHz, 8 KB I-cache + 32 KB D-cache, 64 MB SDRAM, 320x240 video, 48 kHz stereo audio, 18-channel OPL3 FM synthesis + MIDI playback library.
+**Hardware:** VexiiRiscv rv32imafc @ 100 MHz, 8 KB I-cache + 32 KB D-cache, 64 MB SDRAM, 320x240 video, 48 kHz stereo audio, 32-voice hardware PCM mixer, and sample-based MIDI playback.
 
 > **New here?** See [GETTING_STARTED.md](GETTING_STARTED.md) — clone to running code in 5 minutes.
 
@@ -245,39 +245,39 @@ of_video_blit_letterbox(src, src_w, src_h);             // Center vertically, bl
 
 ### Audio — `of_audio.h`
 
-48 kHz stereo PCM output with hardware OPL3 (YMF262) FM synthesis.
+48 kHz stereo PCM output. `of_audio_write` accepts interleaved signed
+16-bit stereo pairs and streams them through a reserved hardware mixer
+voice.
 
 ```c
 of_audio_init();                                      // Initialize audio system
-of_audio_enqueue(samples, count);                     // Queue stereo int16_t pairs
-int free = of_audio_ring_free();                      // Samples free in ring buffer
+of_audio_write(samples, count);                       // Queue stereo int16_t pairs
+int free = of_audio_free();                           // Stereo pairs free in ring buffer
+of_audio_stream_open(sample_rate);                    // Gapless mono stream, resampled
+of_audio_stream_write(samples, count);                // Write mono int16_t samples
+of_audio_stream_close();                              // Stop stream playback
 ```
-
-**OPL3 FM synthesis (18 channels, both register banks):**
-
-```c
-of_audio_opl_write(reg, val);     // Write OPL3 register (uint16_t reg)
-of_audio_opl_reset();             // Reset all OPL3 state
-```
-
-Registers `0x00`-`0xFF` target bank 0 (channels 0-8), `0x100`-`0x1FF` target bank 1 (channels 9-17). Enable full OPL3 mode: `of_audio_opl_write(0x105, 0x01)`.
 
 ### MIDI Playback — `of_midi.h`
 
-Plays Standard MIDI Files (Format 0 and 1) through 18 OPL3 channels. Non-blocking, timer-driven. Includes a built-in General MIDI instrument bank.
+Plays Standard MIDI Files (Format 0 and 1) through the sample-based
+MIDI engine. Ship a `.ofsf` SoundFont bank in a data slot; the kernel
+auto-loads the first bank it finds and exposes it to the MIDI runtime.
 
 ```c
-of_midi_init();                              // Init OPL3 in 18-channel mode
+of_midi_init();                              // Init sample voice engine
 of_midi_play(midi_data, midi_len, 1);        // Play (1 = loop)
-of_midi_pump();                              // Call each frame (non-blocking)
 of_midi_stop();                              // Stop and silence all
-of_midi_pause();  / of_midi_resume();        // Pause/resume
+of_midi_pause();                             // Pause
+of_midi_resume();                            // Resume
 of_midi_set_volume(200);                     // Master volume 0-255
-of_midi_load_bank(custom_bank);              // Custom GM bank (NULL = built-in)
 int playing = of_midi_playing();             // Query state
 ```
 
-**Features:** Format 0 + Format 1 (multi-track), velocity-scaled volume, channel volume (CC7), pan (CC10), pitch bend (±2 semitones), tempo changes, looping, custom instrument banks. Error codes: `OF_MIDI_OK`, `OF_MIDI_ERR_BAD_HDR`, `OF_MIDI_ERR_FORMAT`, `OF_MIDI_ERR_NO_TRACKS`, `OF_MIDI_ERR_PLAYING`.
+`of_midi_play()` installs the MIDI pump on the timer ISR. Do not call
+`of_midi_pump()` from the main loop while playback is active.
+
+**Features:** Format 0 + Format 1 (multi-track), velocity-scaled volume, channel volume (CC7), pan (CC10), pitch bend, tempo changes, looping, and `.ofsf` instrument banks. Error codes: `OF_MIDI_OK`, `OF_MIDI_ERR_BAD_HDR`, `OF_MIDI_ERR_FORMAT`, `OF_MIDI_ERR_NO_TRACKS`, `OF_MIDI_ERR_PLAYING`, `OF_MIDI_ERR_NO_BANK`.
 
 **Example (mididemo):**
 
@@ -297,7 +297,6 @@ int main(void) {
     of_midi_play(midi_buf, n, 1);     // loop
 
     while (1) {
-        of_midi_pump();               // process MIDI events
         usleep(1000);
     }
 }
@@ -305,17 +304,25 @@ int main(void) {
 
 ### Audio Mixer — `of_mixer.h`
 
-Multi-voice PCM mixer with automatic resampling to 48 kHz. Input: unsigned 8-bit PCM.
+32-voice hardware PCM mixer with automatic resampling to 48 kHz. Native
+input is signed 16-bit mono PCM stored in the SDRAM mixer sample pool.
+The 8-bit API accepts signed 8-bit mono PCM and expands it to 16-bit.
 
 ```c
-of_mixer_init(8, 48000);                             // 8 voices, 48 kHz output
-int voice = of_mixer_play(pcm_u8, len, rate, pri, vol);  // Play sample → voice ID
+of_mixer_init(32, OF_MIXER_OUTPUT_RATE);             // 32 voices, 48 kHz output
+int16_t *pcm = of_mixer_alloc_samples(count * 2);    // SDRAM sample pool
+int voice = of_mixer_play((const uint8_t *)pcm, count, rate, pri, vol);
 of_mixer_set_volume(voice, 200);                     // Volume: 0-255
+of_mixer_set_pan(voice, 128);                        // 0=left, 128=center, 255=right
+of_mixer_set_loop(voice, loop_start, loop_end);      // Forward loop
 of_mixer_stop(voice);                                // Stop one voice
 of_mixer_stop_all();                                 // Stop all voices
-of_mixer_pump();                                     // Call each frame to process audio
 int active = of_mixer_voice_active(voice);           // 1 if playing, 0 if done
 ```
+
+`of_mixer_pump()` is a compatibility no-op on current firmware. The
+`of_mixer_set_bidi()` and `of_mixer_set_filter()` entry points remain
+for older source compatibility, but current hardware ignores them.
 
 ### Input — `of_input.h`
 
@@ -401,9 +408,11 @@ of_set_idle_hook(my_audio_pump);      // Called by OS during bridge waits
 of_set_idle_hook(NULL);               // Disable
 ```
 
-### Save System — `of_save.h`
+### Save Files
 
-10 persistent save slots (256 KB each), staged in the CRAM0 save window and persisted by APF nonvolatile unload handling.
+10 persistent save slots (256 KB each), mapped to APF file IDs 10-19.
+Slot 8 is reserved for SDK/shared config and is not an app save slot.
+Dirty save files are committed through the bridge when closed.
 
 **Preferred: standard C file I/O with the save filename from the instance JSON:**
 
@@ -572,15 +581,17 @@ When there's only one instance JSON for your app, the Pocket auto-selects it —
 
 | Slot ID | Name | Purpose |
 |---------|------|---------|
-| 9 | Game | Instance selector (SDK-owned in data.json) |
+| 0 | Game | Instance selector (SDK-owned in data.json) |
 | 1 | OS Binary | `os.bin` — loaded by bootloader via DMA |
 | 2 | Application | Your app ELF — loaded by OS kernel |
 | 3-6 | Data 1-4 | App data files (WAD, GRP, images, audio, etc.) |
+| 7 | Sound Bank | Optional `.ofsf` SoundFont bank for MIDI |
+| 8 | Shared Config | SDK/system-owned nonvolatile config, 256 KB |
 | 10-19 | Save 0-9 | Nonvolatile CRAM0 save slots (256 KB each) |
 
 **Rules:**
-- Slot 9 (Game selector) is defined in the SDK's `data.json` — don't add it to your instance
-- Slot 0 is reserved by APF — do not use
+- Slot 0 (Game selector) is defined in the SDK's `data.json` — don't add it to your instance
+- Slot 8 is reserved by the SDK/system — do not use it for app data or saves
 - Save slots use bridge address `0x20100000` (CRAM0 save window) with 256 KB stride
 - Place data files in your app directory — copy copies them to the SD card
 
@@ -667,9 +678,16 @@ make                                # rebuild your app
 0x10400000 ├──────────────────────┤
            │ App Code + Data      │  Up to 48 MB
            │ (loaded from ELF)    │
+0x13400000 ├──────────────────────┤
+           │ App heap / mmap      │
+0x13700000 ├──────────────────────┤
+           │ Mixer Sample Pool    │  8 MB SDRAM
+0x13F00000 ├──────────────────────┤
+           │ Runtime reserve      │  Stack / cache-evict area
 0x13FFFFFF └──────────────────────┘
 
 0x20100000   CRAM0 bridge save window: Save slots (10 x 256 KB)
+0x20380000   CRAM0 bridge shared config slot: 256 KB
 ```
 
 ---
@@ -797,7 +815,7 @@ openfpgaOS-SDK/
 │   │   ├── fbdemo/       <- PNG framebuffer display
 │   │   ├── interactdemo/ <- Pocket menu variables
 │   │   ├── memdemo/      <- memset/memcpy throughput benchmark
-│   │   ├── mididemo/     <- MIDI playback (18-ch OPL3)
+│   │   ├── mididemo/     <- Sample-based MIDI playback
 │   │   ├── moddemo/      <- MOD/tracker music playback
 │   │   ├── savea/        <- Save slot integrity test
 │   │   ├── saveb/        <- Save cross-pollution test

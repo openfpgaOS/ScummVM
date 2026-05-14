@@ -106,6 +106,11 @@ private:
     void drawCursor(uint8_t *dst) const;
 };
 
+/* Per-instance scummvm.ini filename, set by main() after it discovers
+ * which slot the launcher bound (e.g. monkey1.ini).  createConfig{Read,
+ * Write}Stream / getDefaultConfigFileName resolve through this. */
+void openfpga_set_config_path(const char *path);
+
 /* ── OSystem_OpenFPGA ────────────────────────────────────────────── */
 
 class OSystem_OpenFPGA : public ModularMixerBackend, public ModularGraphicsBackend, Common::EventSource {

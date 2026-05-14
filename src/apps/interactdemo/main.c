@@ -1,11 +1,25 @@
 /*
- * openfpgaOS Interact + Input Demo
+ * interactdemo — live view of `of_interact_get()` + controller state
  *
- * Two panels:
- *   1. Live interact variables from the Pocket menu
- *   2. ASCII controller — buttons light up when pressed
+ * Canonical example of:
+ *   - of_interact_get(idx) for reading the host launcher's per-app
+ *     interact variables (the Pocket menu sliders/dropdowns/toggles
+ *     defined in interact.json)
+ *   - of_input_poll + of_input_state for the full controller surface
+ *     (digital buttons, both analog sticks, both analog triggers)
+ *   - Diff-based terminal redraws — only the cells that changed get
+ *     repainted, so the UART bandwidth stays trivial even at 60 Hz
  *
- * 40x30 terminal, CP437 box drawing, ANSI 16-color.
+ * Two panels rendered with ANSI box-drawing + 16-colour SGR:
+ *   1. Interact: three variables from interact.json (toggle, slider,
+ *      dropdown) updated whenever the user moves them in the launcher
+ *      menu.
+ *   2. Controller: ASCII layout of the Pocket gamepad with each button
+ *      lighting up green while held.
+ *
+ * Controls: gamepad maps directly into the on-screen controller; there
+ * are no app-specific button bindings.  Use the launcher menu to
+ * adjust interact variables.
  */
 
 #include "of.h"

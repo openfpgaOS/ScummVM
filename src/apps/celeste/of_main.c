@@ -1,11 +1,26 @@
 /*
- * Celeste Classic -- openfpgaOS port (SDL shim)
+ * celeste — Celeste Classic port (SDL2-native shim into openfpgaOS HAL)
  *
- * Adapted from lemon32767/ccleste sdl12main.c.
- * Uses the openfpgaOS SDL2 shim — surface points directly at the
- * 320x240 HW framebuffer. Renders at 2x scale with centering.
+ * Canonical example of:
+ *   - Porting a third-party C game to Pocket via the SDK's SDL2 shim
+ *     using SDL2-native APIs (SDL_Init + SDL_CreateWindow +
+ *     SDL_GetWindowSurface + SDL_UpdateWindowSurface — *not* the
+ *     deprecated SDL_SetVideoMode/SDL_Flip pair).
+ *   - SDL_SetPaletteColors against the surface's palette object,
+ *     and SDL_GetKeyboardState returning a SCANCODE-indexed array
+ *     (`kbstate[SDL_SCANCODE_LEFT]`, not `kbstate[SDLK_LEFT]`).
+ *   - SDL_Mixer for SFX init, mapping onto the hardware mixer.
+ *   - Wiring the on-board controller into SDL keyboard events under
+ *     the hood — the game's main loop sees standard SDL2 input and
+ *     doesn't know it's running on a Pocket.
+ *   - Centred 2x scale into the 320x240 HW framebuffer (OFS_X/OFS_Y
+ *     below): doubles a 128x128 PICO-8 surface into 256x256 with
+ *     letterboxing.
  *
- * Game logic: celeste.c/celeste.h (MIT license, lemon32767)
+ * The pure game logic lives in celeste.c / celeste.h (MIT, lemon32767)
+ * and is unmodified upstream.  This file is the only Pocket-aware
+ * code: the SDL shim, the PICO-8 palette mapping, and the audio
+ * + tilemap loaders.
  */
 
 #include <SDL2/SDL.h>
@@ -16,13 +31,56 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "of_codec.h"
+
 #include "celeste.h"
 #include "tilemap.h"
 
 /* ======================================================================
- * Globals
+ * SFX bank — bundled `celeste-sfx.bin` at slot:4
+ *
+ * The 23 PICO-8 SFX Celeste actually uses are concatenated into a
+ * single binary at slot:4.  Format (little-endian):
+ *
+ *   uint32  magic = 'CSFX' (0x58465343)
+ *   uint32  version = 1
+ *   uint32  num_slots = 64
+ *   slots[64]:
+ *     uint32  offset    (file byte offset, 0 = empty / unused index)
+ *     uint32  length    (raw .wav bytes)
+ *   ... wav data, 4-byte aligned ...
+ *
+ * tools/build_celeste_sfx.sh builds this bundle from upstream's
+ * data/snd*.wav files.  At startup we mmap the file (just keep the
+ * blob in BSS-allocated RAM), parse each populated slot through
+ * of_codec_parse_wav, and stash a Mix_Chunk for it.  CELESTE_P8_SFX
+ * then resolves to a 1-line Mix_PlayChannel.  Music is not bundled —
+ * see the CELESTE_P8_MUSIC stub below.
  * ====================================================================== */
 
+#define CELESTE_SFX_MAGIC  0x58465343u
+#define CELESTE_SFX_NUM    64
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t num_slots;
+    struct {
+        uint32_t offset;
+        uint32_t length;
+    } slot[CELESTE_SFX_NUM];
+} celeste_sfx_header_t;
+
+static Mix_Chunk *sfx_bank[CELESTE_SFX_NUM];
+static uint8_t   *sfx_blob;       /* whole file kept around while WAV chunks parse */
+static int        sfx_loaded;     /* count of clips successfully decoded */
+
+/* ======================================================================
+ * Globals — SDL2 owns the window, we just keep the surface handle for
+ * the per-frame draw helpers that need pixels[].
+ * ====================================================================== */
+
+static SDL_Window  *window = NULL;
 static SDL_Surface *screen = NULL;
 
 #define PICO8_W 128
@@ -100,6 +158,84 @@ static void LoadData(void) {
     printf("done\nloading font...");
     load_bmp_data(font_bmp, font_bmp_len, font_data, 128, 85, 1);
     printf("done\n");
+}
+
+/* Decode one populated SFX slot from the bank into a Mix_Chunk.  Mirrors
+ * the shim's Mix_LoadWAV but reads from a memory blob instead of a file
+ * — every clip in the bundle is itself a complete WAV, so we hand each
+ * one to of_codec_parse_wav unchanged. */
+static Mix_Chunk *make_chunk_from_wav(const uint8_t *wav, uint32_t size) {
+    of_codec_result_t result;
+    if (of_codec_parse_wav(wav, size, &result) < 0) return NULL;
+
+    uint32_t num_samples = result.pcm_len;
+    if (result.bits_per_sample == 16) num_samples /= 2;
+    if (result.channels == 2)         num_samples /= 2;
+
+    int16_t *pcm_s16 = (int16_t *)of_mixer_alloc_samples(num_samples * sizeof(int16_t));
+    if (!pcm_s16) return NULL;
+
+    /* PICO-8 SFX are 16-bit mono at 22050 Hz. Keep them as signed
+     * 16-bit in the SDRAM sample pool for the hardware mixer. */
+    if (result.bits_per_sample == 16) {
+        const int16_t *s = (const int16_t *)result.pcm;
+        int step = result.channels;
+        for (uint32_t i = 0; i < num_samples; i++)
+            pcm_s16[i] = s[i * step];
+    } else {
+        int step = result.channels;
+        for (uint32_t i = 0; i < num_samples; i++)
+            pcm_s16[i] = (int16_t)(((int)result.pcm[i * step] - 128) << 8);
+    }
+
+    Mix_Chunk *chunk = (Mix_Chunk *)calloc(1, sizeof(Mix_Chunk));
+    if (!chunk) return NULL;
+    chunk->pcm_s16      = pcm_s16;
+    chunk->sample_count = num_samples;
+    chunk->sample_rate  = result.sample_rate;
+    chunk->volume       = MIX_MAX_VOLUME;
+    return chunk;
+}
+
+static void LoadSFX(void) {
+    FILE *f = fopen("slot:4", "rb");
+    if (!f) {
+        printf("[celeste] no slot:4 (sfx bank); audio silent\n");
+        return;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < (long)sizeof(celeste_sfx_header_t)) {
+        fclose(f); printf("[celeste] sfx bank: file too small\n"); return;
+    }
+
+    sfx_blob = (uint8_t *)malloc((size_t)sz);
+    if (!sfx_blob) { fclose(f); printf("[celeste] sfx bank: OOM\n"); return; }
+    fread(sfx_blob, 1, (size_t)sz, f);
+    fclose(f);
+
+    celeste_sfx_header_t *hdr = (celeste_sfx_header_t *)sfx_blob;
+    if (hdr->magic != CELESTE_SFX_MAGIC ||
+        hdr->version != 1 ||
+        hdr->num_slots != CELESTE_SFX_NUM) {
+        printf("[celeste] sfx bank: bad header (magic=%08X v=%u n=%u)\n",
+               (unsigned)hdr->magic, (unsigned)hdr->version,
+               (unsigned)hdr->num_slots);
+        free(sfx_blob); sfx_blob = NULL;
+        return;
+    }
+
+    for (int i = 0; i < CELESTE_SFX_NUM; i++) {
+        uint32_t off = hdr->slot[i].offset;
+        uint32_t len = hdr->slot[i].length;
+        if (off == 0 || len == 0) continue;
+        if (off + len > (uint32_t)sz) continue;
+        sfx_bank[i] = make_chunk_from_wav(sfx_blob + off, len);
+        if (sfx_bank[i]) sfx_loaded++;
+    }
+    printf("[celeste] sfx bank: %d/%d clips loaded\n",
+           sfx_loaded, CELESTE_SFX_NUM);
 }
 
 /* ======================================================================
@@ -259,7 +395,12 @@ static int pico8emu(CELESTE_P8_CALLBACK_TYPE call, ...) {
     #define BOOL_ARG() (Celeste_P8_bool_t)va_arg(args, int)
 
     switch (call) {
-    case CELESTE_P8_MUSIC: { INT_ARG(); INT_ARG(); INT_ARG(); } break;
+    case CELESTE_P8_MUSIC: {
+        /* Music is not bundled — would need an OGG decoder added to
+         * the SDL_mixer shim, OR transcoded WAV streams ~5 MB.  See
+         * the upstream `data/mus*.ogg` if you want to wire it up. */
+        INT_ARG(); INT_ARG(); INT_ARG();
+    } break;
     case CELESTE_P8_SPR: {
         int spr=INT_ARG(), x=INT_ARG(), y=INT_ARG();
         int cols=INT_ARG(), rows=INT_ARG();
@@ -268,7 +409,11 @@ static int pico8emu(CELESTE_P8_CALLBACK_TYPE call, ...) {
         if (spr>=0) Xblit(spr, x-camera_x, y-camera_y, fx, fy);
     } break;
     case CELESTE_P8_BTN: { int b=INT_ARG(); ret=(buttons_state&(1<<b))!=0; } break;
-    case CELESTE_P8_SFX: { INT_ARG(); } break;
+    case CELESTE_P8_SFX: {
+        int idx = INT_ARG();
+        if (idx >= 0 && idx < CELESTE_SFX_NUM && sfx_bank[idx])
+            Mix_PlayChannel(-1, sfx_bank[idx], 0);
+    } break;
     case CELESTE_P8_PAL: {
         int a=INT_ARG(), b=INT_ARG();
         if (a>=0&&a<16&&b>=0&&b<16) palette[a]=base_palette[b];
@@ -323,18 +468,31 @@ static int pico8emu(CELESTE_P8_CALLBACK_TYPE call, ...) {
  * ====================================================================== */
 
 int main(void) {
-    /* SDL_SetVideoMode: inits video, clears buffer, returns HW surface */
-    screen = SDL_SetVideoMode(320, 240, 8, SDL_SWSURFACE);
+    /* SDL2-native init: subsystems explicit, then create the window
+     * and pull its surface.  On the Pocket the window is the 320x240
+     * HW framebuffer regardless of the requested size, but writing it
+     * SDL2-style means the same code runs unchanged on a desktop
+     * SDL2 build (useful for the SDL2-on-PC test path). */
+    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
 
-    /* Set PICO-8 palette on hardware */
-    SDL_SetPalette(screen, SDL_PHYSPAL|SDL_LOGPAL,
-                   (SDL_Color *)base_palette, 0, 16);
+    window = SDL_CreateWindow("Celeste",
+                              SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+                              320, 240,
+                              SDL_WINDOW_SHOWN);
+    screen = SDL_GetWindowSurface(window);
+
+    /* In SDL2, palette colours go through SDL_SetPaletteColors against
+     * the surface's palette object — there is no SDL_PHYSPAL/LOGPAL
+     * any more; the indexed surface is itself the LUT. */
+    SDL_SetPaletteColors(screen->format->palette,
+                         base_palette, 0, 16);
     ResetPalette();
 
     Mix_OpenAudio(22050, AUDIO_S16SYS, 1, 1024);
 
     printf("now loading...\n");
     LoadData();
+    LoadSFX();
 
     Celeste_P8_set_call_func(pico8emu);
 
@@ -346,12 +504,22 @@ int main(void) {
 
     int running = 1;
     while (running) {
-        /* Input: keyboard state is updated during SDL_PollEvent */
-        const Uint8 *kbstate = SDL_GetKeyState(NULL);
+        /* Drain SDL events first so the keyboard-state array sees
+         * any KEYDOWN/KEYUP that happened since the last poll.  On
+         * Pocket the shim folds controller input into key state too. */
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) running = 0;
+        }
 
-        /* Hold Y (F9) to reset */
+        /* SDL2: keyboard state is a SCANCODE-indexed array — use
+         * SDL_SCANCODE_* (physical key), NOT SDLK_* (virtual key /
+         * keycode), or you'll index into garbage on real SDL2. */
+        const Uint8 *kbstate = SDL_GetKeyboardState(NULL);
+
+        /* Hold Y (F9) for ~1 second to reset the run. */
         static int reset_timer = 0;
-        if (initial_state && kbstate[SDLK_F9]) {
+        if (initial_state && kbstate[SDL_SCANCODE_F9]) {
             if (++reset_timer >= 30) {
                 reset_timer = 0;
                 OSDset("reset");
@@ -359,33 +527,35 @@ int main(void) {
                 Celeste_P8_set_rndseed(SDL_GetTicks());
                 Celeste_P8_init();
             }
-        } else reset_timer = 0;
-
-        buttons_state = 0;
-        SDL_GameControllerUpdate();
-
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) running = 0;
+        } else {
+            reset_timer = 0;
         }
 
-        if (kbstate[SDLK_LEFT])  buttons_state |= (1<<0);
-        if (kbstate[SDLK_RIGHT]) buttons_state |= (1<<1);
-        if (kbstate[SDLK_UP])    buttons_state |= (1<<2);
-        if (kbstate[SDLK_DOWN])  buttons_state |= (1<<3);
-        if (kbstate[SDLK_z]||kbstate[SDLK_c]) buttons_state |= (1<<4);
-        if (kbstate[SDLK_x]||kbstate[SDLK_v]) buttons_state |= (1<<5);
+        buttons_state = 0;
+        if (kbstate[SDL_SCANCODE_LEFT])  buttons_state |= (1 << 0);
+        if (kbstate[SDL_SCANCODE_RIGHT]) buttons_state |= (1 << 1);
+        if (kbstate[SDL_SCANCODE_UP])    buttons_state |= (1 << 2);
+        if (kbstate[SDL_SCANCODE_DOWN])  buttons_state |= (1 << 3);
+        if (kbstate[SDL_SCANCODE_Z] || kbstate[SDL_SCANCODE_C])
+            buttons_state |= (1 << 4);
+        if (kbstate[SDL_SCANCODE_X] || kbstate[SDL_SCANCODE_V])
+            buttons_state |= (1 << 5);
 
         Celeste_P8_update();
         Celeste_P8_draw();
         OSDdraw();
 
-        /* SDL_Flip: flip → clear next buffer → update surface pointer */
-        SDL_Flip(screen);
+        /* SDL2-native present: SDL_UpdateWindowSurface flips the
+         * back buffer to the display.  The shim handles the
+         * "clear next buffer + refresh surface->pixels" dance that
+         * SDL_Flip used to do explicitly in the SDL 1.2 path. */
+        SDL_UpdateWindowSurface(window);
+        screen = SDL_GetWindowSurface(window);
 
-        /* 30 fps */
+        /* 30 fps cap.  static `frame_start` keeps the previous-frame
+         * timestamp across iterations without leaking through globals. */
         static unsigned frame_start = 0;
-        unsigned frame_end = SDL_GetTicks();
+        unsigned frame_end  = SDL_GetTicks();
         unsigned frame_time = frame_end - frame_start;
         if (frame_time < 33) SDL_Delay(33 - frame_time);
         frame_start = SDL_GetTicks();
@@ -393,6 +563,7 @@ int main(void) {
 
     if (initial_state) SDL_free(initial_state);
     Mix_CloseAudio();
+    SDL_DestroyWindow(window);
     SDL_Quit();
     return 0;
 }

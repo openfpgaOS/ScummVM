@@ -57,6 +57,7 @@ extern "C" {
 #include "of_input.h"
 #include "of_timer.h"
 #include "of_file.h"
+#include "of_mount.h"
 #include "of_net.h"
 #include "of_analogizer.h"
 #include "of_terminal.h"

@@ -6,11 +6,13 @@
 #include "openfpga_osystem.h"
 
 #include "backends/mutex/null/null-mutex.h"
-#include "backends/saves/default/default-saves.h"
 #include "backends/timer/default/default-timer.h"
 #include "backends/events/default/default-events.h"
-#include "backends/mixer/null/null-mixer.h"
+#include "common/memstream.h"
+#include "common/stream.h"
 #include "openfpga_fs.h"
+#include "openfpga_mixer.h"
+#include "openfpga_save.h"
 
 extern "C" {
 #include <stdlib.h>
@@ -44,8 +46,8 @@ void OpenFPGAGraphicsManager::initSize(uint width, uint height, const Graphics::
     _screenChangeID++;
     _screenDirty = true;
 
-    /* Switch to overlay mode: framebuffer + terminal text on top */
-    of_video_set_display_mode(OF_DISPLAY_OVERLAY);
+    /* Game graphics only -- main() will flip to FRAMEBUFFER right
+     * before engine->run().  Configure the color mode and clear here. */
     of_video_set_color_mode(OF_VIDEO_MODE_8BIT);
     of_video_clear(0);
     of_video_flip();
@@ -216,21 +218,24 @@ void OSystem_OpenFPGA::initBackend() {
     _ofGfx = new OpenFPGAGraphicsManager();
     _graphicsManager = _ofGfx;
 
-    _mixerManager = new NullMixerManager();
+    _mixerManager = new OpenFPGAMixerManager();
     _mixerManager->init();
 
     _timerManager = new DefaultTimerManager();
     _eventManager = new DefaultEventManager(this);
-    _savefileManager = new DefaultSaveFileManager();
+    _savefileManager = new OpenFPGASaveFileManager();
     _fsFactory = new OpenFPGAFilesystemFactory();
 
     BaseBackend::initBackend();
 }
 
 bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
-    /* Pump timers */
+    /* Pump timers + audio mixer.  pollEvent fires at engine frame
+     * rate; the mixer's update() tops up the SDK audio FIFO while it
+     * has room, so as long as we're called more often than the FIFO
+     * drains (~21 ms at 48 kHz stereo) audio stays gapless. */
     ((DefaultTimerManager *)getTimerManager())->checkTimers();
-    ((NullMixerManager *)_mixerManager)->update(1);
+    ((OpenFPGAMixerManager *)_mixerManager)->update();
 
     of_input_poll();
 
@@ -354,17 +359,18 @@ void OSystem_OpenFPGA::quit() {
 }
 
 void OSystem_OpenFPGA::logMessage(LogMessageType::Type type, const char *message) {
-    /* Always show latest message at bottom two lines (28-29).
-     * Clear them, then write message at row 28 truncated to 40 chars. */
+    /* Show latest message at the bottom two lines (28-29).  Use the
+     * VT100 "Erase in Line" escape (\x1b[2K) to clear each row -- vs
+     * writing 40 literal spaces, which used to flood phdpd's mirrored
+     * byte stream with whitespace even though the on-screen result was
+     * the same. */
     char buf[80];
     strncpy(buf, message, 79);
     buf[79] = '\0';
-    /* Remove trailing newline */
     int len = strlen(buf);
     while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
         buf[--len] = '\0';
-    printf("\x1b[28;1H%-40s\x1b[29;1H%-40s\x1b[28;1H%s",
-           "", "", buf);
+    printf("\x1b[28;1H\x1b[2K\x1b[29;1H\x1b[2K\x1b[28;1H%s", buf);
     fflush(stdout);
 }
 
@@ -372,16 +378,79 @@ void OSystem_OpenFPGA::addSysArchivesToSearchSet(Common::SearchSet &s, int prior
     /* No system archives on this platform */
 }
 
+/* ScummVM's persistent config slot is per-game (monkey1.ini etc.).
+ * main() resolves the actual filename via opendir at startup and
+ * stashes it here. */
+
+namespace {
+
+char g_iniPath[64] = "";
+const char *iniPath() { return g_iniPath[0] ? g_iniPath : nullptr; }
+
+class ConfigWriteStream : public Common::MemoryWriteStreamDynamic {
+public:
+    ConfigWriteStream(const char *path)
+        : Common::MemoryWriteStreamDynamic(DisposeAfterUse::YES),
+          _path(path), _flushed(false), _err(false) {}
+
+    ~ConfigWriteStream() override { flushToSlot(); }
+
+    bool flush() override { flushToSlot(); return !_err; }
+    bool err() const override { return _err || Common::MemoryWriteStreamDynamic::err(); }
+
+private:
+    void flushToSlot() {
+        if (_flushed) return;
+        _flushed = true;
+        FILE *f = fopen(_path, "wb");
+        if (!f) { _err = true; return; }
+        uint32 n = size();
+        if (n && fwrite(getData(), 1, n, f) != n) _err = true;
+        fclose(f);
+    }
+    const char *_path;
+    bool        _flushed;
+    bool        _err;
+};
+
+} // namespace
+
+void openfpga_set_config_path(const char *path) {
+    if (!path) { g_iniPath[0] = '\0'; return; }
+    snprintf(g_iniPath, sizeof(g_iniPath), "%s", path);
+}
+
 Common::SeekableReadStream *OSystem_OpenFPGA::createConfigReadStream() {
-    return nullptr;  /* No config file */
+    const char *path = iniPath();
+    if (!path) return nullptr;
+    FILE *f = fopen(path, "rb");
+    if (!f) return nullptr;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return nullptr; }
+    long sz = ftell(f);
+    if (sz <= 0) { fclose(f); return nullptr; }
+    fseek(f, 0, SEEK_SET);
+    byte *buf = (byte *)malloc((size_t)sz);
+    if (!buf) { fclose(f); return nullptr; }
+    if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) { free(buf); fclose(f); return nullptr; }
+    fclose(f);
+    return new Common::MemoryReadStream(buf, (uint32)sz, DisposeAfterUse::YES);
 }
 
 Common::WriteStream *OSystem_OpenFPGA::createConfigWriteStream() {
-    return nullptr;  /* No writable config */
+    /* Writes to the nonvolatile config slot currently starve the
+     * launcher's UART pump on the Pocket -- same shape as the ISO read
+     * issue the cdiso CR flagged for the OS-side yielding cache-fill
+     * follow-up.  Until that lands, refuse config persistence so
+     * ScummVM's setAndFlush calls (notably updateGameGUIOptions during
+     * createInstance) early-return from flushToDisk instead of
+     * blocking.  Engine options stay in-memory for the session. */
+    return nullptr;
+    (void)iniPath();
 }
 
 Common::Path OSystem_OpenFPGA::getDefaultConfigFileName() {
-    return Common::Path();
+    const char *path = iniPath();
+    return path ? Common::Path(path) : Common::Path();
 }
 
 Common::Path OSystem_OpenFPGA::getDefaultLogFileName() {
@@ -389,16 +458,20 @@ Common::Path OSystem_OpenFPGA::getDefaultLogFileName() {
 }
 
 void OSystem_OpenFPGA::messageBox(LogMessageType::Type type, const char *message) {
-    /* Don't show GUI dialog — just log and continue */
+    /* Don't show GUI dialog — just log and continue.  Use \x1b[2K to
+     * clear each row instead of padding spaces. */
     char buf[41];
     strncpy(buf, message, 40);
     buf[40] = '\0';
-    printf("\x1b[25;1HMSGBOX:\x1b[26;1H%s", buf);
+    printf("\x1b[25;1H\x1b[2KMSGBOX:\x1b[26;1H\x1b[2K%s", buf);
     fflush(stdout);
 }
 
 void OSystem_OpenFPGA::fatalError() {
-    printf("\x1b[27;1H*** FATAL ERROR — halted ***");
+    /* Show the terminal so the user can read the panic message even
+     * if the engine had switched to framebuffer-only display. */
+    of_video_set_display_mode(OF_DISPLAY_TERMINAL);
+    printf("\x1b[27;1H\x1b[2K*** FATAL ERROR — halted ***");
     fflush(stdout);
     for (;;) { usleep(100 * 1000); }
 }

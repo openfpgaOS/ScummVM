@@ -37,9 +37,9 @@ static inline void of_file_slot_register(uint32_t slot_id, const char *filename)
 }
 
 /* Start a non-blocking file read from a data slot.
- * dest must point into a DMA-target region (the kernel rejects
- * destinations outside the platform's bridge-addressable window).
- * callback(token, result) fires when DMA completes: result=0 success, <0 error.
+ * dest must point into a DMA-target region (Pocket currently requires CRAM0).
+ * callback(token, result) fires from the data-slot completion IRQ:
+ * result=0 success, <0 error.
  * Only one async read in flight at a time (bridge limitation).
  * Returns token >= 0 on success, < 0 if busy or error. */
 static inline int of_file_read_async(int slot_id, uint32_t offset,
@@ -50,8 +50,8 @@ static inline int of_file_read_async(int slot_id, uint32_t offset,
                           (long)length, (long)callback).value;
 }
 
-/* Poll async read progress. Call from your main loop.
- * Returns 1 if a read completed (callback invoked), 0 otherwise. */
+/* Poll async read progress. Optional on Pocket: completion is IRQ-driven.
+ * Returns 1 once per completed read, 0 otherwise. */
 static inline int of_file_async_poll(void) {
     return (int)of_ecall0(OF_EID_FILE, OF_FILE_FID_ASYNC_POLL).value;
 }

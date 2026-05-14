@@ -1,13 +1,30 @@
 /*
- * moddemo — Minimal 4-channel MOD player for openfpgaOS
+ * moddemo — minimal 4-channel ProTracker MOD player
  *
- * All mixing in FPGA hardware. CPU only:
- *   1. Parses MOD header, uploads 8-bit samples to CRAM1
- *   2. Reads pattern data and updates voice registers at tick rate
- *   3. Computes effects (portamento, volume slide, arpeggio) in software
+ * Canonical example of:
+ *   - Mapping a tracker channel to a *pinned* hardware mixer voice via
+ *     of_mixer_play (note-on) + of_mixer_retrigger (subsequent notes).
+ *     Stop+play would let the allocator re-pick the slot and channels
+ *     would steal each other — see project memory `mod_voice_pinning`.
+ *   - Uploading 8-bit signed samples to the SDRAM sample pool with
+ *     of_mixer_alloc_samples (the kernel handles the cache flush so
+ *     the HW mixer's AXI master sees committed bytes)
+ *   - Per-voice rate updates with of_mixer_set_rate_raw (Q16.16) on
+ *     the tracker's tick boundary — no per-sample CPU mixing
+ *   - Reserved of_mixer_set_filter calls for the Amiga-A500 low-pass
+ *     path; current firmware keeps that API as a no-op compatibility hook
  *
- * Loads MOD files from data slots 3 and 4.
- * Press A to switch songs, B to skip to next pattern.
+ * The CPU runs the tracker engine (period table, effect column,
+ * volume slides, arpeggios) at ~50 Hz; everything per-sample is the
+ * HW mixer's job.  This is what makes a MOD demo cheap on Pocket.
+ *
+ * Slot map (per instance.json):
+ *   slot:3  primary MOD file
+ *   slot:4  alternate MOD file (A button switches)
+ *
+ * Controls:
+ *   A   switch between slot:3 and slot:4
+ *   B   skip to next pattern in the song
  */
 
 #include "of.h"
@@ -50,7 +67,7 @@ typedef struct {
     uint8_t      order[MOD_MAX_PATTERNS];
     int          num_patterns;
     uint8_t     *pattern_data;  /* raw pattern bytes */
-    int8_t      *sample_data[MOD_NUM_SAMPLES]; /* pointers into CRAM1 */
+    int8_t      *sample_data[MOD_NUM_SAMPLES]; /* pointers into SDRAM sample pool */
 } mod_file_t;
 
 /* ======================================================================
@@ -67,10 +84,9 @@ static const uint16_t period_table[36] = {
  * Amiga base clock = 7093789.2 Hz (PAL), period is clock divider. */
 #define AMIGA_CLOCK 7093789
 
-/* Amiga-style low-pass: the A500 output stage rolled off around 7 kHz
- * (LED filter off).  SVF cutoff is Q0.16 where 65535 = Nyquist (24 kHz).
- * 7 kHz → 7000/24000 × 65536 ≈ 19115.  A touch of resonance (Q ≈ 20)
- * adds a slight presence bump at the cutoff. */
+/* Reserved Amiga-style low-pass settings. The current mixer firmware
+ * ignores of_mixer_set_filter(), but keeping the values here preserves
+ * the intended A500-style path for hardware that implements it later. */
 #define MOD_LPF_CUTOFF  35000
 #define MOD_LPF_Q       80
 
@@ -201,7 +217,7 @@ static int parse_mod(mod_file_t *m, const uint8_t *data, uint32_t len) {
     /* Sample data follows patterns */
     uint32_t sample_offset = 1084 + m->num_patterns * MOD_ROWS_PER_PAT * MOD_NUM_CHANNELS * 4;
 
-    /* Upload samples to CRAM1, converting 8-bit signed → 16-bit signed.
+    /* Upload samples to the SDRAM mixer pool, converting 8-bit signed to 16-bit signed.
      * The hardware mixer expects 16-bit samples via of_mixer_play. */
     for (int i = 0; i < MOD_NUM_SAMPLES; i++) {
         uint32_t slen = m->samples[i].length;
@@ -217,7 +233,7 @@ static int parse_mod(mod_file_t *m, const uint8_t *data, uint32_t len) {
         /* Allocate 2 bytes per sample (16-bit) */
         int16_t *cram = (int16_t *)of_mixer_alloc_samples(slen * 2);
         if (!cram) {
-            printf("CRAM1 full at sample %d\n", i + 1);
+            printf("sample pool full at sample %d\n", i + 1);
             m->sample_data[i] = NULL;
             continue;
         }

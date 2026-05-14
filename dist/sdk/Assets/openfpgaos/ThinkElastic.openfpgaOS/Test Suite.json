@@ -15,6 +15,10 @@
                 "filename": "testdemo.elf"
             },
             {
+                "id": 4,
+                "filename": "bank.ofsf"
+            },
+            {
                 "id": 10,
                 "filename": "Test_0.sav"
             },
