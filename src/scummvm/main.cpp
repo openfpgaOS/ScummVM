@@ -343,6 +343,13 @@ extern "C" int main(void) {
      * starves the launcher UART pump on the Pocket. */
     ConfMan.setBool("openfpga_skip_detection", true, gid);
 
+    /* Enable multi-MIDI so iMUSE creates BOTH the AdLib (OPL emu) and
+     * our openfpga GM drivers.  Without this, picking our GM driver
+     * makes iMUSE skip AdLib music in the SCUMM PAK (the ADL/SBL
+     * sub-blocks).  With multi-MIDI, AdLib music renders through OPL
+     * emu into our mixer, and MT-32-style cues go through our driver. */
+    ConfMan.setBool("multi_midi", true, gid);
+
     /* Optional per-game variant override (e.g. "Floppy", "CD", "SE").
      * Leave empty and the fast path picks the first matching entry
      * in gameVariantsTable for `gameid`. */

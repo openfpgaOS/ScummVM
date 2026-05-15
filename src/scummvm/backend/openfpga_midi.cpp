@@ -41,24 +41,41 @@ Common::TimerManager::TimerProc g_midiTimerProc  = nullptr;
 void                           *g_midiTimerParam = nullptr;
 uint32_t                        g_midiNextDispatchUs = 0;
 
+/* IRQ runs in M-mode; calling of_time_us() (an ecall) from inside the
+ * IRQ handler re-enters the OS trap dispatcher and corrupts the saved
+ * return context.
+ *
+ * Keep the IRQ minimal: just run the SMP voice envelope tick.  Timing
+ * for the iMUSE dispatch is done from the main thread using of_time_us
+ * (safe to ecall from there) so it tracks real wall-clock regardless
+ * of the IRQ rate the SDK actually configured. */
 void midi_tick_irq(void) {
     smp_voice_tick();
-    if (!g_midiTimerProc) return;
-
-    uint32_t now = of_time_us();
-    /* Compare via signed delta so wrap-around at ~71 minutes is
-     * handled naturally. */
-    if ((int32_t)(now - g_midiNextDispatchUs) >= 0) {
-        g_midiTimerProc(g_midiTimerParam);
-        g_midiNextDispatchUs += MIDI_TICK_US;
-        /* If we fell behind by more than one slot (e.g. due to a
-         * long-running send()), resync to the current time to avoid
-         * spamming back-to-back dispatches. */
-        if ((int32_t)(now - g_midiNextDispatchUs) > (int32_t)MIDI_TICK_US)
-            g_midiNextDispatchUs = now + MIDI_TICK_US;
-    }
 }
 } // namespace
+
+/* Called from the main thread (via pollEvent in our OSystem backend).
+ * Computes elapsed wall-clock since the last call and dispatches the
+ * appropriate number of MIDI_TICK_US slots to iMUSE.  Tracks real time
+ * regardless of the actual IRQ frequency. */
+void openfpga_midi_pump_pending() {
+    if (!g_midiTimerProc) return;
+    static uint32_t lastUs = 0;
+    uint32_t now = of_time_us();
+    if (lastUs == 0) { lastUs = now; return; }
+    int32_t elapsed = (int32_t)(now - lastUs);
+    if (elapsed < (int32_t)MIDI_TICK_US) return;
+    int slots = elapsed / MIDI_TICK_US;
+    /* Dispatch all pending slots so Note-Off events fire on time and
+     * notes don't ring forever.  iMUSE's timer callback is cheap
+     * (~bookkeeping + per-event send()); even a 200-slot catch-up
+     * burst after a stall is sub-millisecond.  We still ratchet
+     * lastUs to NOW so we don't keep replaying old time. */
+    if (slots > 256) slots = 256;     /* sanity ceiling */
+    lastUs += slots * MIDI_TICK_US;
+    for (int i = 0; i < slots; ++i)
+        g_midiTimerProc(g_midiTimerParam);
+}
 
 OpenFPGAMidiDriver::OpenFPGAMidiDriver() : _open(false) {
     memset(_program, 0, sizeof(_program));
@@ -75,15 +92,19 @@ OpenFPGAMidiDriver::~OpenFPGAMidiDriver() {
 }
 
 int OpenFPGAMidiDriver::open() {
+    warning("[openfpga_midi] open()");
     if (_open) return MERR_ALREADY_OPEN;
 
-    if (of_midi_init() != OF_MIDI_OK)
+    if (of_midi_init() != OF_MIDI_OK) {
+        warning("[openfpga_midi] of_midi_init FAILED");
         return MERR_DEVICE_NOT_AVAILABLE;
+    }
 
-    /* Without a SoundFont bank we have nothing to synthesize from --
-     * let ScummVM fall back to its software OPL emu. */
-    if (of_smp_bank_get() == nullptr)
+    if (of_smp_bank_get() == nullptr) {
+        warning("[openfpga_midi] SMP bank NOT loaded");
         return MERR_DEVICE_NOT_AVAILABLE;
+    }
+    warning("[openfpga_midi] open OK -- MIDI driver active");
 
     /* Single 1 kHz IRQ drives both voice envelopes and the MidiParser
      * tempo callback (see midi_tick_irq in the anon namespace above).
@@ -114,11 +135,25 @@ void OpenFPGAMidiDriver::setTimerCallback(void *timer_param,
      * dispatches if of_time_us happened to be near zero). */
     g_midiTimerParam     = timer_param;
     g_midiTimerProc      = timer_proc;
-    g_midiNextDispatchUs = of_time_us() + MIDI_TICK_US;
 }
 
 void OpenFPGAMidiDriver::send(uint32 b) {
     if (!_open) return;
+
+    /* TEMP trace: every 256th MIDI msg + every note-on. */
+    {
+        static uint32 sendCount  = 0;
+        static uint32 noteOnCount = 0;
+        ++sendCount;
+        const uint8_t st = b & 0xF0;
+        if (st == 0x90 && ((b >> 16) & 0x7F) > 0) {
+            ++noteOnCount;
+            if ((noteOnCount % 16) == 1)
+                warning("[openfpga_midi] note-on #%u msg=0x%06x", noteOnCount, b);
+        }
+        if ((sendCount % 512) == 1)
+            warning("[openfpga_midi] sends=%u note-ons=%u", sendCount, noteOnCount);
+    }
 
     const uint8_t status = b & 0xFF;
     const uint8_t ch     = status & 0x0F;

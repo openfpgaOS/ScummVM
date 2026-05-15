@@ -51,7 +51,7 @@ typedef struct {
     uint8_t voice_base_vol;  /* Pre-baked at note-on: (vel_scale × initial_attn_scale) >> 8.
                                 Collapses two multiplies into one slot, drops one mul/tick. */
     uint8_t sustain_held; /* CC64 holding this note in sustain */
-    int mixer_voice;      /* hardware mixer voice index */
+    uint64_t mixer_voice; /* stable hardware mixer handle */
     env_state_t vol_env;
     env_state_t mod_env;
     lfo_state_t mod_lfo;

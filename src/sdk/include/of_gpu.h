@@ -155,36 +155,16 @@ static uint32_t _gpu_base;
 #define GPU_TRANSLUC_DATA       OF_GPU_REG(0x24)  /* W: 32-bit word into transluc[] */
 #define GPU_TEX_FLUSH           OF_GPU_REG(0x28)  /* W: flush texture cache */
 #define GPU_DMA_KICK            OF_GPU_REG(0x2C)  /* W: write 1 to fire DMA pull from (SRC, LEN) */
-#define GPU_DMA_DBG             OF_GPU_REG(0x38)  /* reserved/read-zero */
-#define GPU_DBG_SELECT          OF_GPU_REG(0x3C)  /* area mode: legacy stall counter reads zero */
-
-/* Texture-cache diagnostic counters are optional in production bitstreams.
- * Consumers should tolerate zero-only readback and compute nonzero deltas
- * modulo this mask. */
-#define OF_GPU_TEX_DBG_COUNTER_BITS 20u
-#define OF_GPU_TEX_DBG_COUNTER_MASK ((1u << OF_GPU_TEX_DBG_COUNTER_BITS) - 1u)
 
 /* GPU_STATUS bit definitions */
 #define GPU_STATUS_BUSY        0x1u
 #define GPU_STATUS_RING_EMPTY  0x2u
 #define GPU_STATUS_DMA_BUSY    0x4u  /* SDRAM command/payload DMA busy */
 
-enum {
-    OF_GPU_STALL_TEX_WAIT = 0,
-    OF_GPU_STALL_CMAP_WAIT,
-    OF_GPU_STALL_CMAP_ISSUE,
-    OF_GPU_STALL_FBSS_BUSY,
-    OF_GPU_STALL_FB_WRITE,
-    OF_GPU_STALL_INFLIGHT,
-    OF_GPU_STALL_PERSP_WAIT,
-    OF_GPU_STALL_COUNT
-};
-
 /* ================================================================
  * Command IDs
  * ================================================================ */
 
-#define GPU_CMD_NOP             0x01
 #define GPU_CMD_FENCE           0x02
 #define GPU_CMD_CLEAR_RECT      0x11  /* 3-word payload: start byte addr,
                                        * {w,h}, {pad,color}. Color's low
@@ -193,7 +173,6 @@ enum {
 /* 0x21 GPU_CMD_SET_DEPTH_FUNC retired in lean Phase 2.3 (Z dropped). */
 #define GPU_CMD_SET_FB          0x23
 /* 0x24 GPU_CMD_SET_ZB         retired in lean Phase 2.3 (Z dropped). */
-#define GPU_CMD_SET_COLORMAP_ID 0x28  /* 1-word payload: [3:0] = palookup slot */
 #define GPU_CMD_DRAW_TRIANGLES  0x30
 /* 0x40 GPU_CMD_DRAW_SPAN retired: scalar spans now use
  * GPU_CMD_DRAW_SPAN_GROUP with the 15-word scalar payload. */
@@ -218,17 +197,18 @@ enum {
  * Palookup (colormap) layout in SDRAM — must match gpu_core.v's
  * PALOOKUP_BASE / PALOOKUP_STRIDE constants.
  *
- * Each slot holds a Quake/BUILD-shape shade × texel table.  Slot 0
- * is the default (used by callers that don't issue CMD_SET_COLORMAP_ID,
- * preserving single-palookup compatibility).  Up to 16 slots; the
- * GPU reads palookup[slot][shade & 63][texel] from
- *   GPU_AXI_BASE + 0x100000 + slot*0x4000 + shade*256 + texel
+ * Each slot holds a Quake/BUILD-shape shade × texel table.  Scalar spans
+ * and span groups carry an explicit colormap_id in each command. Triangles
+ * currently use slot 0. Up to 16 slots; the GPU reads
+ * palookup[slot][shade & 63][texel] from
+ *   GPU_AXI_BASE + OF_GPU_PALOOKUP_AXI_OFFSET
+ *              + slot*0x4000 + shade*256 + texel
  * via gpu_tex_cache port B (the prior on-chip cmap_bram is retired).
  *
  * The CPU-visible address depends on how the target maps the GPU's
  * AXI M0 into the CPU address space — apps should obtain it via the
  * runtime caps descriptor and add the per-slot offset.  These
- * constants encode the GPU-side AXI offset (0x100000) and per-slot
+ * constants encode the GPU-side AXI offset and per-slot
  * stride; the kernel's caps descriptor adds the per-target physical
  * base.  The lookup is target-portable as long as the kernel
  * advertises a `palookup_base` field that maps the same 26-bit
@@ -284,11 +264,9 @@ static uint32_t _gpu_state_fb_addr;
 static uint32_t _gpu_state_fb_stride;
 static uint32_t _gpu_state_tex_addr;
 static uint32_t _gpu_state_tex_dims;
-static uint32_t _gpu_state_colormap_id;
 
 #define OF_GPU_STATE_FB       (1u << 0)
 #define OF_GPU_STATE_TEXTURE  (1u << 1)
-#define OF_GPU_STATE_CMAP     (1u << 2)
 
 #define OF_GPU_BATCH_WORDS_PER_SPAN   15u
 #define OF_GPU_COMMAND_STREAM_BATCH_WORDS ((OF_GPU_RING_SIZE / 4u) - 1u)
@@ -483,9 +461,9 @@ static inline void of_gpu_init(void) {
  * directly through the uncached SDRAM alias so the GPU sees committed
  * data.  16 KB per slot, up to 16 slots (cf. OF_GPU_PALOOKUP_*).
  *
- * Slot selection at draw time is sticky: call of_gpu_set_colormap_id()
- * to switch.  Reset default is slot 0, so single-palookup apps just
- * call of_gpu_palookup_upload(0, …) and never issue a SET. */
+ * Span and span-group draw commands select slots explicitly with their
+ * colormap_id fields. Triangle draws use slot 0, so apps that submit
+ * triangles should upload row 0 as identity when they want raw texels. */
 static inline void of_gpu_palookup_upload(uint8_t slot, const uint8_t *data,
                                            uint32_t size) {
     if (slot >= OF_GPU_PALOOKUP_SLOTS || size > OF_GPU_PALOOKUP_STRIDE) return;
@@ -535,20 +513,6 @@ static inline void of_gpu_palookup_upload(uint8_t slot, const uint8_t *data,
             w |= ((uint32_t)tb[i]) << (i * 8);
         dst[words] = w;
     }
-}
-
-/* Select the active palookup slot for triangle draws.  Scalar spans and
- * span groups carry explicit per-command colormap_id fields. */
-static inline void of_gpu_set_colormap_id(uint8_t slot) {
-    slot &= 0xF;
-    if ((_gpu_state_valid & OF_GPU_STATE_CMAP) &&
-        _gpu_state_colormap_id == (uint32_t)slot)
-        return;
-
-    _gpu_cmd_header(GPU_CMD_SET_COLORMAP_ID, 1);
-    _gpu_ring_write((uint32_t)slot);
-    _gpu_state_colormap_id = (uint32_t)slot;
-    _gpu_state_valid |= OF_GPU_STATE_CMAP;
 }
 
 /* Decimates BUILD's 64 KB transluc[256][256] to the fabric's 32 KB
@@ -644,26 +608,11 @@ static inline void of_gpu_shutdown(void) {
     _gpu_state_valid = 0;
 }
 
-static inline void of_gpu_nop(void) {
-    _gpu_cmd_header(GPU_CMD_NOP, 0);
-}
-
-static inline uint32_t of_gpu_ring_free(void) {
-    return _gpu_ring_free_now();
-}
-
-static inline int of_gpu_ring_can_fit(uint32_t bytes) {
-    return of_gpu_ring_free() >= bytes;
-}
-
 typedef struct {
     uint32_t status;
     uint32_t rdptr;
     uint32_t wrptr;
     uint32_t fence_reached;
-    uint32_t tex_req_count;
-    uint32_t tex_miss_count;
-    uint32_t stall_count[OF_GPU_STALL_COUNT];
     uint32_t dma_waits;
     uint32_t dma_spin_iters;
     uint32_t ring_waits;
@@ -682,15 +631,8 @@ static inline void of_gpu_debug_snapshot(of_gpu_debug_snapshot_t *snap,
     snap->rdptr = GPU_RING_RDPTR;
     snap->wrptr = _gpu_wrptr;
     snap->fence_reached = GPU_FENCE_REACHED;
-    snap->tex_req_count = GPU_TRANSLUC_ADDR;
-    snap->tex_miss_count = GPU_TRANSLUC_DATA;
 
-    for (uint32_t i = 0; i < OF_GPU_STALL_COUNT; i++) {
-        GPU_DBG_SELECT = i;
-        snap->stall_count[i] = GPU_DBG_SELECT;
-    }
-
-    snap->ring_free = of_gpu_ring_free();
+    snap->ring_free = _gpu_ring_free_now();
     snap->min_ring_free = _gpu_dbg_min_ring_free < snap->ring_free ?
         _gpu_dbg_min_ring_free : snap->ring_free;
     snap->dma_waits = _gpu_dbg_dma_waits;

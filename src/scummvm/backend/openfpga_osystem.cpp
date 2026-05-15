@@ -235,6 +235,11 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
      * has room, so as long as we're called more often than the FIFO
      * drains (~21 ms at 48 kHz stereo) audio stays gapless. */
     ((DefaultTimerManager *)getTimerManager())->checkTimers();
+    /* Drain pending iMUSE timer slots accumulated by the 1 kHz MIDI
+     * IRQ.  iMUSE's callback is too deep to run safely on the BRAM
+     * IRQ stack, so the IRQ just counts ticks; we dispatch here. */
+    extern void openfpga_midi_pump_pending();
+    openfpga_midi_pump_pending();
     ((OpenFPGAMixerManager *)_mixerManager)->update();
 
     of_input_poll();

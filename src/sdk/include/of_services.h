@@ -227,6 +227,59 @@ struct of_services_table {
      * reports, exposed separately from the two gamepad player snapshots. */
     void      (*input_get_keyboard_state)(void *out);
     void      (*input_read_mouse_state)(void *out);
+
+    /* -- Mixer stable handles (append-only) --
+     * These entries name logical sounds instead of physical mixer slots.
+     * A stale handle must never be able to mutate a slot after reuse. */
+    uint64_t  (*mixer_play_h)(const uint8_t *pcm_s16,
+                              uint32_t sample_count,
+                              uint32_t sample_rate,
+                              int priority,
+                              int volume);
+    uint64_t  (*mixer_play_8bit_h)(const uint8_t *pcm_s8,
+                                   uint32_t sample_count,
+                                   uint32_t sample_rate,
+                                   int priority,
+                                   int volume);
+    uint64_t  (*mixer_alloc_for_group_h)(int group,
+                                         const uint8_t *pcm_s16,
+                                         uint32_t sample_count,
+                                         uint32_t sample_rate,
+                                         int priority,
+                                         int volume);
+    uint64_t  (*mixer_retrigger_h)(uint64_t handle,
+                                   const uint8_t *pcm_s16,
+                                   uint32_t sample_count,
+                                   uint32_t sample_rate,
+                                   int volume);
+    void      (*mixer_stop_h)(uint64_t handle);
+    int       (*mixer_handle_active)(uint64_t handle);
+    int       (*mixer_handle_group)(uint64_t handle);
+    int       (*mixer_handle_voice)(uint64_t handle);
+    void      (*mixer_set_volume_h)(uint64_t handle, int volume);
+    void      (*mixer_set_pan_h)(uint64_t handle, int pan);
+    void      (*mixer_set_loop_h)(uint64_t handle, int loop_start, int loop_end);
+    void      (*mixer_set_rate_h)(uint64_t handle, int sample_rate_hz);
+    void      (*mixer_set_rate_raw_h)(uint64_t handle, uint32_t rate_fp16);
+    void      (*mixer_set_vol_lr_h)(uint64_t handle, int vol_l, int vol_r);
+    void      (*mixer_set_bidi_h)(uint64_t handle, int enable);
+    int       (*mixer_get_position_h)(uint64_t handle);
+    void      (*mixer_set_position_h)(uint64_t handle, int sample_offset);
+    void      (*mixer_set_voice_h)(uint64_t handle,
+                                   int sample_rate_hz,
+                                   int vol_l,
+                                   int vol_r);
+    void      (*mixer_set_voice_raw_h)(uint64_t handle,
+                                       uint32_t rate_fp16,
+                                       int vol_l,
+                                       int vol_r);
+    void      (*mixer_set_vol_rate_h)(uint64_t handle, int rate);
+    void      (*mixer_set_filter_h)(uint64_t handle,
+                                    int cutoff_q016,
+                                    int q,
+                                    int enable);
+    uint32_t  (*mixer_poll_ended_h)(uint64_t *out_handles,
+                                    uint32_t max_handles);
 };
 
 #ifndef OF_PC

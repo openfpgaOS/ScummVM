@@ -31,6 +31,10 @@ extern "C" {
 #define OF_MIXER_MAX_VOICES  32
 #define OF_MIXER_OUTPUT_RATE 48000
 
+typedef uint64_t of_mixer_handle_t;
+
+#define OF_MIXER_HANDLE_INVALID ((of_mixer_handle_t)0)
+
 /* Convert sample rate in Hz to 16.16 fixed-point for raw API.
  * Use at init time to build a note-rate lookup table. */
 #define OF_MIXER_RATE_FP16(hz) \
@@ -39,6 +43,13 @@ extern "C" {
 #ifndef OF_PC
 
 #include "of_services.h"
+
+#define OF_SVC_FIELD_INDEX(field) \
+    ((uint32_t)((offsetof(struct of_services_table, field) - \
+                 offsetof(struct of_services_table, video_init)) / sizeof(void *)))
+
+#define OF_SVC_HAS_FIELD(field) \
+    (OF_SVC && (OF_SVC->count > OF_SVC_FIELD_INDEX(field)))
 
 static inline void of_mixer_init(int max_voices, int output_rate) {
     OF_SVC->mixer_init(max_voices, output_rate);
@@ -54,17 +65,54 @@ static inline int of_mixer_play_8bit(const uint8_t *pcm_s8, uint32_t sample_coun
     return OF_SVC->mixer_play_8bit(pcm_s8, sample_count, sample_rate, priority, volume);
 }
 
+static inline of_mixer_handle_t
+of_mixer_play_h(const uint8_t *pcm_s16, uint32_t sample_count,
+                uint32_t sample_rate, int priority, int volume) {
+    if (OF_SVC_HAS_FIELD(mixer_play_h) && OF_SVC->mixer_play_h)
+        return OF_SVC->mixer_play_h(pcm_s16, sample_count, sample_rate,
+                                    priority, volume);
+    return OF_MIXER_HANDLE_INVALID;
+}
+
+static inline of_mixer_handle_t
+of_mixer_play_8bit_h(const uint8_t *pcm_s8, uint32_t sample_count,
+                     uint32_t sample_rate, int priority, int volume) {
+    if (OF_SVC_HAS_FIELD(mixer_play_8bit_h) && OF_SVC->mixer_play_8bit_h)
+        return OF_SVC->mixer_play_8bit_h(pcm_s8, sample_count, sample_rate,
+                                         priority, volume);
+    return OF_MIXER_HANDLE_INVALID;
+}
+
 static inline void of_mixer_retrigger(int voice, const uint8_t *pcm_s16,
                                       uint32_t sample_count, uint32_t sample_rate,
                                       int volume) {
     OF_SVC->mixer_retrigger(voice, pcm_s16, sample_count, sample_rate, volume);
 }
 
+static inline of_mixer_handle_t
+of_mixer_retrigger_h(of_mixer_handle_t handle, const uint8_t *pcm_s16,
+                     uint32_t sample_count, uint32_t sample_rate, int volume) {
+    if (OF_SVC_HAS_FIELD(mixer_retrigger_h) && OF_SVC->mixer_retrigger_h)
+        return OF_SVC->mixer_retrigger_h(handle, pcm_s16, sample_count,
+                                         sample_rate, volume);
+    return OF_MIXER_HANDLE_INVALID;
+}
+
 static inline void of_mixer_stop(int voice) { OF_SVC->mixer_stop(voice); }
 static inline void of_mixer_stop_all(void) { OF_SVC->mixer_stop_all(); }
 
+static inline void of_mixer_stop_h(of_mixer_handle_t handle) {
+    if (OF_SVC_HAS_FIELD(mixer_stop_h) && OF_SVC->mixer_stop_h)
+        OF_SVC->mixer_stop_h(handle);
+}
+
 static inline void of_mixer_set_volume(int voice, int volume) {
     OF_SVC->mixer_set_volume(voice, volume);
+}
+
+static inline void of_mixer_set_volume_h(of_mixer_handle_t handle, int volume) {
+    if (OF_SVC_HAS_FIELD(mixer_set_volume_h) && OF_SVC->mixer_set_volume_h)
+        OF_SVC->mixer_set_volume_h(handle, volume);
 }
 
 static inline void of_mixer_pump(void) { OF_SVC->mixer_pump(); }
@@ -73,32 +121,90 @@ static inline int of_mixer_voice_active(int voice) {
     return OF_SVC->mixer_voice_active(voice);
 }
 
+static inline int of_mixer_handle_active(of_mixer_handle_t handle) {
+    if (OF_SVC_HAS_FIELD(mixer_handle_active) && OF_SVC->mixer_handle_active)
+        return OF_SVC->mixer_handle_active(handle);
+    return 0;
+}
+
+static inline int of_mixer_handle_group(of_mixer_handle_t handle) {
+    if (OF_SVC_HAS_FIELD(mixer_handle_group) && OF_SVC->mixer_handle_group)
+        return OF_SVC->mixer_handle_group(handle);
+    return -1;
+}
+
+static inline int of_mixer_handle_voice(of_mixer_handle_t handle) {
+    if (OF_SVC_HAS_FIELD(mixer_handle_voice) && OF_SVC->mixer_handle_voice)
+        return OF_SVC->mixer_handle_voice(handle);
+    return -1;
+}
+
 static inline void of_mixer_set_pan(int voice, int pan) {
     OF_SVC->mixer_set_pan(voice, pan);
+}
+
+static inline void of_mixer_set_pan_h(of_mixer_handle_t handle, int pan) {
+    if (OF_SVC_HAS_FIELD(mixer_set_pan_h) && OF_SVC->mixer_set_pan_h)
+        OF_SVC->mixer_set_pan_h(handle, pan);
 }
 
 static inline void of_mixer_set_loop(int voice, int loop_start, int loop_end) {
     OF_SVC->mixer_set_loop(voice, loop_start, loop_end);
 }
 
+static inline void of_mixer_set_loop_h(of_mixer_handle_t handle,
+                                       int loop_start, int loop_end) {
+    if (OF_SVC_HAS_FIELD(mixer_set_loop_h) && OF_SVC->mixer_set_loop_h)
+        OF_SVC->mixer_set_loop_h(handle, loop_start, loop_end);
+}
+
 static inline void of_mixer_set_rate(int voice, int sample_rate_hz) {
     OF_SVC->mixer_set_rate(voice, sample_rate_hz);
+}
+
+static inline void of_mixer_set_rate_h(of_mixer_handle_t handle,
+                                       int sample_rate_hz) {
+    if (OF_SVC_HAS_FIELD(mixer_set_rate_h) && OF_SVC->mixer_set_rate_h)
+        OF_SVC->mixer_set_rate_h(handle, sample_rate_hz);
 }
 
 static inline void of_mixer_set_vol_lr(int voice, int vol_l, int vol_r) {
     OF_SVC->mixer_set_vol_lr(voice, vol_l, vol_r);
 }
 
+static inline void of_mixer_set_vol_lr_h(of_mixer_handle_t handle,
+                                         int vol_l, int vol_r) {
+    if (OF_SVC_HAS_FIELD(mixer_set_vol_lr_h) && OF_SVC->mixer_set_vol_lr_h)
+        OF_SVC->mixer_set_vol_lr_h(handle, vol_l, vol_r);
+}
+
 static inline void of_mixer_set_bidi(int voice, int enable) {
     OF_SVC->mixer_set_bidi(voice, enable);
+}
+
+static inline void of_mixer_set_bidi_h(of_mixer_handle_t handle, int enable) {
+    if (OF_SVC_HAS_FIELD(mixer_set_bidi_h) && OF_SVC->mixer_set_bidi_h)
+        OF_SVC->mixer_set_bidi_h(handle, enable);
 }
 
 static inline int of_mixer_get_position(int voice) {
     return OF_SVC->mixer_get_position(voice);
 }
 
+static inline int of_mixer_get_position_h(of_mixer_handle_t handle) {
+    if (OF_SVC_HAS_FIELD(mixer_get_position_h) && OF_SVC->mixer_get_position_h)
+        return OF_SVC->mixer_get_position_h(handle);
+    return -1;
+}
+
 static inline void of_mixer_set_position(int voice, int sample_offset) {
     OF_SVC->mixer_set_position(voice, sample_offset);
+}
+
+static inline void of_mixer_set_position_h(of_mixer_handle_t handle,
+                                           int sample_offset) {
+    if (OF_SVC_HAS_FIELD(mixer_set_position_h) && OF_SVC->mixer_set_position_h)
+        OF_SVC->mixer_set_position_h(handle, sample_offset);
 }
 
 /* Set rate + stereo volume in one call — tracker hot path. */
@@ -107,14 +213,34 @@ static inline void of_mixer_set_voice(int voice, int sample_rate_hz,
     OF_SVC->mixer_set_voice(voice, sample_rate_hz, vol_l, vol_r);
 }
 
+static inline void of_mixer_set_voice_h(of_mixer_handle_t handle,
+                                        int sample_rate_hz,
+                                        int vol_l, int vol_r) {
+    if (OF_SVC_HAS_FIELD(mixer_set_voice_h) && OF_SVC->mixer_set_voice_h)
+        OF_SVC->mixer_set_voice_h(handle, sample_rate_hz, vol_l, vol_r);
+}
+
 static inline void of_mixer_set_rate_raw(int voice, uint32_t rate_fp16) {
     OF_SVC->mixer_set_rate_raw(voice, rate_fp16);
+}
+
+static inline void of_mixer_set_rate_raw_h(of_mixer_handle_t handle,
+                                           uint32_t rate_fp16) {
+    if (OF_SVC_HAS_FIELD(mixer_set_rate_raw_h) && OF_SVC->mixer_set_rate_raw_h)
+        OF_SVC->mixer_set_rate_raw_h(handle, rate_fp16);
 }
 
 /* Set rate (16.16 raw) + stereo volume — zero-division tracker hot path. */
 static inline void of_mixer_set_voice_raw(int voice, uint32_t rate_fp16,
                                           int vol_l, int vol_r) {
     OF_SVC->mixer_set_voice_raw(voice, rate_fp16, vol_l, vol_r);
+}
+
+static inline void of_mixer_set_voice_raw_h(of_mixer_handle_t handle,
+                                            uint32_t rate_fp16,
+                                            int vol_l, int vol_r) {
+    if (OF_SVC_HAS_FIELD(mixer_set_voice_raw_h) && OF_SVC->mixer_set_voice_raw_h)
+        OF_SVC->mixer_set_voice_raw_h(handle, rate_fp16, vol_l, vol_r);
 }
 
 /* Set the volume-ramp rate for a voice -- how fast the hardware smooths
@@ -124,8 +250,20 @@ static inline void of_mixer_set_volume_ramp(int voice, int rate) {
     OF_SVC->mixer_set_vol_rate(voice, rate);
 }
 
+static inline void of_mixer_set_volume_ramp_h(of_mixer_handle_t handle, int rate) {
+    if (OF_SVC_HAS_FIELD(mixer_set_vol_rate_h) && OF_SVC->mixer_set_vol_rate_h)
+        OF_SVC->mixer_set_vol_rate_h(handle, rate);
+}
+
 static inline uint32_t of_mixer_poll_ended(void) {
     return OF_SVC->mixer_poll_ended();
+}
+
+static inline uint32_t of_mixer_poll_ended_h(of_mixer_handle_t *out_handles,
+                                             uint32_t max_handles) {
+    if (OF_SVC_HAS_FIELD(mixer_poll_ended_h) && OF_SVC->mixer_poll_ended_h)
+        return OF_SVC->mixer_poll_ended_h(out_handles, max_handles);
+    return 0;
 }
 
 static inline void *of_mixer_alloc_samples(size_t size) {
@@ -170,6 +308,12 @@ static inline void of_mixer_set_filter(int voice, int cutoff_q016, int q, int en
     OF_SVC->mixer_set_filter(voice, cutoff_q016, q, enable);
 }
 
+static inline void of_mixer_set_filter_h(of_mixer_handle_t handle,
+                                         int cutoff_q016, int q, int enable) {
+    if (OF_SVC_HAS_FIELD(mixer_set_filter_h) && OF_SVC->mixer_set_filter_h)
+        OF_SVC->mixer_set_filter_h(handle, cutoff_q016, q, enable);
+}
+
 /* Group-aware atomic alloc-and-tag.  MUSIC scans low→high, SFX (and
  * untagged/other groups) scans high→low so the two groups land at
  * opposite ends of the slot range under low load.  Steal path prefers
@@ -183,13 +327,24 @@ static inline int of_mixer_alloc_for_group(int group, const uint8_t *pcm_s16,
                                            uint32_t sample_count,
                                            uint32_t sample_rate,
                                            int priority, int volume) {
-    if (OF_SVC->mixer_alloc_for_group)
+    if (OF_SVC_HAS_FIELD(mixer_alloc_for_group) && OF_SVC->mixer_alloc_for_group)
         return OF_SVC->mixer_alloc_for_group(group, pcm_s16, sample_count,
                                              sample_rate, priority, volume);
     int v = OF_SVC->mixer_play(pcm_s16, sample_count, sample_rate,
                                priority, volume);
     if (v >= 0) OF_SVC->mixer_set_group(v, group);
     return v;
+}
+
+static inline of_mixer_handle_t
+of_mixer_alloc_for_group_h(int group, const uint8_t *pcm_s16,
+                           uint32_t sample_count,
+                           uint32_t sample_rate,
+                           int priority, int volume) {
+    if (OF_SVC_HAS_FIELD(mixer_alloc_for_group_h) && OF_SVC->mixer_alloc_for_group_h)
+        return OF_SVC->mixer_alloc_for_group_h(group, pcm_s16, sample_count,
+                                               sample_rate, priority, volume);
+    return OF_MIXER_HANDLE_INVALID;
 }
 
 /* Read the group tag for a voice slot.  Used by ISR-context callers
@@ -200,7 +355,7 @@ static inline int of_mixer_alloc_for_group(int group, const uint8_t *pcm_s16,
  * the voice index is out of range, or on older firmware where the
  * OF_SVC entry is absent (treat that as "ownership unknown"). */
 static inline int of_mixer_voice_group(int voice) {
-    if (OF_SVC->mixer_voice_group)
+    if (OF_SVC_HAS_FIELD(mixer_voice_group) && OF_SVC->mixer_voice_group)
         return OF_SVC->mixer_voice_group(voice);
     return -1;
 }
@@ -297,6 +452,88 @@ static inline int of_mixer_alloc_for_group(int group, const uint8_t *pcm_s16,
     return -1;
 }
 static inline int of_mixer_voice_group(int voice) { (void)voice; return -1; }
+
+static inline of_mixer_handle_t
+of_mixer_play_h(const uint8_t *pcm_s16, uint32_t sample_count,
+                uint32_t sample_rate, int priority, int volume) {
+    (void)pcm_s16; (void)sample_count; (void)sample_rate;
+    (void)priority; (void)volume;
+    return OF_MIXER_HANDLE_INVALID;
+}
+static inline of_mixer_handle_t
+of_mixer_play_8bit_h(const uint8_t *pcm_s8, uint32_t sample_count,
+                     uint32_t sample_rate, int priority, int volume) {
+    (void)pcm_s8; (void)sample_count; (void)sample_rate;
+    (void)priority; (void)volume;
+    return OF_MIXER_HANDLE_INVALID;
+}
+static inline of_mixer_handle_t
+of_mixer_alloc_for_group_h(int group, const uint8_t *pcm_s16,
+                           uint32_t sample_count, uint32_t sample_rate,
+                           int priority, int volume) {
+    (void)group; (void)pcm_s16; (void)sample_count;
+    (void)sample_rate; (void)priority; (void)volume;
+    return OF_MIXER_HANDLE_INVALID;
+}
+static inline of_mixer_handle_t
+of_mixer_retrigger_h(of_mixer_handle_t handle, const uint8_t *pcm_s16,
+                     uint32_t sample_count, uint32_t sample_rate, int volume) {
+    (void)handle; (void)pcm_s16; (void)sample_count; (void)sample_rate; (void)volume;
+    return OF_MIXER_HANDLE_INVALID;
+}
+static inline void of_mixer_stop_h(of_mixer_handle_t handle) { (void)handle; }
+static inline int of_mixer_handle_active(of_mixer_handle_t handle) { (void)handle; return 0; }
+static inline int of_mixer_handle_group(of_mixer_handle_t handle) { (void)handle; return -1; }
+static inline int of_mixer_handle_voice(of_mixer_handle_t handle) { (void)handle; return -1; }
+static inline void of_mixer_set_volume_h(of_mixer_handle_t handle, int volume) {
+    (void)handle; (void)volume;
+}
+static inline void of_mixer_set_pan_h(of_mixer_handle_t handle, int pan) {
+    (void)handle; (void)pan;
+}
+static inline void of_mixer_set_loop_h(of_mixer_handle_t handle, int loop_start, int loop_end) {
+    (void)handle; (void)loop_start; (void)loop_end;
+}
+static inline void of_mixer_set_rate_h(of_mixer_handle_t handle, int sample_rate_hz) {
+    (void)handle; (void)sample_rate_hz;
+}
+static inline void of_mixer_set_rate_raw_h(of_mixer_handle_t handle, uint32_t rate_fp16) {
+    (void)handle; (void)rate_fp16;
+}
+static inline void of_mixer_set_vol_lr_h(of_mixer_handle_t handle, int vol_l, int vol_r) {
+    (void)handle; (void)vol_l; (void)vol_r;
+}
+static inline void of_mixer_set_bidi_h(of_mixer_handle_t handle, int enable) {
+    (void)handle; (void)enable;
+}
+static inline int of_mixer_get_position_h(of_mixer_handle_t handle) {
+    (void)handle; return -1;
+}
+static inline void of_mixer_set_position_h(of_mixer_handle_t handle, int sample_offset) {
+    (void)handle; (void)sample_offset;
+}
+static inline void of_mixer_set_voice_h(of_mixer_handle_t handle,
+                                        int sample_rate_hz,
+                                        int vol_l, int vol_r) {
+    (void)handle; (void)sample_rate_hz; (void)vol_l; (void)vol_r;
+}
+static inline void of_mixer_set_voice_raw_h(of_mixer_handle_t handle,
+                                            uint32_t rate_fp16,
+                                            int vol_l, int vol_r) {
+    (void)handle; (void)rate_fp16; (void)vol_l; (void)vol_r;
+}
+static inline void of_mixer_set_volume_ramp_h(of_mixer_handle_t handle, int rate) {
+    (void)handle; (void)rate;
+}
+static inline void of_mixer_set_filter_h(of_mixer_handle_t handle,
+                                         int cutoff_q016, int q, int enable) {
+    (void)handle; (void)cutoff_q016; (void)q; (void)enable;
+}
+static inline uint32_t of_mixer_poll_ended_h(of_mixer_handle_t *out_handles,
+                                             uint32_t max_handles) {
+    (void)out_handles; (void)max_handles;
+    return 0;
+}
 
 #endif /* OF_PC */
 

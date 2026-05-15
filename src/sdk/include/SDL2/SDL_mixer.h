@@ -45,7 +45,7 @@ typedef struct { int unused; } Mix_Music;
 
 static int __mix_initialized;
 static int __mix_max_channels = 8;
-static int __mix_voice_ids[32];
+static of_mixer_handle_t __mix_voice_ids[32];
 
 /* ======================================================================
  * Init / Open / Close
@@ -136,17 +136,18 @@ static inline int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops) {
         of_audio_init();
         of_mixer_init(__mix_max_channels, OF_AUDIO_RATE);
         __mix_initialized = 1;
-        memset(__mix_voice_ids, -1, sizeof(__mix_voice_ids));
+        memset(__mix_voice_ids, 0, sizeof(__mix_voice_ids));
     }
 
     int vol = (chunk->volume * 255) / 128;
-    int voice = of_mixer_play(chunk->pcm_u8, chunk->sample_count,
-                              chunk->sample_rate, 0, vol);
-    if (voice < 0) return -1;
+    of_mixer_handle_t voice = of_mixer_play_h(chunk->pcm_u8, chunk->sample_count,
+                                              chunk->sample_rate, 0, vol);
+    if (voice == OF_MIXER_HANDLE_INVALID) return -1;
 
     if (channel < 0) {
         for (int i = 0; i < __mix_max_channels; i++) {
-            if (__mix_voice_ids[i] < 0 || !of_mixer_voice_active(__mix_voice_ids[i])) {
+            if (__mix_voice_ids[i] == OF_MIXER_HANDLE_INVALID ||
+                !of_mixer_handle_active(__mix_voice_ids[i])) {
                 channel = i; break;
             }
         }
@@ -159,8 +160,8 @@ static inline int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops) {
 static inline void Mix_HaltChannel(int channel) {
     if (!__mix_initialized) return;
     if (channel < 0) { of_mixer_stop_all(); return; }
-    if (channel < 32 && __mix_voice_ids[channel] >= 0)
-        of_mixer_stop(__mix_voice_ids[channel]);
+    if (channel < 32 && __mix_voice_ids[channel] != OF_MIXER_HANDLE_INVALID)
+        of_mixer_stop_h(__mix_voice_ids[channel]);
 }
 
 static inline void Mix_Pause(int ch)  { (void)ch; }
