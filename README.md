@@ -10,8 +10,6 @@ A native port of [ScummVM](https://www.scummvm.org/) to the Analogue Pocket runn
 | Monkey Island 2 (CD) | ISO | ✓ MIDI | — | Tested |
 | Day of the Tentacle | ISO | ✓ MIDI | ✓ digital | Tested |
 | Fate of Atlantis | ISO | ✓ MIDI | ✓ digital | Tested |
-| MI1 Special Edition (classic mode) | ZIP | — | — | Boots, silent — see *xWMA* note below |
-| MI2 Special Edition (classic mode) | ZIP | — | — | Boots, silent — same as MI1 SE |
 
 Engine coverage today: **SCUMM v4–v6**. v3 and v7 may work but are untested. Other ScummVM engines (Sierra AGI/SCI, Beneath a Steel Sky, etc.) are not enabled in this build but the upstream code is present and would build with small Makefile changes.
 
@@ -101,24 +99,23 @@ The Pocket-side OS mounts standard ISO 9660 filesystems via `of_iso_mount`, and 
 
 The four classic ISO instances we ship (MI1, MI2, DOTT, Atlantis) all follow this pattern. Use them as templates.
 
-### Mode B — ZIP (for loose-folder distributions like Steam editions)
+### Mode B — ZIP (for loose-folder distributions)
 
-For games whose original media isn't a CD (Steam releases of remastered SE editions, GOG-extracted folders, etc.), pack the game files into a **STORE-mode** ZIP and the engine reads from inside the archive via ScummVM's `Common::makeZipArchive`.
+For games whose original media isn't a CD (GOG-extracted folders, repackaged remasters, etc.), pack the game files into a **STORE-mode** ZIP and the engine reads from inside the archive via ScummVM's `Common::makeZipArchive`.
 
 The crucial requirements: zip with `-0` (no compression) and include a `game.cfg` at the archive root.
 
 ```sh
 cd /path/to/Game\ Folder
 cat > game.cfg <<EOF
-gameid=monkey
+gameid=tentacle
 engineid=scumm
-description=The Secret of Monkey Island (Special Edition, Classic mode)
+description=Day of the Tentacle
 platform=pc
 language=en
 music=openfpga
-variant=SE
 EOF
-zip -0 -r ~/mygame.zip Monkey1.pak audio/ game.cfg
+zip -0 -r ~/dott.zip *.LFL *.LEC game.cfg
 ```
 
 Instance JSON is identical to ISO mode except slot 3 points at the `.zip`:
@@ -145,13 +142,13 @@ Slots 10–19 are non-volatile and reserved for save game slots 0–9. Slot 9 is
 - **CD audio**: classic CD-era SCUMM games store music as CD-track references. Our ISO mount path doesn't wire up CDDA tracks directly; the engine falls back to MIDI for those games (which works for MI1/MI2 because the MIDI versions of every cue are still in the resource files).
 - **Digital speech** (DOTT, Atlantis): standard `.SOU` / `MONSTER.SOU` files, decoded by upstream ScummVM codecs.
 
-### Why MI1/MI2 Special Edition is silent
+### Note on the Special Editions (MI1 SE, MI2 SE)
 
-The remastered audio in MI1/MI2 SE is **xWMA** (a Microsoft-extended WMA Pro variant inside XACT wave banks). We ported FFmpeg's WMA Pro decoder for this build — the code lives at `src/scummvm/scummvm/audio/decoders/wmapro.cpp` — but the SE encoder uses two undocumented bitstream extensions ("Reserved bit" and "Channel transform bit") that even mainline FFmpeg flags as unimplemented. With the canonical `block_align = 4459` and a proper xWMA wrapper, `ffmpeg -i ...` decodes only ~10–15 % of an SE music entry before bailing.
+We don't ship instances for the LucasArts SE remasters because their audio is **xWMA** (a Microsoft-extended WMA Pro variant inside XACT wave banks) that uses undocumented bitstream extensions ("Reserved bit" and "Channel transform bit") that even mainline FFmpeg flags as unimplemented. With the canonical `block_align = 4459` supplied, `ffmpeg -i ...` decodes only ~10–15 % of an SE music entry before bailing.
 
-The decoder is wired up but gated off (`engines/scumm/soundse.cpp` returns nullptr for `kXWBCodecWMA`). Re-enable by un-stubbing that branch once a working xWMA decoder is in tree, or transcode the wave banks offline using Microsoft's `xWMAEncode.exe` and ship the result as a side file.
+A scaffolded WMA Pro decoder lives at `src/scummvm/scummvm/audio/decoders/wmapro.cpp` (currently gated off in `engines/scumm/soundse.cpp`). If a working xWMA decoder lands upstream — or you transcode the wave banks offline via Microsoft's `xWMAEncode.exe` — re-enabling is a one-line change. See `tools/wmapro_test/README.md` for the PC-side test harness.
 
-See `tools/wmapro_test/README.md` for the PC-side test harness that produced these findings.
+For now, use the **classic CD** versions of MI1 and MI2 (the ISO instances we ship); they have MIDI music that plays fine.
 
 ## Repository layout
 
@@ -170,7 +167,7 @@ tools/wmapro_test/                 PC unit test for the WMA Pro decoder port
 
 ## Known limitations
 
-- **MI1/MI2 SE music**: silent (see above).
+- **LucasArts Special Editions (MI1 SE, MI2 SE) not shipped**: their xWMA audio isn't decodable today (see note above).
 - **CDDA**: ISO-mounted images don't expose CDDA tracks; CD-style music falls back to MIDI.
 - **No GUI launcher**: instance selection happens in the Pocket's own launcher; no in-game game-picker.
 - **Save UI**: original ScummVM save dialog disabled (depends on theme assets we don't ship). Use F5 / F7 from inside SCUMM or game-specific save mechanics.
