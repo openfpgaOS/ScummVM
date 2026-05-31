@@ -1,0 +1,23 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": { "id": 666, "select": false },
+        "data_slots": [
+            { "id": 1, "filename": "os.bin" },
+            { "id": 2, "filename": "sq6_os.ini" },
+            { "id": 3, "filename": "scummvm.elf" },
+            { "id": 4, "filename": "sq6.iso" },
+            { "id": 5, "filename": "bank.ofsf" },
+            { "id": 9, "filename": "sq6.ini" },
+            { "id": 10, "filename": "sq6_0.sav" },
+            { "id": 11, "filename": "sq6_1.sav" },
+            { "id": 12, "filename": "sq6_2.sav" },
+            { "id": 13, "filename": "sq6_3.sav" },
+            { "id": 14, "filename": "sq6_4.sav" },
+            { "id": 15, "filename": "sq6_5.sav" },
+            { "id": 16, "filename": "sq6_6.sav" },
+            { "id": 17, "filename": "sq6_7.sav" },
+            { "id": 18, "filename": "sq6_8.sav" }
+        ]
+    }
+}

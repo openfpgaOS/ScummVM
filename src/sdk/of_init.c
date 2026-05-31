@@ -34,6 +34,7 @@
 
 #include "of_app_abi.h"
 #include "of_caps.h"
+#include "of_input_types.h"
 #include "of_services.h"
 
 /* Definitions for the externs declared in of_caps.h / of_services.h.
@@ -42,6 +43,8 @@
  * (101) ensures it runs before any other openfpgaOS code. */
 const struct of_capabilities *_of_caps_ptr = (void *)0;
 const struct of_services_table *_of_svc_ptr = (void *)0;
+of_input_state_t _of_input_p0;
+of_input_state_t _of_input_p1;
 
 __attribute__((constructor(101)))
 static void of_runtime_init(void) {

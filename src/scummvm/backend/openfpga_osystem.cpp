@@ -10,12 +10,18 @@
 #include "backends/events/default/default-events.h"
 #include "common/memstream.h"
 #include "common/stream.h"
+#include "openfpga_audiocd.h"
 #include "openfpga_fs.h"
+#include "openfpga_midi.h"
 #include "openfpga_mixer.h"
 #include "openfpga_save.h"
 
 extern "C" {
+#include <of_cache.h>
+#include <of_file.h>
+#include <of_gpu.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -29,17 +35,21 @@ OpenFPGAGraphicsManager::OpenFPGAGraphicsManager()
     : _screenW(320), _screenH(200), _screenChangeID(0),
       _overlayVisible(false), _paletteDirty(false), _screenDirty(false),
       _cursorX(160), _cursorY(100), _cursorHotX(0), _cursorHotY(0),
-      _cursorW(0), _cursorH(0), _cursorKeycolor(0), _cursorVisible(false) {
+      _cursorW(0), _cursorH(0), _cursorKeycolor(0), _cursorVisible(false),
+      _gpuReady(false), _videoBufIdx(-1), _videoFence(0), _gpuCleanMask(0) {
     memset(_screenBuf, 0, sizeof(_screenBuf));
     memset(_palette, 0, sizeof(_palette));
     memset(_cursorData, 0, sizeof(_cursorData));
-    memset(&_frameSurface, 0, sizeof(_frameSurface));
 }
 
 OpenFPGAGraphicsManager::~OpenFPGAGraphicsManager() {
 }
 
 void OpenFPGAGraphicsManager::initSize(uint width, uint height, const Graphics::PixelFormat *format) {
+    if (width > OPENFPGA_SCREEN_W)
+        width = OPENFPGA_SCREEN_W;
+    if (height > OPENFPGA_SCREEN_H)
+        height = OPENFPGA_SCREEN_H;
     _screenW = width;
     _screenH = height;
     memset(_screenBuf, 0, sizeof(_screenBuf));
@@ -54,11 +64,19 @@ void OpenFPGAGraphicsManager::initSize(uint width, uint height, const Graphics::
 }
 
 void OpenFPGAGraphicsManager::setPalette(const byte *colors, uint start, uint num) {
+    if (start >= 256)
+        return;
+    if (start + num > 256)
+        num = 256 - start;
     memcpy(_palette + start * 3, colors, num * 3);
     _paletteDirty = true;
 }
 
 void OpenFPGAGraphicsManager::grabPalette(byte *colors, uint start, uint num) const {
+    if (start >= 256)
+        return;
+    if (start + num > 256)
+        num = 256 - start;
     memcpy(colors, _palette + start * 3, num * 3);
 }
 
@@ -98,15 +116,101 @@ void OpenFPGAGraphicsManager::fillScreen(uint32 col) {
 }
 
 void OpenFPGAGraphicsManager::fillScreen(const Common::Rect &r, uint32 col) {
-    for (int y = r.top; y < r.bottom && y < (int)_screenH; y++) {
-        for (int x = r.left; x < r.right && x < (int)_screenW; x++) {
+    int top = r.top < 0 ? 0 : r.top;
+    int left = r.left < 0 ? 0 : r.left;
+    int bottom = r.bottom > (int)_screenH ? (int)_screenH : r.bottom;
+    int right = r.right > (int)_screenW ? (int)_screenW : r.right;
+    for (int y = top; y < bottom; y++) {
+        for (int x = left; x < right; x++) {
             _screenBuf[y * _screenW + x] = col & 0xFF;
         }
     }
     _screenDirty = true;
 }
 
+void OpenFPGAGraphicsManager::ensureGpuReady() {
+    if (_gpuReady)
+        return;
+
+    of_gpu_init();
+    _videoBufIdx = of_video_acquire_next(-1, 0);
+    _videoFence = 0;
+    _gpuCleanMask = 0;
+    _gpuReady = true;
+}
+
+uint8_t *OpenFPGAGraphicsManager::acquireFrameBuffer() {
+    ensureGpuReady();
+    if (_videoBufIdx < 0)
+        return of_video_surface();
+
+    uint8_t *fb = of_video_buffer_addr(_videoBufIdx);
+    if (!(_gpuCleanMask & (1u << _videoBufIdx))) {
+        of_cache_flush_range(fb, OPENFPGA_SCREEN_W * OPENFPGA_SCREEN_H);
+        _gpuCleanMask |= (1u << _videoBufIdx);
+    }
+    return fb;
+}
+
+void OpenFPGAGraphicsManager::clearFrameBorders(uint8_t *fb, int xOff, int yOff,
+                                                uint copyW, uint copyH) {
+    if (!_gpuReady || !fb) {
+        if (fb)
+            memset(fb, 0, OPENFPGA_SCREEN_W * OPENFPGA_SCREEN_H);
+        return;
+    }
+
+    const uint32_t fbAddr = (uint32_t)(uintptr_t)fb;
+    bool issued = false;
+    of_gpu_set_framebuffer(fbAddr, OPENFPGA_SCREEN_W);
+
+    if (yOff > 0) {
+        of_gpu_clear_rect(fbAddr, OPENFPGA_SCREEN_W, yOff, 0);
+        issued = true;
+    }
+
+    const int bottomY = yOff + (int)copyH;
+    if (bottomY < OPENFPGA_SCREEN_H) {
+        of_gpu_clear_rect(fbAddr + (uint32_t)bottomY * OPENFPGA_SCREEN_W,
+                          OPENFPGA_SCREEN_W, OPENFPGA_SCREEN_H - bottomY, 0);
+        issued = true;
+    }
+
+    if (copyH != 0 && xOff > 0) {
+        of_gpu_clear_rect(fbAddr + (uint32_t)yOff * OPENFPGA_SCREEN_W,
+                          xOff, copyH, 0);
+        issued = true;
+    }
+
+    const int rightX = xOff + (int)copyW;
+    if (copyH != 0 && rightX < OPENFPGA_SCREEN_W) {
+        of_gpu_clear_rect(fbAddr + (uint32_t)yOff * OPENFPGA_SCREEN_W + rightX,
+                          OPENFPGA_SCREEN_W - rightX, copyH, 0);
+        issued = true;
+    }
+
+    if (issued)
+        of_gpu_wait(of_gpu_submit());
+}
+
+void OpenFPGAGraphicsManager::presentFrame() {
+    if (_gpuReady && _videoBufIdx >= 0) {
+        _videoFence = of_gpu_flip_to(_videoBufIdx);
+        of_gpu_kick();
+        _videoBufIdx = of_video_acquire_next(_videoBufIdx, _videoFence);
+    } else {
+        of_video_flush();
+        of_video_flip();
+    }
+}
+
 void OpenFPGAGraphicsManager::updateScreen() {
+    /* Pump audio (mixer only -- no timer/MIDI recursion) before and
+     * after presentation; the frame copy/flip can stall long enough to
+     * drain the 21 ms audio FIFO. */
+    extern void openfpga_mixer_pump_only(void);
+    openfpga_mixer_pump_only();
+
     if (_paletteDirty) {
         uint32_t pal32[256];
         for (int i = 0; i < 256; i++) {
@@ -120,14 +224,32 @@ void OpenFPGAGraphicsManager::updateScreen() {
 
     /* Always blit -- engines expect updateScreen() to push every frame
      * regardless of dirty tracking. */
-    of_video_blit_letterbox(_screenBuf, _screenW, _screenH);
+    uint8_t *fb = acquireFrameBuffer();
+    int xOff = ((int)OPENFPGA_SCREEN_W - (int)_screenW) / 2;
+    int yOff = ((int)OPENFPGA_SCREEN_H - (int)_screenH) / 2;
+    if (xOff < 0) xOff = 0;
+    if (yOff < 0) yOff = 0;
+    uint copyW = _screenW;
+    uint copyH = _screenH;
+    if (copyW > OPENFPGA_SCREEN_W) copyW = OPENFPGA_SCREEN_W;
+    if (copyH > OPENFPGA_SCREEN_H) copyH = OPENFPGA_SCREEN_H;
+
+    clearFrameBorders(fb, xOff, yOff, copyW, copyH);
+    for (uint y = 0; y < copyH; ++y) {
+        memcpy(fb + (y + yOff) * OPENFPGA_SCREEN_W + xOff,
+               _screenBuf + y * _screenW,
+               copyW);
+    }
 
     if (_cursorVisible)
-        drawCursor(of_video_surface());
+        drawCursor(fb, xOff, yOff);
 
-    of_video_flush();
-    of_video_flip();
+    of_cache_flush_range(fb, OPENFPGA_SCREEN_W * OPENFPGA_SCREEN_H);
+    presentFrame();
     _screenDirty = false;
+
+    extern void openfpga_mixer_pump_only(void);
+    openfpga_mixer_pump_only();
 }
 
 Graphics::PixelFormat OpenFPGAGraphicsManager::getOverlayFormat() const {
@@ -175,12 +297,11 @@ void OpenFPGAGraphicsManager::moveMouse(int dx, int dy) {
     _screenDirty = true;
 }
 
-void OpenFPGAGraphicsManager::drawCursor(uint8_t *dst) const {
+void OpenFPGAGraphicsManager::drawCursor(uint8_t *dst, int xOff, int yOff) const {
     if (!_cursorVisible || _cursorW == 0 || _cursorH == 0)
         return;
 
-    int yOff = (OPENFPGA_SCREEN_H - _screenH) / 2;
-    int cx = _cursorX - _cursorHotX;
+    int cx = _cursorX - _cursorHotX + xOff;
     int cy = _cursorY - _cursorHotY + yOff;
 
     for (uint row = 0; row < _cursorH; row++) {
@@ -200,9 +321,30 @@ void OpenFPGAGraphicsManager::drawCursor(uint8_t *dst) const {
  * OSystem_OpenFPGA
  * ═══════════════════════════════════════════════════════════════════ */
 
+namespace {
+
+int pixelsFromRate(int rate, uint32 elapsedMs, int32 &accum) {
+    if (rate == 0) {
+        accum = 0;
+        return 0;
+    }
+
+    if ((rate > 0 && accum < 0) || (rate < 0 && accum > 0))
+        accum = 0;
+
+    accum += rate * (int32)elapsedMs;
+    int pixels = accum / 1000;
+    accum -= pixels * 1000;
+    return pixels;
+}
+
+} // namespace
+
 OSystem_OpenFPGA::OSystem_OpenFPGA()
     : _startTime(0), _ofGfx(nullptr),
-      _mouseButtonL(false), _mouseButtonR(false), _autoDismissCounter(60) {
+      _mouseButtonL(false), _mouseButtonR(false), _autoDismissCounter(60),
+      _ignoreInitialButtons(true), _lastMouseTick(0),
+      _mouseAccumX(0), _mouseAccumY(0) {
 }
 
 OSystem_OpenFPGA::~OSystem_OpenFPGA() {
@@ -226,21 +368,22 @@ void OSystem_OpenFPGA::initBackend() {
     _savefileManager = new OpenFPGASaveFileManager();
     _fsFactory = new OpenFPGAFilesystemFactory();
 
+    openfpga_set_pump_managers(_timerManager, _mixerManager);
+
+    /* Pre-set the AudioCD manager so BaseBackend::initBackend() skips
+     * its DefaultAudioCDManager lazy-init.  Ours additionally streams
+     * raw CDDA from a .cue/.bin pair in SearchMan -- main.cpp adds
+     * the game zip before initBackend is called, so the cue is visible. */
+    _audiocdManager = new OpenFPGAAudioCDManager();
+
     BaseBackend::initBackend();
 }
 
 bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
-    /* Pump timers + audio mixer.  pollEvent fires at engine frame
-     * rate; the mixer's update() tops up the SDK audio FIFO while it
-     * has room, so as long as we're called more often than the FIFO
-     * drains (~21 ms at 48 kHz stereo) audio stays gapless. */
-    ((DefaultTimerManager *)getTimerManager())->checkTimers();
-    /* Drain pending iMUSE timer slots accumulated by the 1 kHz MIDI
-     * IRQ.  iMUSE's callback is too deep to run safely on the BRAM
-     * IRQ stack, so the IRQ just counts ticks; we dispatch here. */
-    extern void openfpga_midi_pump_pending();
-    openfpga_midi_pump_pending();
-    ((OpenFPGAMixerManager *)_mixerManager)->update();
+    openfpga_drive_audio_and_timers();
+
+    if (popQueuedEvent(event))
+        return true;
 
     of_input_poll();
 
@@ -249,45 +392,74 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
     if (_autoDismissCounter > 0) {
         _autoDismissCounter--;
         if (_autoDismissCounter == 0) {
-            event.type = Common::EVENT_KEYDOWN;
-            event.kbd.keycode = Common::KEYCODE_RETURN;
-            event.kbd.ascii = '\r';
-            event.kbd.flags = 0;
-            return true;
+            queueKey(Common::KEYCODE_RETURN, Common::ASCII_RETURN);
+            return popQueuedEvent(event);
         }
     }
 
-    /* Analog stick → mouse movement */
+    /* Analog stick and D-pad both drive the mouse.  Movement is applied
+     * before button handling so clicks land at the current cursor, but
+     * button/key events are returned first so continuous movement cannot
+     * starve clicks or shortcuts. */
     of_input_state_t state;
     of_input_state(0, &state);
 
+    if (_ignoreInitialButtons) {
+        if (state.buttons != 0) {
+            _lastMouseTick = getMillis();
+            _mouseAccumX = 0;
+            _mouseAccumY = 0;
+            _mouseButtonL = false;
+            _mouseButtonR = false;
+            return false;
+        }
+        _ignoreInitialButtons = false;
+    }
+
+    uint32 nowMs = getMillis();
+    uint32 elapsedMs = (_lastMouseTick == 0) ? 16 : nowMs - _lastMouseTick;
+    _lastMouseTick = nowMs;
+    if (elapsedMs > 50)
+        elapsedMs = 50;
+
     const int deadzone = 4000;
-    const int maxSpeed = 6;
+    const bool slowMouse = (state.buttons & (OF_BTN_L1 | OF_BTN_L2)) != 0;
+    const bool fastMouse = (state.buttons & (OF_BTN_R1 | OF_BTN_R2)) != 0;
+    const int analogMaxRate = slowMouse ? 120 : (fastMouse ? 420 : 260);
+    const int dpadBaseRate = slowMouse ? 60 : (fastMouse ? 240 : 120);
     int lx = state.joy_lx;
     int ly = state.joy_ly;
     if (lx > -deadzone && lx < deadzone) lx = 0;
     if (ly > -deadzone && ly < deadzone) ly = 0;
 
-    int dx = 0, dy = 0;
-    if (lx != 0) dx = (lx * maxSpeed) / 32767;
-    if (ly != 0) dy = (ly * maxSpeed) / 32767;
+    int rateX = 0;
+    int rateY = 0;
+    if (lx != 0)
+        rateX += (lx * analogMaxRate) / 32767;
+    if (ly != 0)
+        rateY += (ly * analogMaxRate) / 32767;
 
-    /* D-pad for precision */
-    if (of_btn(OF_BTN_LEFT))  dx -= 1;
-    if (of_btn(OF_BTN_RIGHT)) dx += 1;
-    if (of_btn(OF_BTN_UP))    dy -= 1;
-    if (of_btn(OF_BTN_DOWN))  dy += 1;
-
-    if (dx != 0 || dy != 0) {
-        _ofGfx->moveMouse(dx, dy);
-        event.type = Common::EVENT_MOUSEMOVE;
-        event.mouse.x = _ofGfx->getMouseX();
-        event.mouse.y = _ofGfx->getMouseY();
-        return true;
+    int dpadX = 0;
+    int dpadY = 0;
+    if (state.buttons & OF_BTN_LEFT)  --dpadX;
+    if (state.buttons & OF_BTN_RIGHT) ++dpadX;
+    if (state.buttons & OF_BTN_UP)    --dpadY;
+    if (state.buttons & OF_BTN_DOWN)  ++dpadY;
+    if (dpadX || dpadY) {
+        int dpadRate = (dpadX && dpadY) ? ((dpadBaseRate * 3) / 4) : dpadBaseRate;
+        rateX += dpadX * dpadRate;
+        rateY += dpadY * dpadRate;
     }
 
+    int dx = pixelsFromRate(rateX, elapsedMs, _mouseAccumX);
+    int dy = pixelsFromRate(rateY, elapsedMs, _mouseAccumY);
+
+    bool moved = dx != 0 || dy != 0;
+    if (moved)
+        _ofGfx->moveMouse(dx, dy);
+
     /* A = left click */
-    bool aDown = of_btn(OF_BTN_A) != 0;
+    bool aDown = (state.buttons & OF_BTN_A) != 0;
     if (aDown != _mouseButtonL) {
         _mouseButtonL = aDown;
         event.type = aDown ? Common::EVENT_LBUTTONDOWN : Common::EVENT_LBUTTONUP;
@@ -297,7 +469,7 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
     }
 
     /* B = right click */
-    bool bDown = of_btn(OF_BTN_B) != 0;
+    bool bDown = (state.buttons & OF_BTN_B) != 0;
     if (bDown != _mouseButtonR) {
         _mouseButtonR = bDown;
         event.type = bDown ? Common::EVENT_RBUTTONDOWN : Common::EVENT_RBUTTONUP;
@@ -306,34 +478,64 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
         return true;
     }
 
-    /* Start = F5 (save/load menu) */
-    if (of_btn_pressed(OF_BTN_START)) {
-        event.type = Common::EVENT_KEYDOWN;
-        event.kbd.keycode = Common::KEYCODE_F5;
-        event.kbd.ascii = Common::ASCII_F5;
-        event.kbd.flags = 0;
-        return true;
+    /* Controller shortcuts. */
+    if (state.buttons_pressed & OF_BTN_X) {
+        queueKey(Common::KEYCODE_RETURN, Common::ASCII_RETURN);
+        return popQueuedEvent(event);
     }
 
-    /* Select = Escape (skip cutscene) */
-    if (of_btn_pressed(OF_BTN_SELECT)) {
-        event.type = Common::EVENT_KEYDOWN;
-        event.kbd.keycode = Common::KEYCODE_ESCAPE;
-        event.kbd.ascii = 27;
-        event.kbd.flags = 0;
-        return true;
+    if (state.buttons_pressed & OF_BTN_Y) {
+        queueKey(Common::KEYCODE_SPACE, Common::ASCII_SPACE);
+        return popQueuedEvent(event);
     }
 
-    /* Y = pause */
-    if (of_btn_pressed(OF_BTN_Y)) {
-        event.type = Common::EVENT_KEYDOWN;
-        event.kbd.keycode = Common::KEYCODE_SPACE;
-        event.kbd.ascii = ' ';
-        event.kbd.flags = 0;
+    if (state.buttons_pressed & OF_BTN_START) {
+        queueKey(Common::KEYCODE_F5, Common::ASCII_F5);
+        return popQueuedEvent(event);
+    }
+
+    /* Plain Select intentionally has no Escape binding. SCUMM uses Escape
+     * as cutscene-abort, so mapping Select there skips to the next scene. */
+
+    if (state.buttons_pressed & OF_BTN_L3) {
+        queueKey(Common::KEYCODE_TAB, Common::ASCII_TAB);
+        return popQueuedEvent(event);
+    }
+
+    if (state.buttons_pressed & OF_BTN_R3) {
+        queueKey(Common::KEYCODE_PERIOD, '.');
+        return popQueuedEvent(event);
+    }
+
+    if (moved) {
+        event.type = Common::EVENT_MOUSEMOVE;
+        event.mouse.x = _ofGfx->getMouseX();
+        event.mouse.y = _ofGfx->getMouseY();
         return true;
     }
 
     return false;
+}
+
+void OSystem_OpenFPGA::queueKey(Common::KeyCode keycode, uint16 ascii, byte flags) {
+    Common::Event ev;
+    ev.type = Common::EVENT_KEYDOWN;
+    ev.kbdRepeat = false;
+    ev.kbd.keycode = keycode;
+    ev.kbd.ascii = ascii;
+    ev.kbd.flags = flags;
+    _eventQueue.push(ev);
+
+    ev.type = Common::EVENT_KEYUP;
+    ev.kbdRepeat = false;
+    _eventQueue.push(ev);
+}
+
+bool OSystem_OpenFPGA::popQueuedEvent(Common::Event &event) {
+    if (_eventQueue.empty())
+        return false;
+    event = _eventQueue.pop();
+    return true;
 }
 
 Common::MutexInternal *OSystem_OpenFPGA::createMutex() {
@@ -345,7 +547,67 @@ uint32 OSystem_OpenFPGA::getMillis(bool skipRecord) {
 }
 
 void OSystem_OpenFPGA::delayMillis(uint msecs) {
-    usleep(msecs * 1000);
+    /* Main-thread drain at 1 ms granularity.  Each tick:
+     *   - drain() pushes ring -> FIFO (cheap)
+     *   - update() refills the ring if below 75 % (no-op when full)
+     * Tried moving drain to the 1 kHz timer ISR but of_audio_write
+     * from IRQ produces audible vibrato; main-thread is the safer
+     * spot even though it can underrun during long engine work. */
+    OpenFPGAMixerManager *mgr = (OpenFPGAMixerManager *)_mixerManager;
+    extern void openfpga_audiocd_pump(void);
+    openfpga_midi_pump_pending();
+    openfpga_audiocd_pump();
+    mgr->update();
+    mgr->drain();
+    while (msecs > 0) {
+        usleep(1000);
+        openfpga_midi_pump_pending();
+        openfpga_audiocd_pump();
+        mgr->drain();
+        if ((msecs & 0x3) == 0) mgr->update();   /* refill every ~4 ms */
+        --msecs;
+    }
+    openfpga_midi_pump_pending();
+    mgr->update();
+    mgr->drain();
+}
+
+/* Shared by pollEvent, delayMillis, and the graphics manager's
+ * updateScreen (DMA blit can stall the main thread).  Pumping here
+ * means audio stays gapless even when the engine doesn't return
+ * control to its event loop for a frame.  initBackend stashes the
+ * concrete manager pointers via openfpga_set_pump_managers so we
+ * avoid the virtual-base cast from g_system. */
+static DefaultTimerManager   *g_pumpTimerMgr = nullptr;
+static OpenFPGAMixerManager  *g_pumpMixerMgr = nullptr;
+static bool                   g_pumpBusy = false;
+
+void openfpga_set_pump_managers(Common::TimerManager *t, MixerManager *m) {
+    g_pumpTimerMgr = (DefaultTimerManager *)t;
+    g_pumpMixerMgr = (OpenFPGAMixerManager *)m;
+}
+
+void openfpga_drive_audio_and_timers(void) {
+    if (!g_pumpTimerMgr || !g_pumpMixerMgr) return;
+    if (g_pumpBusy) return;
+    g_pumpBusy = true;
+    g_pumpTimerMgr->checkTimers();
+    openfpga_midi_pump_pending();
+    extern void openfpga_audiocd_pump(void);
+    openfpga_audiocd_pump();
+    g_pumpMixerMgr->update();
+    g_pumpMixerMgr->drain();
+    g_pumpBusy = false;
+}
+
+void openfpga_mixer_pump_only(void) {
+    if (!g_pumpMixerMgr || g_pumpBusy) return;
+    g_pumpBusy = true;
+    extern void openfpga_audiocd_pump(void);
+    openfpga_audiocd_pump();
+    g_pumpMixerMgr->update();
+    g_pumpMixerMgr->drain();
+    g_pumpBusy = false;
 }
 
 void OSystem_OpenFPGA::getTimeAndDate(TimeDate &td, bool skipRecord) const {
@@ -375,7 +637,7 @@ void OSystem_OpenFPGA::logMessage(LogMessageType::Type type, const char *message
     int len = strlen(buf);
     while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
         buf[--len] = '\0';
-    printf("\x1b[28;1H\x1b[2K\x1b[29;1H\x1b[2K\x1b[28;1H%s", buf);
+    printf("\x1b[28;1H\x1b[2K\x1b[29;1H\x1b[2K\x1b[28;1H%s\r\n", buf);
     fflush(stdout);
 }
 
@@ -389,7 +651,7 @@ void OSystem_OpenFPGA::addSysArchivesToSearchSet(Common::SearchSet &s, int prior
 
 namespace {
 
-char g_iniPath[64] = "";
+char g_iniPath[256] = "";
 const char *iniPath() { return g_iniPath[0] ? g_iniPath : nullptr; }
 
 class ConfigWriteStream : public Common::MemoryWriteStreamDynamic {
@@ -423,6 +685,7 @@ private:
 void openfpga_set_config_path(const char *path) {
     if (!path) { g_iniPath[0] = '\0'; return; }
     snprintf(g_iniPath, sizeof(g_iniPath), "%s", path);
+    of_file_slot_register(9, g_iniPath);
 }
 
 Common::SeekableReadStream *OSystem_OpenFPGA::createConfigReadStream() {

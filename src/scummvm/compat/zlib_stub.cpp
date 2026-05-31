@@ -52,45 +52,9 @@ uLong adler32(uLong adler, const Bytef *buf, uInt len) {
 
 } /* extern "C" */
 
-/* ScummVM zlib wrapper stubs — these are called by common/ code but
- * we don't have zlib available. Return error/null. */
-namespace Common {
-
-bool inflateZlib(byte *dst, unsigned long *dstLen, const byte *src, unsigned long srcLen) {
-    return false;
-}
-
-bool inflateZlibHeaderless(byte *dst, uint *dstLen, const byte *src, uint srcLen,
-                           const byte *dict, uint dictLen) {
-    return false;
-}
-
-bool inflateClickteam(byte *dst, uint *dstLen, const byte *src, uint srcLen) {
-    return false;
-}
-
-SeekableReadStream *wrapCompressedReadStream(SeekableReadStream *toBeWrapped,
-                                              DisposeAfterUse::Flag disposeParent,
-                                              uint64 knownSize) {
-    /* No compression support — return the stream as-is */
-    return toBeWrapped;
-}
-
-WriteStream *wrapCompressedWriteStream(WriteStream *toBeWrapped) {
-    return toBeWrapped;
-}
-
-SeekableReadStream *wrapClickteamReadStream(SeekableReadStream *toBeWrapped,
-                                             DisposeAfterUse::Flag disposeParent,
-                                             uint64 knownSize) {
-    return toBeWrapped;
-}
-
-/* matchString, tag2string, replace are now provided by str.cpp (no SCUMMVM_UTIL) */
-
-/* OutSaveFile and SaveFileManager are now in backends/saves/savefile.cpp */
-
-} /* namespace Common */
+/* Common deflate helpers and stream wrappers are provided by
+ * common/compression/gzio.cpp.  Keep only the C zlib symbol stubs
+ * above for code paths compiled out by USE_ZLIB. */
 
 /* SVGBitmap stub — include the actual header to get the right class layout */
 #include "graphics/svg.h"
@@ -108,4 +72,3 @@ SVGBitmap::SVGBitmap(Common::SeekableReadStream *in, int targetWidth, int target
 namespace GUI {
 void dumpAllDialogs(const Common::String &) {}
 }
-

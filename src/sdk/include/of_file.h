@@ -36,8 +36,56 @@ static inline void of_file_slot_register(uint32_t slot_id, const char *filename)
     OF_SVC->file_slot_register(slot_id, filename);
 }
 
+/* Resolve a filename to its APF data-slot id.
+ * The match is case-insensitive and uses the basename, matching fopen()
+ * resolution. Returns 0 on success and writes *slot_id_out when non-NULL;
+ * returns <0 when the file is not registered/found. */
+static inline int of_file_slot_find(const char *filename,
+                                    uint32_t *slot_id_out) {
+    struct of_sbiret r = of_ecall1(OF_EID_FILE, OF_FILE_FID_SLOT_FIND,
+                                   (long)filename);
+    if (r.error)
+        return (int)r.error;
+    if (slot_id_out)
+        *slot_id_out = (uint32_t)r.value;
+    return 0;
+}
+
+/* Allocate CRAM0 staging memory suitable for of_file_read_async().
+ * The returned pointer is CPU-addressable CRAM0 and remains valid until
+ * of_file_dma_stage_reset() or app exit. Allocate a few fixed-size buffers at
+ * startup, then reuse them for async reads. Returns NULL on failure. */
+static inline void *of_file_dma_stage_alloc(uint32_t size, uint32_t align) {
+    struct of_sbiret r = of_ecall2(OF_EID_FILE, OF_FILE_FID_DMA_STAGE_ALLOC,
+                                   (long)size, (long)align);
+    if (r.error)
+        return (void *)0;
+    return (void *)r.value;
+}
+
+/* Reset the app DMA staging allocator. Fails with OF_ERR_BUSY if an async
+ * read is currently in flight. */
+static inline int of_file_dma_stage_reset(void) {
+    struct of_sbiret r = of_ecall0(OF_EID_FILE, OF_FILE_FID_DMA_STAGE_RESET);
+    return (int)r.error;
+}
+
+/* Maximum byte count accepted by one of_file_read_async() request. */
+static inline uint32_t of_file_async_max_read(void) {
+    struct of_sbiret r = of_ecall0(OF_EID_FILE, OF_FILE_FID_ASYNC_MAX_READ);
+    return r.error ? 0u : (uint32_t)r.value;
+}
+
+/* Total bytes reserved for app-visible CRAM0 async staging. */
+static inline uint32_t of_file_dma_stage_size(void) {
+    struct of_sbiret r = of_ecall0(OF_EID_FILE, OF_FILE_FID_DMA_STAGE_SIZE);
+    return r.error ? 0u : (uint32_t)r.value;
+}
+
 /* Start a non-blocking file read from a data slot.
- * dest must point into a DMA-target region (Pocket currently requires CRAM0).
+ * dest can point to normal SDRAM.  CRAM0 destinations allocated with
+ * of_file_dma_stage_alloc() use the zero-copy direct path; other destinations
+ * are copied from an internal CRAM0 bounce buffer on completion.
  * callback(token, result) fires from the data-slot completion IRQ:
  * result=0 success, <0 error.
  * Only one async read in flight at a time (bridge limitation).
@@ -45,20 +93,20 @@ static inline void of_file_slot_register(uint32_t slot_id, const char *filename)
 static inline int of_file_read_async(int slot_id, uint32_t offset,
                                      void *dest, uint32_t length,
                                      void (*callback)(int token, int result)) {
-    return (int)of_ecall5(OF_EID_FILE, OF_FILE_FID_READ_ASYNC,
-                          slot_id, (long)offset, (long)dest,
-                          (long)length, (long)callback).value;
+    return of_sbi_ret_int(of_ecall5(OF_EID_FILE, OF_FILE_FID_READ_ASYNC,
+                                    slot_id, (long)offset, (long)dest,
+                                    (long)length, (long)callback));
 }
 
 /* Poll async read progress. Optional on Pocket: completion is IRQ-driven.
  * Returns 1 once per completed read, 0 otherwise. */
 static inline int of_file_async_poll(void) {
-    return (int)of_ecall0(OF_EID_FILE, OF_FILE_FID_ASYNC_POLL).value;
+    return of_sbi_ret_int(of_ecall0(OF_EID_FILE, OF_FILE_FID_ASYNC_POLL));
 }
 
 /* Check if an async read is in flight. */
 static inline int of_file_async_busy(void) {
-    return (int)of_ecall0(OF_EID_FILE, OF_FILE_FID_ASYNC_BUSY).value;
+    return of_sbi_ret_int(of_ecall0(OF_EID_FILE, OF_FILE_FID_ASYNC_BUSY));
 }
 
 #endif /* OF_PC */

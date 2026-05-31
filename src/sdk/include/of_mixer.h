@@ -1,14 +1,13 @@
 /*
  * of_mixer.h -- PCM Mixer API for openfpgaOS
  *
- * 32-voice CPU-side software mixer.  Runs from the 1 kHz timer ISR,
- * produces 48 stereo samples per block, and pushes them to the
- * audio_output dcfifo.  Sample-based MIDI synthesis (of_midi /
- * of_smp_voice) drives this same mixer.
+ * 32-voice hardware PCM mixer.  Samples live in normal SDRAM buffers;
+ * the OS flushes cached buffers before handing their absolute SDRAM
+ * address to the mixer DMA path.
  *
  * Usage:
  *   1. Call of_mixer_init()
- *   2. Allocate sample memory: buf = of_mixer_alloc_samples(size)
+ *   2. Allocate sample memory: buf = malloc(size)
  *   3. Load 16-bit signed mono PCM data into buf
  *   4. Play: of_mixer_play(buf, sample_count, sample_rate, 0, volume)
  *   5. Optionally set loop, rate, stereo volume, bidi, position
@@ -266,6 +265,9 @@ static inline uint32_t of_mixer_poll_ended_h(of_mixer_handle_t *out_handles,
     return 0;
 }
 
+/* Legacy allocator.  Prefer malloc/free for new code; the mixer can DMA
+ * from any SDRAM buffer.  This service remains for older apps that use
+ * of_mixer_free_samples() as a bulk reset. */
 static inline void *of_mixer_alloc_samples(size_t size) {
     return OF_SVC->mixer_alloc_samples((uint32_t)size);
 }
@@ -301,9 +303,8 @@ static inline void of_mixer_set_master_volume(int volume) {
     OF_SVC->mixer_set_master_volume(volume);
 }
 
-/* Per-voice SVF low-pass filter.  cutoff_q016 is a Q0.16 register
- * value (65535 ≈ wide-open), q is 0..255 resonance, enable gates
- * the filter into the voice's signal path. */
+/* Retired per-voice filter surface.  The current mixer has no SVF, so this
+ * is a compatibility no-op kept for older apps. */
 static inline void of_mixer_set_filter(int voice, int cutoff_q016, int q, int enable) {
     OF_SVC->mixer_set_filter(voice, cutoff_q016, q, enable);
 }

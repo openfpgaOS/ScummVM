@@ -4,9 +4,8 @@
  * The kernel auto-loads the first .ofsf it finds in a data slot at boot
  * and hands the buffer to apps via OF_SVC->smp_bank_preload_base. This
  * file copies the metadata (header + presets + zones) into SDRAM so the
- * CPU never reads CRAM1 during playback — only the mixer DMA touches
- * CRAM1.  Without this copy, CPU zone-reads and mixer sample-DMA
- * contend on the CRAM1 bus arbiter and eventually deadlock.
+ * app can keep compact, writable metadata while sample data remains in
+ * the preloaded SDRAM bank read by the mixer.
  */
 
 #include "include/of_smp_bank.h"
@@ -24,34 +23,60 @@ static const ofsf_preset_t *loaded_presets;
 static const ofsf_zone_t   *loaded_zones;
 static const void           *sample_base;
 
-__attribute__((constructor(102)))
-static void bank_autobind(void)
+int of_smp_bank_bind_preloaded(void)
 {
+    if (loaded_header && loaded_presets && loaded_zones && sample_base)
+        return 1;
+    if (!OF_SVC || OF_SVC->magic != OF_SVC_MAGIC)
+        return 0;
+
     const void *buf = OF_SVC->smp_bank_preload_base;
-    if (!buf) return;
+    uint32_t preload_size = OF_SVC->smp_bank_preload_size;
+    if (!buf || preload_size < sizeof(ofsf_header_t))
+        return 0;
 
     const ofsf_header_t *hdr = (const ofsf_header_t *)buf;
     if (hdr->magic != OFSF_MAGIC || hdr->version != OFSF_VERSION)
-        return;
+        return -1;
+
+    uint32_t preset_bytes = OFSF_PRESET_COUNT * sizeof(ofsf_preset_t);
+    uint32_t zone_bytes = hdr->zone_count * sizeof(ofsf_zone_t);
+    uint32_t metadata_end = sizeof(ofsf_header_t) + preset_bytes + zone_bytes;
+    if (hdr->zone_count == 0 ||
+        metadata_end > preload_size ||
+        hdr->sample_data_offset > preload_size ||
+        hdr->sample_data_size > preload_size - hdr->sample_data_offset)
+        return -2;
 
     const uint8_t *base = (const uint8_t *)buf;
 
+    ofsf_preset_t *new_presets = (ofsf_preset_t *)malloc(preset_bytes);
+    ofsf_zone_t *new_zones = (ofsf_zone_t *)malloc(zone_bytes);
+    if (!new_presets || !new_zones) {
+        free(new_presets);
+        free(new_zones);
+        return -3;
+    }
+
     memcpy(&hdr_copy, hdr, sizeof(hdr_copy));
+    memcpy(new_presets, base + sizeof(ofsf_header_t), preset_bytes);
+    memcpy(new_zones, base + sizeof(ofsf_header_t) + preset_bytes, zone_bytes);
 
-    uint32_t preset_bytes = OFSF_PRESET_COUNT * sizeof(ofsf_preset_t);
-    preset_copy = (ofsf_preset_t *)malloc(preset_bytes);
-    if (preset_copy)
-        memcpy(preset_copy, base + sizeof(ofsf_header_t), preset_bytes);
-
-    uint32_t zone_bytes = hdr->zone_count * sizeof(ofsf_zone_t);
-    zone_copy = (ofsf_zone_t *)malloc(zone_bytes);
-    if (zone_copy)
-        memcpy(zone_copy, base + sizeof(ofsf_header_t) + preset_bytes, zone_bytes);
-
+    free(preset_copy);
+    free(zone_copy);
+    preset_copy = new_presets;
+    zone_copy = new_zones;
     loaded_header  = &hdr_copy;
     loaded_presets = preset_copy;
     loaded_zones   = zone_copy;
     sample_base    = base + hdr->sample_data_offset;
+    return 1;
+}
+
+__attribute__((constructor(102)))
+static void bank_autobind(void)
+{
+    (void)of_smp_bank_bind_preloaded();
 }
 
 const ofsf_header_t *of_smp_bank_get(void)

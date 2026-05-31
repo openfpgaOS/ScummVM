@@ -1,8 +1,8 @@
 /*
  * openfpga_save.h -- Save-file manager for openfpgaOS.
  *
- * Backs ScummVM's Common::SaveFileManager with the 10 nonvolatile APF
- * save slots exposed by the SDK as POSIX paths "save:0".."save:9".
+ * Backs ScummVM's Common::SaveFileManager with the nine save files we
+ * expose to the UI via APF data slots 10..18.
  * Each slot stores one save under a fixed-size header that records
  * the original ScummVM filename (e.g. "monkey-001.s00") so engine code
  * doesn't have to know about slot IDs.
@@ -13,7 +13,7 @@
 
 #include "common/savefile.h"
 
-#define OPENFPGA_MAX_SAVES   10
+#define OPENFPGA_MAX_SAVES   9
 #define OPENFPGA_SAVE_SIZE   (256 * 1024)
 #define SAVE_MAGIC           0x53564D53u   /* 'SVMS' */
 #define SAVE_NAME_MAX        64
@@ -42,5 +42,7 @@ private:
     static int    findSlotByName(const char *name);
     static int    findFreeSlot();
 };
+
+void openfpga_set_save_path(int slot, const char *path);
 
 #endif /* OPENFPGA_SAVE_H */

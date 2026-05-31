@@ -32,7 +32,7 @@ Engine coverage today: **SCUMM v4–v6**. v3 and v7 may work but are untested. O
 
 ## Adding a game
 
-Each game on the Pocket is one **instance**: an instance JSON tells the launcher which data file to bind to slot 3 (the game data), which `.cfg` to bind to slot 5, which slot 9 holds the user's `.ini`, and which slots 10–19 hold save files. Ship as many instances as you want.
+Each game on the Pocket is one **instance**: an instance JSON tells the launcher which OS `.ini` to bind to slot 2, which data file to bind to slot 4, which slot 9 holds ScummVM's per-game `.ini`, and which slots 10–18 hold save files. Ship as many instances as you want.
 
 Two delivery modes are supported.
 
@@ -42,9 +42,14 @@ The Pocket-side OS mounts standard ISO 9660 filesystems via `of_iso_mount`, and 
 
 1. **Get an ISO of your CD.** `dd if=/dev/sr0 of=mygame.iso bs=2048`, or any standard ripping tool. Verify on desktop ScummVM first.
 
-2. **Write a `game.cfg`** (plain text, key=value):
+2. **Write the per-instance OS `.ini`**. The `[os]` section launches the shared ELF; the `[scummvm]` section provides ScummVM's bootstrap data:
 
     ```ini
+    [os]
+    ELF=scummvm.elf
+    ARGS=monkey
+
+    [scummvm]
     gameid=monkey
     engineid=scumm
     description=The Secret of Monkey Island
@@ -64,10 +69,10 @@ The Pocket-side OS mounts standard ISO 9660 filesystems via `of_iso_mount`, and 
         "variant_select": { "id": 666, "select": false },
         "data_slots": [
           { "id": 1,  "filename": "os.bin"        },
-          { "id": 2,  "filename": "scummvm.elf"   },
-          { "id": 3,  "filename": "monkey1.iso"   },
-          { "id": 4,  "filename": "bank.ofsf"     },
-          { "id": 5,  "filename": "monkey1.cfg"   },
+          { "id": 2,  "filename": "monkey1_os.ini" },
+          { "id": 3,  "filename": "scummvm.elf"   },
+          { "id": 4,  "filename": "monkey1.iso"   },
+          { "id": 5,  "filename": "bank.ofsf"     },
           { "id": 9,  "filename": "monkey1.ini"   },
           { "id": 10, "filename": "monkey1_0.sav" },
           { "id": 11, "filename": "monkey1_1.sav" },
@@ -77,8 +82,7 @@ The Pocket-side OS mounts standard ISO 9660 filesystems via `of_iso_mount`, and 
           { "id": 15, "filename": "monkey1_5.sav" },
           { "id": 16, "filename": "monkey1_6.sav" },
           { "id": 17, "filename": "monkey1_7.sav" },
-          { "id": 18, "filename": "monkey1_8.sav" },
-          { "id": 19, "filename": "monkey1_9.sav" }
+          { "id": 18, "filename": "monkey1_8.sav" }
         ]
       }
     }
@@ -90,7 +94,7 @@ The Pocket-side OS mounts standard ISO 9660 filesystems via `of_iso_mount`, and 
 
     ```
     <SD>/Assets/scummvm/ThinkElastic.ScummVM/monkey1.iso
-    <SD>/Assets/scummvm/ThinkElastic.ScummVM/monkey1.cfg
+    <SD>/Assets/scummvm/ThinkElastic.ScummVM/monkey1_os.ini
     ```
 
     `make copy` puts the instance JSON and static assets in place automatically.
@@ -103,25 +107,17 @@ The four classic ISO instances we ship (MI1, MI2, DOTT, Atlantis) all follow thi
 
 For games whose original media isn't a CD (GOG-extracted folders, repackaged remasters, etc.), pack the game files into a **STORE-mode** ZIP and the engine reads from inside the archive via ScummVM's `Common::makeZipArchive`.
 
-The crucial requirements: zip with `-0` (no compression) and include a `game.cfg` at the archive root.
+The crucial requirement is zip with `-0` (no compression). Instances keep their bootstrap config in slot 2's OS `.ini`.
 
 ```sh
 cd /path/to/Game\ Folder
-cat > game.cfg <<EOF
-gameid=tentacle
-engineid=scumm
-description=Day of the Tentacle
-platform=pc
-language=en
-music=openfpga
-EOF
-zip -0 -r ~/dott.zip *.LFL *.LEC game.cfg
+zip -0 -r ~/dott.zip *.LFL *.LEC
 ```
 
-Instance JSON is identical to ISO mode except slot 3 points at the `.zip`:
+Instance JSON is identical to ISO mode except slot 4 points at the `.zip`:
 
 ```json
-{ "id": 3, "filename": "monkey1se.zip" }
+{ "id": 4, "filename": "monkey1se.zip" }
 ```
 
 ZIP-mode behaviour:
@@ -134,11 +130,11 @@ ZIP-mode behaviour:
 
 ### Saves and config
 
-Slots 10–19 are non-volatile and reserved for save game slots 0–9. Slot 9 is the per-instance `.ini` (ScummVM's persistent config). Both are written transparently as the engine plays. To wipe a game's saves, just delete those `.sav` files from the SD.
+Slots 10–18 are non-volatile and reserved for save game slots 0–8. Slot 9 is ScummVM's persistent per-game `.ini`; slot 2 is the openfpgaOS launch/config `.ini` read through `of_config_get`. To wipe a game's saves, just delete those `.sav` files from the SD.
 
 ## Audio
 
-- **MIDI**: AdLib OPL emulation (most music) runs through ScummVM's softsynth and out through our hardware audio mixer. MT-32 / General-MIDI cues route through `openfpga_midi`, which uses the Pocket's hardware PCM mixer + a sample-based soundfont (`bank.ofsf`, slot 4).
+- **MIDI**: AdLib OPL emulation (most music) runs through ScummVM's softsynth and out through our hardware audio mixer. MT-32 / General-MIDI cues route through `openfpga_midi`, which uses the Pocket's hardware PCM mixer + a sample-based soundfont (`bank.ofsf`, slot 5).
 - **CD audio**: classic CD-era SCUMM games store music as CD-track references. Our ISO mount path doesn't wire up CDDA tracks directly; the engine falls back to MIDI for those games (which works for MI1/MI2 because the MIDI versions of every cue are still in the resource files).
 - **Digital speech** (DOTT, Atlantis): standard `.SOU` / `MONSTER.SOU` files, decoded by upstream ScummVM codecs.
 
@@ -159,9 +155,9 @@ src/scummvm/                       core build root
   scummvm/                         vendored ScummVM submodule
 dist/scummvm/                      core layout copied to SD by `make copy`
   Cores/ThinkElastic.ScummVM/      data.json + icon + variants
-  Assets/scummvm/                  per-game instance JSONs + .cfg files
+  Assets/scummvm/                  per-game instance JSONs + config/data files
     ThinkElastic.ScummVM/
-    common/                        shared .cfg files for ISO-based games
+    common/                        shared OS .ini files and game data
 tools/wmapro_test/                 PC unit test for the WMA Pro decoder port
 ```
 

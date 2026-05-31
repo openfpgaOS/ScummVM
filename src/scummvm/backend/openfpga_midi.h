@@ -25,19 +25,29 @@ public:
     OpenFPGAMidiDriver();
     ~OpenFPGAMidiDriver() override;
 
+#ifdef NONSTANDARD_PORT
+    static void *operator new(size_t size);
+    static void operator delete(void *p) noexcept;
+    static void operator delete(void *p, size_t) noexcept;
+#endif
+
     int open() override;
     void close() override;
     bool isOpen() const override { return _open; }
     void send(uint32 b) override;
+    void sysEx(const byte *msg, uint16 length) override;
 
-    /* Pin the MidiParser onto the same 1 kHz hardware-timer ISR that
-     * advances smp_voice envelopes, instead of letting MPU401 install
-     * it on DefaultTimerManager (which only ticks from pollEvent and
-     * causes Note Off events to land late = stuck voices). */
+    /* Schedule the MidiParser from the same 1 kHz hardware-timer clock
+     * that advances smp_voice envelopes.  The IRQ records pending parser
+     * ticks, while the backend pumps the callback from the main thread. */
     void setTimerCallback(void *timer_param,
                           Common::TimerManager::TimerProc timer_proc) override;
 
 private:
+    void silenceAll();
+    void resetChannelState(int ch, bool resetProgram);
+    void resetDeviceState(bool resetPrograms);
+
     bool    _open;
     uint8_t _program[16];     /* GM program (0..127) per channel */
     uint8_t _volume[16];      /* CC7 channel volume   (0..127, default 100) */
@@ -64,5 +74,15 @@ public:
  * in StaticPluginProvider::getPlugins(); to avoid patching that file we
  * register our own provider from main(). */
 PluginProvider *createOpenFPGAMidiPluginProvider();
+
+extern "C" void openfpga_midi_panic(void);
+extern "C" void openfpga_midi_pause(bool pause);
+void openfpga_midi_pump_pending(void);
+
+#ifdef NONSTANDARD_PORT
+MidiDriver::DeviceHandle openfpga_midi_device_handle();
+bool openfpga_midi_is_device_handle(MidiDriver::DeviceHandle handle);
+MidiDriver *openfpga_midi_create_driver();
+#endif
 
 #endif /* OPENFPGA_MIDI_H */

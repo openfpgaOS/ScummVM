@@ -1,0 +1,24 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": { "id": 666, "select": false },
+        "data_slots": [
+            { "id": 1, "filename": "os.bin" },
+            { "id": 2, "filename": "lsl7_os.ini" },
+            { "id": 3, "filename": "scummvm.elf" },
+            { "id": 4, "filename": "lsl7/lsl7.cue" },
+            { "id": 5, "filename": "bank.ofsf" },
+            { "id": 7, "filename": "lsl7/lsl7.bin" },
+            { "id": 9, "filename": "lsl7.ini" },
+            { "id": 10, "filename": "lsl7_0.sav" },
+            { "id": 11, "filename": "lsl7_1.sav" },
+            { "id": 12, "filename": "lsl7_2.sav" },
+            { "id": 13, "filename": "lsl7_3.sav" },
+            { "id": 14, "filename": "lsl7_4.sav" },
+            { "id": 15, "filename": "lsl7_5.sav" },
+            { "id": 16, "filename": "lsl7_6.sav" },
+            { "id": 17, "filename": "lsl7_7.sav" },
+            { "id": 18, "filename": "lsl7_8.sav" }
+        ]
+    }
+}

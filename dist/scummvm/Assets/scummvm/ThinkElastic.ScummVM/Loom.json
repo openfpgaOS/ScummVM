@@ -1,0 +1,23 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": { "id": 666, "select": false },
+        "data_slots": [
+            { "id": 1, "filename": "os.bin" },
+            { "id": 2, "filename": "loom_os.ini" },
+            { "id": 3, "filename": "scummvm.elf" },
+            { "id": 4, "filename": "loom.iso" },
+            { "id": 5, "filename": "bank.ofsf" },
+            { "id": 9, "filename": "loom.ini" },
+            { "id": 10, "filename": "loom_0.sav" },
+            { "id": 11, "filename": "loom_1.sav" },
+            { "id": 12, "filename": "loom_2.sav" },
+            { "id": 13, "filename": "loom_3.sav" },
+            { "id": 14, "filename": "loom_4.sav" },
+            { "id": 15, "filename": "loom_5.sav" },
+            { "id": 16, "filename": "loom_6.sav" },
+            { "id": 17, "filename": "loom_7.sav" },
+            { "id": 18, "filename": "loom_8.sav" }
+        ]
+    }
+}

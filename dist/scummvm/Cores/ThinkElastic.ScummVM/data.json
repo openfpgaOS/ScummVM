@@ -20,6 +20,14 @@
             },
             {
                 "id": 2,
+                "name": "OS Config",
+                "required": false,
+                "parameters": 0,
+                "extensions": ["ini"],
+                "deferload": true
+            },
+            {
+                "id": 3,
                 "name": "Application",
                 "required": false,
                 "parameters": 0,
@@ -28,15 +36,15 @@
                 "deferload": true
             },
             {
-                "id": 3,
+                "id": 4,
                 "name": "Game Data",
                 "required": false,
                 "parameters": 0,
-                "extensions": ["iso", "zip"],
+                "extensions": ["iso", "zip", "cue"],
                 "deferload": true
             },
             {
-                "id": 4,
+                "id": 5,
                 "name": "Sound Bank",
                 "required": false,
                 "parameters": 0,
@@ -45,11 +53,11 @@
                 "deferload": true
             },
             {
-                "id": 5,
-                "name": "Game Config",
+                "id": 7,
+                "name": "Disc Image",
                 "required": false,
                 "parameters": 0,
-                "extensions": ["cfg", "txt"],
+                "extensions": ["bin"],
                 "deferload": true
             },
             { "id": 9,  "name": "Settings", "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x200C0000", "size_maximum": "0x40000", "extensions": ["ini"] },
@@ -61,8 +69,7 @@
             { "id": 15, "name": "Save 5",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20240000", "size_maximum": "0x40000", "extensions": ["sav"] },
             { "id": 16, "name": "Save 6",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20280000", "size_maximum": "0x40000", "extensions": ["sav"] },
             { "id": 17, "name": "Save 7",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x202C0000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 18, "name": "Save 8",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20300000", "size_maximum": "0x40000", "extensions": ["sav"] },
-            { "id": 19, "name": "Save 9",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20340000", "size_maximum": "0x40000", "extensions": ["sav"] }
+            { "id": 18, "name": "Save 8",   "required": false, "parameters": "0x84", "nonvolatile": true, "address": "0x20300000", "size_maximum": "0x40000", "extensions": ["sav"] }
         ]
     }
 }

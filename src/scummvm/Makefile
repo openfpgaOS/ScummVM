@@ -59,6 +59,12 @@ CXXFLAGS += -DHAVE_CONFIG_H
 CXXFLAGS += -DDISABLE_COMMAND_LINE
 CXXFLAGS += -Wno-reorder -Wno-unused-parameter -Wno-sign-compare
 CXXFLAGS += -Wno-missing-field-initializers -Wno-unused-variable
+# Upstream ScummVM uses #pragma mark heavily for IDE navigation. GCC
+# warns for each one, which drowns out useful port warnings on full builds.
+CXXFLAGS += -Wno-unknown-pragmas
+# ScummVM also intentionally uses four-character command IDs such as
+# 'SAVE' and 'TEXT'. They are stable tags here, not accidental char typos.
+CXXFLAGS += -Wno-multichar
 
 # Include paths for ScummVM sources
 CXXFLAGS += -I$(SCUMMVM) -I$(SCUMMVM)/engines -I$(SCUMMVM)/backends
@@ -92,10 +98,13 @@ CXX_RT_SRCS = $(SDK_DIR)/of_cxxabi.cpp
 # lib9660, no app-side sector cache.
 BACKEND_SRCS = \
 	backend/openfpga_osystem.cpp \
+	backend/openfpga_memory.cpp \
 	backend/openfpga_mixer.cpp \
 	backend/openfpga_midi.cpp \
 	backend/openfpga_save.cpp \
-	backend/openfpga_fs.cpp
+	backend/openfpga_fs.cpp \
+	backend/openfpga_audiocd.cpp \
+	backend/openfpga_cue_archive.cpp
 
 # Compat stubs
 COMPAT_SRCS = \
@@ -126,7 +135,7 @@ OF_SDK_C_OBJS = $(OF_SDK_C_SRCS:.c=.o)
 SCUMMVM_COMMON_SRCS = $(filter-out %/recorderfile.cpp %/updates.cpp, $(wildcard $(SCUMMVM)/common/*.cpp)) \
 	$(wildcard $(SCUMMVM)/common/encodings/*.cpp) \
 	$(wildcard $(SCUMMVM)/common/formats/*.cpp) \
-	$(filter-out %/zlib.cpp %/gzio.cpp, $(wildcard $(SCUMMVM)/common/compression/*.cpp)) \
+	$(filter-out %/zlib.cpp, $(wildcard $(SCUMMVM)/common/compression/*.cpp)) \
 	$(wildcard $(SCUMMVM)/common/std/*.cpp)
 
 # ── ScummVM base/ sources ──────────────────────────────────────────
@@ -137,7 +146,7 @@ SCUMMVM_BASE_SRCS = \
 	$(SCUMMVM)/base/commandLine.cpp
 
 # ── ScummVM graphics/ sources (all, excluding OpenGL/TinyGL/larry) ──
-SCUMMVM_GRAPHICS_SRCS = $(filter-out %/larryScale.cpp %/larryScale_generated.cpp %/svg.cpp, \
+SCUMMVM_GRAPHICS_SRCS = $(filter-out %/svg.cpp %/larryScale_generated.cpp, \
 	$(wildcard $(SCUMMVM)/graphics/*.cpp)) \
 	$(filter-out %/blit-atari.cpp %/blit-neon.cpp %/blit-sse2.cpp %/blit-avx2.cpp, \
 	$(wildcard $(SCUMMVM)/graphics/blit/*.cpp)) \
@@ -168,6 +177,19 @@ SCUMMVM_ENGINE_SRCS = $(filter-out $(SCUMM_EXCLUDE), $(wildcard $(SCUMMVM)/engin
 	$(SCUMMVM)/engines/scumm/he/script_v60he.cpp \
 	$(SCUMMVM)/engines/scumm/he/script_v70he.cpp \
 	$(SCUMMVM)/engines/scumm/he/sound_he.cpp
+
+# ── ScummVM SCI engine sources (Sierra adventures: KQ, LSL, SQ, PQ, GK, ...) ─
+SCUMMVM_ENGINE_SRCS += \
+	$(wildcard $(SCUMMVM)/engines/sci/*.cpp) \
+	$(wildcard $(SCUMMVM)/engines/sci/engine/*.cpp) \
+	$(wildcard $(SCUMMVM)/engines/sci/graphics/*.cpp) \
+	$(wildcard $(SCUMMVM)/engines/sci/graphics/drivers/*.cpp) \
+	$(wildcard $(SCUMMVM)/engines/sci/parser/*.cpp) \
+	$(wildcard $(SCUMMVM)/engines/sci/resource/*.cpp) \
+	$(wildcard $(SCUMMVM)/engines/sci/sound/*.cpp) \
+	$(wildcard $(SCUMMVM)/engines/sci/sound/decoders/*.cpp) \
+	$(wildcard $(SCUMMVM)/engines/sci/sound/drivers/*.cpp) \
+	$(wildcard $(SCUMMVM)/engines/sci/video/*.cpp)
 
 # ── ScummVM engine framework ───────────────────────────────────────
 SCUMMVM_ENGINES_SRCS = $(wildcard $(SCUMMVM)/engines/*.cpp)

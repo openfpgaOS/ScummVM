@@ -8,10 +8,13 @@
 
 extern "C" {
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
 }
 
 /* ScummVM points us at "/cd" (see main.cpp), but the engine also asks
@@ -24,30 +27,63 @@ bool pathIsRoot(const Common::String &p) {
     return p.empty() || p == "." || p == "/" || p == OPENFPGA_FS_ROOT;
 }
 
-/* Stream wrapper around a stdio FILE*. */
-class StdioReadStream : public Common::SeekableReadStream {
+/* Stream wrapper around a POSIX fd.  The openfpgaOS stdio layer keeps
+ * its own internal FILE buffers; traps in __stdio_read during streamed
+ * audio indicate those buffers are not safe for this backend's mounted
+ * ISO path.  Use unbuffered read/lseek here instead. */
+class FdReadStream : public Common::SeekableReadStream {
 public:
-    StdioReadStream(FILE *f, long sz) : _f(f), _size(sz) {}
-    ~StdioReadStream() override { if (_f) fclose(_f); }
+    FdReadStream(int fd, int64 sz) : _fd(fd), _size(sz), _eos(false), _err(false) {}
+    ~FdReadStream() override { if (_fd >= 0) close(_fd); }
 
-    bool eos() const override   { return feof(_f) != 0; }
-    bool err() const override   { return ferror(_f) != 0; }
-    void clearErr() override    { clearerr(_f); }
+    bool eos() const override   { return _eos; }
+    bool err() const override   { return _err; }
+    void clearErr() override    { _err = false; }
 
     uint32 read(void *buf, uint32 cnt) override {
-        return (uint32)fread(buf, 1, cnt, _f);
+        byte *out = (byte *)buf;
+        uint32 total = 0;
+
+        while (cnt) {
+            ssize_t got = ::read(_fd, out + total, cnt);
+            if (got < 0) {
+                if (errno == EINTR)
+                    continue;
+                _err = true;
+                break;
+            }
+            if (got == 0) {
+                _eos = true;
+                break;
+            }
+            total += (uint32)got;
+            cnt -= (uint32)got;
+        }
+
+        return total;
     }
 
-    int64 pos()  const override { return ftell(_f); }
+    int64 pos() const override {
+        off_t p = lseek(_fd, 0, SEEK_CUR);
+        return p < 0 ? -1 : (int64)p;
+    }
     int64 size() const override { return _size; }
 
     bool seek(int64 offset, int whence = SEEK_SET) override {
-        return fseek(_f, (long)offset, whence) == 0;
+        off_t p = lseek(_fd, (off_t)offset, whence);
+        if (p < 0) {
+            _err = true;
+            return false;
+        }
+        _eos = false;
+        return true;
     }
 
 private:
-    FILE *_f;
-    long  _size;
+    int   _fd;
+    int64 _size;
+    bool  _eos;
+    bool  _err;
 };
 
 } // namespace
@@ -68,7 +104,7 @@ OpenFPGAFSNode::OpenFPGAFSNode(const Common::String &path) {
     }
     /* Engine handed us either "FOO.LFL" (relative to the game dir) or
      * "/cd/FOO.LFL" (absolute under the mount).  Normalise to the
-     * latter so stat/fopen against the kernel mount works either way. */
+     * latter so stat/open against the kernel mount works either way. */
     if (path.hasPrefix("/")) {
         _path = path;
     } else {
@@ -178,13 +214,13 @@ AbstractFSNode *OpenFPGAFSNode::getParent() const {
 Common::SeekableReadStream *OpenFPGAFSNode::createReadStream() {
     if (_isDir) return nullptr;
 
-    FILE *f = fopen(_path.c_str(), "rb");
+    int fd = open(_path.c_str(), O_RDONLY);
 
     /* ISO 9660 stores names upper-case but ScummVM asks lower-case.
      * If exact open failed, walk the parent dir for a case-insensitive
      * match and open that.  Cheap enough for the few-files-per-dir
      * structure SCUMM games have. */
-    if (!f) {
+    if (fd < 0) {
         const char *slash = strrchr(_path.c_str(), '/');
         Common::String parent = slash
             ? Common::String(_path.c_str(), slash - _path.c_str())
@@ -197,7 +233,7 @@ Common::SeekableReadStream *OpenFPGAFSNode::createReadStream() {
             while ((e = readdir(d)) != nullptr) {
                 if (strcasecmp(e->d_name, _name.c_str()) == 0) {
                     Common::String alt = parent + "/" + e->d_name;
-                    f = fopen(alt.c_str(), "rb");
+                    fd = open(alt.c_str(), O_RDONLY);
                     break;
                 }
             }
@@ -205,11 +241,13 @@ Common::SeekableReadStream *OpenFPGAFSNode::createReadStream() {
         }
     }
 
-    if (!f) return nullptr;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    return new StdioReadStream(f, sz);
+    if (fd < 0) return nullptr;
+    off_t end = lseek(fd, 0, SEEK_END);
+    if (end < 0 || lseek(fd, 0, SEEK_SET) < 0) {
+        close(fd);
+        return nullptr;
+    }
+    return new FdReadStream(fd, (int64)end);
 }
 
 Common::SeekableWriteStream *OpenFPGAFSNode::createWriteStream(bool /*atomic*/) {

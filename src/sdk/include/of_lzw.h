@@ -20,14 +20,14 @@ extern "C" {
 
 static inline int32_t of_lzw_compress(const uint8_t *in, int32_t in_len,
                                       uint8_t *out) {
-    return (int32_t)of_ecall3(OF_EID_LZW, OF_LZW_FID_COMPRESS,
-                              (long)in, in_len, (long)out).value;
+    return of_sbi_ret_i32(of_ecall3(OF_EID_LZW, OF_LZW_FID_COMPRESS,
+                                    (long)in, in_len, (long)out));
 }
 
 static inline int32_t of_lzw_uncompress(const uint8_t *in, int32_t comp_len,
                                         uint8_t *out) {
-    return (int32_t)of_ecall3(OF_EID_LZW, OF_LZW_FID_UNCOMPRESS,
-                              (long)in, comp_len, (long)out).value;
+    return of_sbi_ret_i32(of_ecall3(OF_EID_LZW, OF_LZW_FID_UNCOMPRESS,
+                                    (long)in, comp_len, (long)out));
 }
 
 #else /* OF_PC */

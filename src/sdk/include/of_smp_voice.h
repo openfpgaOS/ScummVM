@@ -48,7 +48,7 @@ typedef struct {
     uint8_t midi_ch;
     uint8_t note;
     uint8_t velocity;
-    uint8_t voice_base_vol;  /* Pre-baked at note-on: (vel_scale × initial_attn_scale) >> 8.
+    uint8_t voice_base_vol;  /* Pre-baked at note-on: (velocity_gain × initial_attn_scale) >> 8.
                                 Collapses two multiplies into one slot, drops one mul/tick. */
     uint8_t sustain_held; /* CC64 holding this note in sustain */
     uint64_t mixer_voice; /* stable hardware mixer handle */
@@ -84,7 +84,7 @@ void smp_voice_tick(void);  /* 1 kHz ISR */
 /* Diagnostic stats for smp_voice_tick cost.  Task #10 probe: detect
  * whether a 1 kHz voice tick exceeds the 2 ms pump cap.
  * Fields are named cycles_* but actually hold microseconds — the
- * VexRiscv here does not expose rdcycle to user mode, so of_time_us()
+ * VexiiRiscv here does not expose rdcycle to user mode, so of_time_us()
  * (kernel ecall) is used instead. */
 typedef struct {
     uint32_t cycles_max;     /* worst-case microseconds for a single tick */
@@ -106,7 +106,7 @@ typedef struct {
     /* MMIO-write counters — incremented on every actual HW write since
      * last reset (after the cache-skip guards, so these are the writes
      * that genuinely hit the mixer bus). */
-    uint32_t filter_writes;  /* of_mixer_set_filter calls */
+    uint32_t filter_writes;  /* retired filter path; currently always 0 */
     uint32_t rate_writes;    /* pitch / voice rate register writes */
     uint32_t vol_writes;     /* volume register writes */
 
@@ -117,12 +117,6 @@ typedef struct {
     uint32_t pump_interval_min_us;   /* best-case gap (UINT32_MAX if no data) */
     uint32_t pump_burst_count;       /* pumps where >1 ticks fired */
     uint32_t pump_budget_exceeded;   /* pumps where tick_budget==0 at end */
-
-    /* Biggest single-tick jump in HW cutoff (Q0.16 units, 0..65535) across
-     * all voices since reset.  Large jumps → larger SVF state-variable
-     * transients.  Useful for judging whether filter LFOs / env sweeps
-     * are producing audibly steppy cutoff trajectories. */
-    uint16_t cutoff_delta_max;
 } smp_tick_stats_t;
 
 void smp_voice_tick_get_stats(smp_tick_stats_t *out);
@@ -147,12 +141,6 @@ void smp_voice_update_chorus_send(int midi_ch, int send_0_127);
 void smp_voice_all_off(int midi_ch);
 void smp_voice_all_off_global(void);
 void smp_voice_set_master_volume(int vol);
-
-/* AWE-backend redirect (retired).  Preserved as ABI no-ops so existing
- * SDK apps that enable/query the AWE path still link; the CPU-side SW
- * voice engine is the only backend now. */
-void smp_voice_enable_awe_backend(int on);
-int  smp_voice_awe_backend_enabled(void);
 
 #ifdef __cplusplus
 }

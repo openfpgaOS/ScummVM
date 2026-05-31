@@ -326,6 +326,7 @@ static void reset_tracks(void) {
  * ======================================================================== */
 
 int of_midi_init(void) {
+    (void)of_smp_bank_bind_preloaded();
     smp_voice_init();
     reset_channels();
     M.inited        = 1;

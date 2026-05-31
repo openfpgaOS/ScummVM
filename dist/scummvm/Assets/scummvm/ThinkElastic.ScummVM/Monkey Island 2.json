@@ -3,22 +3,22 @@
         "magic": "APF_VER_1",
         "variant_select": { "id": 666, "select": false },
         "data_slots": [
-            { "id": 1,  "filename": "os.bin"          },
-            { "id": 2,  "filename": "scummvm.elf"     },
-            { "id": 3,  "filename": "monkey2.iso"     },
-            { "id": 4,  "filename": "bank.ofsf"       },
-            { "id": 5,  "filename": "monkey2.cfg"     },
-            { "id": 9,  "filename": "monkey2.ini"     },
-            { "id": 10, "filename": "monkey2_0.sav"   },
-            { "id": 11, "filename": "monkey2_1.sav"   },
-            { "id": 12, "filename": "monkey2_2.sav"   },
-            { "id": 13, "filename": "monkey2_3.sav"   },
-            { "id": 14, "filename": "monkey2_4.sav"   },
-            { "id": 15, "filename": "monkey2_5.sav"   },
-            { "id": 16, "filename": "monkey2_6.sav"   },
-            { "id": 17, "filename": "monkey2_7.sav"   },
-            { "id": 18, "filename": "monkey2_8.sav"   },
-            { "id": 19, "filename": "monkey2_9.sav"   }
+            { "id": 1, "filename": "os.bin" },
+            { "id": 2, "filename": "monkey2_os.ini" },
+            { "id": 3, "filename": "scummvm.elf" },
+            { "id": 4, "filename": "mimad/mimad.cue" },
+            { "id": 5, "filename": "bank.ofsf" },
+            { "id": 7, "filename": "mimad/mimad.bin" },
+            { "id": 9, "filename": "monkey2.ini" },
+            { "id": 10, "filename": "monkey2_0.sav" },
+            { "id": 11, "filename": "monkey2_1.sav" },
+            { "id": 12, "filename": "monkey2_2.sav" },
+            { "id": 13, "filename": "monkey2_3.sav" },
+            { "id": 14, "filename": "monkey2_4.sav" },
+            { "id": 15, "filename": "monkey2_5.sav" },
+            { "id": 16, "filename": "monkey2_6.sav" },
+            { "id": 17, "filename": "monkey2_7.sav" },
+            { "id": 18, "filename": "monkey2_8.sav" }
         ]
     }
 }

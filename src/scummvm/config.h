@@ -16,6 +16,8 @@
 #define ENABLE_SCUMM 1
 /* Do NOT define ENABLE_SCUMM_7_8 — we only want v0-v6 */
 /* Do NOT define ENABLE_HE — no Humongous Entertainment games */
+#define ENABLE_SCI 1
+#define ENABLE_SCI32 1
 
 /* Feature flags */
 #define SCUMMVM_USE_PRAGMA_PACK
@@ -66,7 +68,7 @@
 /* #undef ENABLE_RECORDER */
 /* #undef USE_TTS */
 /* #undef DETECTION_FULL */
-/* #undef USE_TEXT_CONSOLE_FOR_DEBUGGER */
+#define USE_TEXT_CONSOLE_FOR_DEBUGGER 1
 
 /* Package info */
 #define SCUMMVM_VERSION "2.9.0-openfpga"

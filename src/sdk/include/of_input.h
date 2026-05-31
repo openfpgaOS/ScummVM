@@ -22,45 +22,44 @@ extern "C" {
 #define OF_INPUT_SVC_FIELD_INDEX(field) \
     ((uint32_t)((offsetof(struct of_services_table, field) - 12u) / sizeof(void *)))
 
-/* IMPORTANT: This header keeps the polled controller snapshot in static
- * storage so the of_btn* helpers stay branch-free. Include it from
- * exactly ONE translation unit per program; multi-TU apps that include
- * of.h in several files will end up with independent snapshots. */
-static of_input_state_t __of_p0, __of_p1;
+/* Polled controller snapshots live in of_init.c so every translation unit
+ * sees the same input state while the of_btn* helpers remain inline. */
+extern of_input_state_t _of_input_p0;
+extern of_input_state_t _of_input_p1;
 
 static inline void of_input_poll(void) {
     OF_SVC->input_poll();
-    OF_SVC->input_get_state(0, &__of_p0);
-    OF_SVC->input_get_state(1, &__of_p1);
+    OF_SVC->input_get_state(0, &_of_input_p0);
+    OF_SVC->input_get_state(1, &_of_input_p1);
 }
 
 /* Single-player fast path: poll + get P0 in one call */
 static inline void of_input_poll_p0(void) {
-    OF_SVC->input_poll_p0(&__of_p0);
+    OF_SVC->input_poll_p0(&_of_input_p0);
 }
 
 static inline int of_btn(uint32_t mask) {
-    return (__of_p0.buttons & mask) != 0;
+    return (_of_input_p0.buttons & mask) != 0;
 }
 
 static inline int of_btn_pressed(uint32_t mask) {
-    return (__of_p0.buttons_pressed & mask) != 0;
+    return (_of_input_p0.buttons_pressed & mask) != 0;
 }
 
 static inline int of_btn_released(uint32_t mask) {
-    return (__of_p0.buttons_released & mask) != 0;
+    return (_of_input_p0.buttons_released & mask) != 0;
 }
 
 static inline int of_btn_p2(uint32_t mask) {
-    return (__of_p1.buttons & mask) != 0;
+    return (_of_input_p1.buttons & mask) != 0;
 }
 
 static inline int of_btn_pressed_p2(uint32_t mask) {
-    return (__of_p1.buttons_pressed & mask) != 0;
+    return (_of_input_p1.buttons_pressed & mask) != 0;
 }
 
 static inline int of_btn_released_p2(uint32_t mask) {
-    return (__of_p1.buttons_released & mask) != 0;
+    return (_of_input_p1.buttons_released & mask) != 0;
 }
 
 static inline uint32_t of_input_state(int player, of_input_state_t *state) {

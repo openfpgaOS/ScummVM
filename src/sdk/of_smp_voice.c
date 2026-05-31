@@ -33,7 +33,7 @@ static OF_FASTDATA uint32_t    tick_counter;
 /* ------------------------------------------------------------------ */
 /* Tick-cost probe (Task #10)                                         */
 /* ------------------------------------------------------------------ */
-/* NOTE: VexRiscv here does not expose rdcycle to user mode, so we use
+/* NOTE: VexiiRiscv here does not expose rdcycle to user mode, so we use
  * OF_SVC->timer_get_us() (direct service-table call — NOT the ecall
  * of_time_us(), which would nest-trap when smp_voice_tick runs from
  * the MIDI timer ISR). Stats are in microseconds. */
@@ -55,7 +55,6 @@ static OF_FASTDATA uint8_t  tick_ch_active[16];
  * Incremented at actual HW-write sites (post-cache) and from
  * smp_voice_tick_record_pump(), then snapshotted by get_stats and zeroed
  * by reset_stats.  All in BRAM: the writes happen in the ISR. */
-static OF_FASTDATA uint32_t stat_filter_writes;
 static OF_FASTDATA uint32_t stat_rate_writes;
 static OF_FASTDATA uint32_t stat_vol_writes;
 static OF_FASTDATA uint32_t stat_pump_count;
@@ -63,7 +62,6 @@ static OF_FASTDATA uint32_t stat_pump_interval_max_us;
 static OF_FASTDATA uint32_t stat_pump_interval_min_us = 0xFFFFFFFFu;
 static OF_FASTDATA uint32_t stat_pump_burst_count;
 static OF_FASTDATA uint32_t stat_pump_budget_exceeded;
-static OF_FASTDATA uint16_t stat_cutoff_delta_max;
 
 /* A single 1 kHz voice tick should stay comfortably below the pump cap. */
 #define SMP_TICK_SPIKE_US  2000u
@@ -84,7 +82,7 @@ void smp_voice_tick_get_stats(smp_tick_stats_t *out)
     for (int i = 0; i < 16; i++)
         out->ch_active[i] = tick_ch_active[i];
 
-    out->filter_writes         = stat_filter_writes;
+    out->filter_writes         = 0;
     out->rate_writes           = stat_rate_writes;
     out->vol_writes            = stat_vol_writes;
     out->pump_count            = stat_pump_count;
@@ -92,7 +90,6 @@ void smp_voice_tick_get_stats(smp_tick_stats_t *out)
     out->pump_interval_min_us  = stat_pump_interval_min_us;
     out->pump_burst_count      = stat_pump_burst_count;
     out->pump_budget_exceeded  = stat_pump_budget_exceeded;
-    out->cutoff_delta_max      = stat_cutoff_delta_max;
 }
 
 void smp_voice_tick_reset_stats(void)
@@ -102,7 +99,6 @@ void smp_voice_tick_reset_stats(void)
     tick_stat_count  = 0;
     tick_active_peak = 0;
 
-    stat_filter_writes        = 0;
     stat_rate_writes          = 0;
     stat_vol_writes           = 0;
     stat_pump_count           = 0;
@@ -110,7 +106,6 @@ void smp_voice_tick_reset_stats(void)
     stat_pump_interval_min_us = 0xFFFFFFFFu;
     stat_pump_burst_count     = 0;
     stat_pump_budget_exceeded = 0;
-    stat_cutoff_delta_max     = 0;
 }
 
 void smp_voice_tick_record_pump(uint32_t elapsed_us, int ticks_fired,
@@ -179,6 +174,32 @@ static int clamp_midi7(int v)
     if (v < 0) return 0;
     if (v > 127) return 127;
     return v;
+}
+
+static int midi_velocity_to_gain(int velocity)
+{
+    int v = clamp_midi7(velocity);
+    if (v <= 0) return 0;
+
+    int linear = (v << 1) + 1;
+    if (linear > 255) linear = 255;
+
+    /* Gentle perceptual lift for low/mid MIDI velocities.  A pure sqrt-like
+     * curve makes soft notes too loud; this keeps 75% of the old linear
+     * response and blends in 25% of a quadratic ease-out curve.
+     *
+     * Examples:
+     *   v=32:  65 ->  77
+     *   v=64: 129 -> 145
+     *   v=96: 193 -> 205
+     *   v=127:       255
+     */
+    int inv = 127 - v;
+    int ease = 255 - ((inv * inv * 255 + (127 * 127 / 2)) / (127 * 127));
+    int gain = ((linear * 3) + ease + 2) >> 2;
+    if (gain > 255) gain = 255;
+    if (gain < 0) gain = 0;
+    return gain;
 }
 
 /* ------------------------------------------------------------------ */
@@ -485,8 +506,7 @@ static void compute_vol_lr(smp_voice_t *v, int *out_l, int *out_r)
 
     /* Design-doc compose: VOICE_BASE_VOL × RAMP0_LEVEL × CH_VOL × CH_EXPR × MASTER.
      * voice_base_vol (0..255) = (vel_scale × initial_attn_scale) >> 8, baked at
-     * note-on so this function does one less multiply per tick AND matches the
-     * AWE fabric's compose arithmetic verbatim (Phase 3 bit-identical). */
+     * note-on so this function does one less multiply per tick. */
     int32_t vol = env_vol;
     vol = (vol * v->voice_base_vol) >> 8;
     vol = (vol * ch_vol_combined[ch]) >> 7;
@@ -580,14 +600,6 @@ static void channel_recompute_cached(int ch)
 }
 
 /* ------------------------------------------------------------------ */
-/* AWE backend retired — preserve ABI stubs for apps that still call  */
-/* smp_voice_enable_awe_backend / smp_voice_awe_backend_enabled.      */
-/* ------------------------------------------------------------------ */
-
-void smp_voice_enable_awe_backend(int on)       { (void)on; }
-int  smp_voice_awe_backend_enabled(void)        { return 0; }
-
-/* ------------------------------------------------------------------ */
 /* Public API                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -657,18 +669,16 @@ int smp_voice_note_on(const ofsf_zone_t *zone, int midi_ch, int note,
     v->zone = zone;
     v->midi_ch = (uint8_t)midi_ch;
     v->note = (uint8_t)note;
-    v->velocity = (uint8_t)velocity;
+    v->velocity = (uint8_t)clamp_midi7(velocity);
     v->sustain_held = 0;
     v->mixer_voice = OF_MIXER_HANDLE_INVALID;
     v->age = tick_counter;
 
-    /* Pre-bake voice_base_vol = (vel_scale × initial_attn_scale) >> 8.
+    /* Pre-bake voice_base_vol = (velocity_gain × initial_attn_scale) >> 8.
      * One u8 field now replaces the two multiplies the old compute_vol_lr
-     * did per tick, and matches the awe_voice_t.voice_base_vol the AWE
-     * fabric reads from voice-state RAM (Phase 3 onward). */
+     * did per tick. */
     {
-        int vel_scale = (velocity * 2) + 1;
-        if (vel_scale > 255) vel_scale = 255;
+        int vel_scale = midi_velocity_to_gain(velocity);
         int attn_scale = zone ? zone->initial_attn_scale : 255;
         int bv = (vel_scale * attn_scale) >> 8;
         if (bv > 255) bv = 255;
@@ -688,11 +698,8 @@ int smp_voice_note_on(const ofsf_zone_t *zone, int midi_ch, int note,
     uint32_t pitch_mult = smp_cents_to_multiplier(total_cents);
     v->base_rate_fp16 = (uint32_t)(((uint64_t)base_fp16 * pitch_mult) >> 16);
 
-    /* Compute sample address.
-     * sample_base points to start of sample blob in CRAM1.
-     * sample_offset is bytes from blob start.
-     * CRAM1 uses word addressing but samples are 16-bit, so
-     * the word address = base + offset/2. */
+    /* Compute sample address. sample_base points to the start of the
+     * SDRAM sample blob and sample_offset is in bytes from that base. */
     const uint8_t *sample_ptr = (const uint8_t *)sample_base
                               + zone->sample_offset;
 

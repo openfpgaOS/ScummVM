@@ -26,14 +26,14 @@ typedef struct {
 #include "of_syscall_numbers.h"
 
 static inline int of_analogizer_enabled(void) {
-    return (int)of_ecall0(OF_EID_ANALOGIZER,
-                          OF_ANALOGIZER_FID_IS_ENABLED).value;
+    return of_sbi_ret_int(of_ecall0(OF_EID_ANALOGIZER,
+                                    OF_ANALOGIZER_FID_IS_ENABLED));
 }
 
 static inline int of_analogizer_state(of_analogizer_state_t *state) {
-    return (int)of_ecall1(OF_EID_ANALOGIZER,
-                          OF_ANALOGIZER_FID_GET_STATE,
-                          (long)state).value;
+    return of_sbi_ret_int(of_ecall1(OF_EID_ANALOGIZER,
+                                    OF_ANALOGIZER_FID_GET_STATE,
+                                    (long)state));
 }
 
 #else /* OF_PC */

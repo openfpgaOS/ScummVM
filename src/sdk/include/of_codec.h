@@ -28,14 +28,14 @@ typedef struct {
 
 static inline int of_codec_parse_voc(const uint8_t *data, uint32_t size,
                                      of_codec_result_t *out) {
-    return (int)of_ecall3(OF_EID_CODEC, OF_CODEC_FID_PARSE_VOC,
-                          (long)data, size, (long)out).value;
+    return of_sbi_ret_int(of_ecall3(OF_EID_CODEC, OF_CODEC_FID_PARSE_VOC,
+                                    (long)data, size, (long)out));
 }
 
 static inline int of_codec_parse_wav(const uint8_t *data, uint32_t size,
                                      of_codec_result_t *out) {
-    return (int)of_ecall3(OF_EID_CODEC, OF_CODEC_FID_PARSE_WAV,
-                          (long)data, size, (long)out).value;
+    return of_sbi_ret_int(of_ecall3(OF_EID_CODEC, OF_CODEC_FID_PARSE_WAV,
+                                    (long)data, size, (long)out));
 }
 
 #else /* OF_PC */

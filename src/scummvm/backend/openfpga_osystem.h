@@ -11,6 +11,7 @@
 
 #define FORBIDDEN_SYMBOL_ALLOW_ALL
 #include "common/scummsys.h"
+#include "common/events.h"
 #include "backends/modular-backend.h"
 #include "backends/graphics/graphics.h"
 #include "graphics/surface.h"
@@ -89,7 +90,7 @@ private:
     bool _overlayVisible;
 
     /* Framebuffer */
-    uint8_t _screenBuf[320 * 200];
+    uint8_t _screenBuf[OPENFPGA_SCREEN_W * OPENFPGA_SCREEN_H];
     uint8_t _palette[256 * 3];
     bool _paletteDirty;
     bool _screenDirty;
@@ -103,13 +104,37 @@ private:
     uint8_t _cursorData[64 * 64];
     bool _cursorVisible;
 
-    void drawCursor(uint8_t *dst) const;
+    /* GPU-triggered triple-buffer presentation. */
+    bool _gpuReady;
+    int _videoBufIdx;
+    uint32 _videoFence;
+    uint32 _gpuCleanMask;
+
+    void ensureGpuReady();
+    uint8_t *acquireFrameBuffer();
+    void clearFrameBorders(uint8_t *fb, int xOff, int yOff, uint copyW, uint copyH);
+    void presentFrame();
+    void drawCursor(uint8_t *dst, int xOff, int yOff) const;
 };
 
 /* Per-instance scummvm.ini filename, set by main() after it discovers
  * which slot the launcher bound (e.g. monkey1.ini).  createConfig{Read,
  * Write}Stream / getDefaultConfigFileName resolve through this. */
 void openfpga_set_config_path(const char *path);
+
+/* Pump audio + MIDI + timers.  Called from every OSystem entry that
+ * may stall the main thread long enough to drain the 21 ms audio FIFO
+ * (pollEvent, updateScreen, delayMillis). */
+void openfpga_drive_audio_and_timers(void);
+void openfpga_mixer_pump_only(void);
+
+/* Forward decl for header consumers. */
+namespace Common { class TimerManager; }
+class MixerManager;
+
+/* Stash the concrete manager pointers used by
+ * openfpga_drive_audio_and_timers (set once during initBackend). */
+void openfpga_set_pump_managers(Common::TimerManager *t, MixerManager *m);
 
 /* ── OSystem_OpenFPGA ────────────────────────────────────────────── */
 
@@ -148,6 +173,13 @@ private:
     /* Input state */
     bool _mouseButtonL, _mouseButtonR;
     int  _autoDismissCounter;
+    bool _ignoreInitialButtons;
+    uint32 _lastMouseTick;
+    int32 _mouseAccumX, _mouseAccumY;
+    Common::Queue<Common::Event> _eventQueue;
+
+    void queueKey(Common::KeyCode keycode, uint16 ascii, byte flags = 0);
+    bool popQueuedEvent(Common::Event &event);
 };
 
 #endif /* OPENFPGA_OSYSTEM_H */

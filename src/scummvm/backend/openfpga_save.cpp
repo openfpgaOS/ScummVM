@@ -1,30 +1,51 @@
 /*
  * openfpga_save.cpp -- SaveFileManager backed by APF save slots.
  *
- * Slot path is "save:N" (N=0..9).  Each slot opens up as a normal POSIX
- * file via the SDK; fclose() on a write-opened slot auto-flushes the
- * actual byte count back to SD card.
+ * main.cpp maps slot numbers to the actual launcher-bound .sav filenames
+ * at startup.  Each file opens as normal POSIX I/O via the SDK; fclose()
+ * on a write-opened nonvolatile slot commits the byte count to SD card.
  */
 
 #define FORBIDDEN_SYMBOL_ALLOW_ALL
 #include "openfpga_save.h"
 
+#include "common/debug.h"
 #include "common/memstream.h"
 #include "common/stream.h"
 #include "common/str.h"
+#include "common/textconsole.h"
 
 extern "C" {
+#include <of_file.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 }
 
+extern "C" void openfpga_audiocd_quiesce(void);
+
 namespace {
 
+char g_savePaths[OPENFPGA_MAX_SAVES][256];
+byte g_saveWriteBuffer[SAVE_DATA_MAX];
+bool g_saveWriteInUse = false;
+
 FILE *openSlot(int slot, const char *mode) {
-    char path[16];
-    snprintf(path, sizeof(path), "save:%d", slot);
-    return fopen(path, mode);
+    if (slot < 0 || slot >= OPENFPGA_MAX_SAVES || !g_savePaths[slot][0])
+        return nullptr;
+    return fopen(g_savePaths[slot], mode);
+}
+
+bool writeExact(FILE *f, const void *data, uint32 bytes) {
+    const byte *src = (const byte *)data;
+    while (bytes) {
+        const uint32 chunk = bytes > 4096 ? 4096 : bytes;
+        if (fwrite(src, 1, chunk, f) != chunk)
+            return false;
+        src += chunk;
+        bytes -= chunk;
+    }
+    return true;
 }
 
 /* Trailing-'*' wildcard match.  Matches the simple patterns ScummVM
@@ -41,24 +62,95 @@ bool patternMatch(const char *name, const char *pat) {
     return *pat == '\0' && *name == '\0';
 }
 
-/* In-memory write stream that flushes its accumulated bytes to a slot
- * on finalize() / destruction.  ScummVM expects writes to succeed
- * immediately, and we don't want to interleave seeks with slot I/O. */
-class SlotOutStream : public Common::MemoryWriteStreamDynamic {
+/* Fixed-buffer write stream matching the Doom port's save model:
+ * accumulate one complete save in RAM, then write it to the registered
+ * nonvolatile slot name with stdio and use fclose() as the commit result.
+ * Avoid MemoryWriteStreamDynamic here; reallocating near the slot limit is
+ * exactly the kind of heap pressure that has caused Pocket save crashes. */
+class SlotOutStream : public Common::SeekableWriteStream {
 public:
     SlotOutStream(int slot, const Common::String &name)
-        : Common::MemoryWriteStreamDynamic(DisposeAfterUse::YES),
-          _slot(slot), _name(name), _flushed(false), _err(false) {}
+        : _slot(slot), _name(name), _pos(0), _size(0),
+          _flushed(false), _err(false) {
+        g_saveWriteInUse = true;
+        memset(g_saveWriteBuffer, 0, sizeof(g_saveWriteBuffer));
+    }
 
-    ~SlotOutStream() override { flushToSlot(); }
+    ~SlotOutStream() override {
+        flushToSlot();
+        g_saveWriteInUse = false;
+    }
+
+    uint32 write(const void *dataPtr, uint32 dataSize) override {
+        if (_flushed) {
+            _err = true;
+            return 0;
+        }
+
+        if (_pos > SAVE_DATA_MAX) {
+            _err = true;
+            return 0;
+        }
+
+        uint32 writable = SAVE_DATA_MAX - _pos;
+        uint32 toWrite = dataSize > writable ? writable : dataSize;
+        if (toWrite) {
+            memcpy(g_saveWriteBuffer + _pos, dataPtr, toWrite);
+            _pos += toWrite;
+            if (_pos > _size)
+                _size = _pos;
+        }
+        if (toWrite != dataSize)
+            _err = true;
+        return toWrite;
+    }
+
+    int64 pos() const override { return _pos; }
+    int64 size() const override { return _size; }
+
+    bool seek(int64 offset, int whence = SEEK_SET) override {
+        int64 target = 0;
+        switch (whence) {
+        case SEEK_SET:
+            target = offset;
+            break;
+        case SEEK_CUR:
+            target = (int64)_pos + offset;
+            break;
+        case SEEK_END:
+            target = (int64)_size + offset;
+            break;
+        default:
+            _err = true;
+            return false;
+        }
+
+        if (target < 0 || target > (int64)SAVE_DATA_MAX) {
+            _err = true;
+            return false;
+        }
+        if ((uint32)target > _size) {
+            memset(g_saveWriteBuffer + _size, 0, (uint32)target - _size);
+            _size = (uint32)target;
+        }
+        _pos = (uint32)target;
+        return true;
+    }
+
+    void finalize() override {
+        flushToSlot();
+    }
 
     bool flush() override {
-        flushToSlot();
-        return !_err;
+        return !err();
     }
 
     bool err() const override {
-        return _err || Common::MemoryWriteStreamDynamic::err();
+        return _err;
+    }
+
+    void clearErr() override {
+        _err = false;
     }
 
 private:
@@ -66,8 +158,20 @@ private:
         if (_flushed) return;
         _flushed = true;
 
-        uint32 dataLen = size();
-        if (dataLen > SAVE_DATA_MAX) { _err = true; return; }
+        uint32 dataLen = _size;
+        uint32 totalLen = dataLen + (uint32)sizeof(SaveSlotHeader);
+        if (dataLen > SAVE_DATA_MAX) {
+            warning("[save] '%s' too large: payload=%u max=%u",
+                    _name.c_str(), dataLen, (uint32)SAVE_DATA_MAX);
+            _err = true;
+            return;
+        }
+
+        debug(1, "[save] slot=%d file='%s' name='%s' payload=%u total=%u max=%u",
+              _slot, g_savePaths[_slot], _name.c_str(), dataLen,
+              totalLen, (uint32)OPENFPGA_SAVE_SIZE);
+
+        openfpga_audiocd_quiesce();
 
         FILE *f = openSlot(_slot, "wb");
         if (!f) { _err = true; return; }
@@ -78,20 +182,34 @@ private:
         strncpy(hdr.filename, _name.c_str(), SAVE_NAME_MAX - 1);
         hdr.dataLen = dataLen;
 
-        if (fwrite(&hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
-            (dataLen && fwrite(getData(), 1, dataLen, f) != dataLen)) {
+        if (!writeExact(f, &hdr, sizeof(hdr)) ||
+            !writeExact(f, g_saveWriteBuffer, dataLen)) {
             _err = true;
         }
-        fclose(f);
+        if (fclose(f) != 0)
+            _err = true;
     }
 
     int             _slot;
     Common::String  _name;
+    uint32          _pos;
+    uint32          _size;
     bool            _flushed;
     bool            _err;
 };
 
 } // namespace
+
+void openfpga_set_save_path(int slot, const char *path) {
+    if (slot < 0 || slot >= OPENFPGA_MAX_SAVES)
+        return;
+    if (!path) {
+        g_savePaths[slot][0] = '\0';
+        return;
+    }
+    snprintf(g_savePaths[slot], sizeof(g_savePaths[slot]), "%s", path);
+    of_file_slot_register(10 + (uint32)slot, g_savePaths[slot]);
+}
 
 /* ── Slot helpers ─────────────────────────────────────────────────── */
 
@@ -101,7 +219,10 @@ bool OpenFPGASaveFileManager::readHeader(int slot, SaveSlotHeader *hdr) {
     size_t n = fread(hdr, 1, sizeof(SaveSlotHeader), f);
     fclose(f);
     if (n != sizeof(SaveSlotHeader)) return false;
-    return hdr->magic == SAVE_MAGIC;
+    if (hdr->magic != SAVE_MAGIC) return false;
+    if (hdr->dataLen == 0 || hdr->dataLen > SAVE_DATA_MAX) return false;
+    hdr->filename[SAVE_NAME_MAX - 1] = '\0';
+    return hdr->filename[0] != '\0';
 }
 
 int OpenFPGASaveFileManager::findSlotByName(const char *name) {
@@ -116,6 +237,8 @@ int OpenFPGASaveFileManager::findSlotByName(const char *name) {
 int OpenFPGASaveFileManager::findFreeSlot() {
     SaveSlotHeader hdr;
     for (int i = 0; i < OPENFPGA_MAX_SAVES; i++) {
+        if (!g_savePaths[i][0])
+            continue;
         if (!readHeader(i, &hdr)) return i;
     }
     return -1;
@@ -136,7 +259,9 @@ Common::InSaveFile *OpenFPGASaveFileManager::openForLoading(const Common::String
 
     SaveSlotHeader hdr;
     if (fread(&hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
-        hdr.magic != SAVE_MAGIC || hdr.dataLen > SAVE_DATA_MAX) {
+        hdr.magic != SAVE_MAGIC || hdr.dataLen == 0 ||
+        hdr.dataLen > SAVE_DATA_MAX ||
+        strncmp(hdr.filename, name.c_str(), SAVE_NAME_MAX) != 0) {
         fclose(f);
         return nullptr;
     }
@@ -156,10 +281,14 @@ Common::InSaveFile *OpenFPGASaveFileManager::openForLoading(const Common::String
 }
 
 Common::OutSaveFile *OpenFPGASaveFileManager::openForSaving(const Common::String &name, bool compress) {
+    if (g_saveWriteInUse) {
+        setError(Common::kWritingFailed, "A save is already in progress");
+        return nullptr;
+    }
     int slot = findSlotByName(name.c_str());
     if (slot < 0) slot = findFreeSlot();
     if (slot < 0) {
-        setError(Common::kWritingFailed, "All save slots are full");
+        setError(Common::kWritingFailed, "All save slots are full or unavailable");
         return nullptr;
     }
     /* zlib is stubbed in this build, so `compress` is a no-op even via
@@ -175,8 +304,7 @@ bool OpenFPGASaveFileManager::removeSavefile(const Common::String &name) {
      * fails the magic check on next read. */
     FILE *f = openSlot(slot, "wb");
     if (!f) return false;
-    fclose(f);
-    return true;
+    return fclose(f) == 0;
 }
 
 Common::StringArray OpenFPGASaveFileManager::listSavefiles(const Common::String &pattern) {
