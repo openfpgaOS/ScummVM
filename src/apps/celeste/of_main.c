@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * celeste — Celeste Classic port (SDL2-native shim into openfpgaOS HAL)
  *
@@ -32,15 +38,16 @@
 #include <string.h>
 
 #include "of_codec.h"
+#include "of_mixer.h"
 
 #include "celeste.h"
 #include "tilemap.h"
 
 /* ======================================================================
- * SFX bank — bundled `celeste-sfx.bin` at slot:4
+ * SFX bank — bundled `celeste-sfx.bin` at slot:5
  *
  * The 23 PICO-8 SFX Celeste actually uses are concatenated into a
- * single binary at slot:4.  Format (little-endian):
+ * single binary at slot:5.  Format (little-endian):
  *
  *   uint32  magic = 'CSFX' (0x58465343)
  *   uint32  version = 1
@@ -74,6 +81,10 @@ typedef struct __attribute__((packed)) {
 static Mix_Chunk *sfx_bank[CELESTE_SFX_NUM];
 static uint8_t   *sfx_blob;       /* whole file kept around while WAV chunks parse */
 static int        sfx_loaded;     /* count of clips successfully decoded */
+
+static int16_t read_s16le(const uint8_t *p) {
+    return (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
 
 /* ======================================================================
  * Globals — SDL2 owns the window, we just keep the surface handle for
@@ -172,16 +183,39 @@ static Mix_Chunk *make_chunk_from_wav(const uint8_t *wav, uint32_t size) {
     if (result.bits_per_sample == 16) num_samples /= 2;
     if (result.channels == 2)         num_samples /= 2;
 
+#ifdef OF_PC
+    int16_t *pcm_s16 = (int16_t *)malloc(num_samples * sizeof(int16_t));
+    if (!pcm_s16) return NULL;
+
+    /* PC uses the real SDL_mixer path opened as signed 16-bit mono. */
+    if (result.bits_per_sample == 16) {
+        int step = result.channels;
+        for (uint32_t i = 0; i < num_samples; i++)
+            pcm_s16[i] = read_s16le(result.pcm + (i * step * 2));
+    } else {
+        int step = result.channels;
+        for (uint32_t i = 0; i < num_samples; i++)
+            pcm_s16[i] = (int16_t)(((int)result.pcm[i * step] - 128) << 8);
+    }
+
+    Mix_Chunk *chunk = (Mix_Chunk *)calloc(1, sizeof(Mix_Chunk));
+    if (!chunk) {
+        free(pcm_s16);
+        return NULL;
+    }
+    chunk->allocated = 1;
+    chunk->abuf = (Uint8 *)pcm_s16;
+    chunk->alen = num_samples * sizeof(int16_t);
+    chunk->volume = MIX_MAX_VOLUME;
+#else
     int16_t *pcm_s16 = (int16_t *)of_mixer_alloc_samples(num_samples * sizeof(int16_t));
     if (!pcm_s16) return NULL;
 
-    /* PICO-8 SFX are 16-bit mono at 22050 Hz. Keep them as signed
-     * 16-bit in the SDRAM sample pool for the hardware mixer. */
+    /* Pocket SFX live in the SDRAM sample pool used by the hardware mixer. */
     if (result.bits_per_sample == 16) {
-        const int16_t *s = (const int16_t *)result.pcm;
         int step = result.channels;
         for (uint32_t i = 0; i < num_samples; i++)
-            pcm_s16[i] = s[i * step];
+            pcm_s16[i] = read_s16le(result.pcm + (i * step * 2));
     } else {
         int step = result.channels;
         for (uint32_t i = 0; i < num_samples; i++)
@@ -190,17 +224,18 @@ static Mix_Chunk *make_chunk_from_wav(const uint8_t *wav, uint32_t size) {
 
     Mix_Chunk *chunk = (Mix_Chunk *)calloc(1, sizeof(Mix_Chunk));
     if (!chunk) return NULL;
-    chunk->pcm_s16      = pcm_s16;
+    chunk->pcm_s16 = pcm_s16;
     chunk->sample_count = num_samples;
-    chunk->sample_rate  = result.sample_rate;
-    chunk->volume       = MIX_MAX_VOLUME;
+    chunk->sample_rate = result.sample_rate;
+    chunk->volume = MIX_MAX_VOLUME;
+#endif
     return chunk;
 }
 
 static void LoadSFX(void) {
-    FILE *f = fopen("slot:4", "rb");
+    FILE *f = fopen("slot:5", "rb");
     if (!f) {
-        printf("[celeste] no slot:4 (sfx bank); audio silent\n");
+        printf("[celeste] no slot:5 (sfx bank); audio silent\n");
         return;
     }
     fseek(f, 0, SEEK_END);

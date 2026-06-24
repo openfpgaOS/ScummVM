@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * wavdemo — load a PCM WAV and play it through the hardware mixer
  *
@@ -24,7 +30,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#define WAV_SLOT_ID     3
 #define MAX_WAV_SIZE    (4 * 1024 * 1024)
 
 /* WAV file lives in BSS; large but fine — BSS is in SDRAM and
@@ -63,6 +68,9 @@ typedef struct {
 
 static uint16_t read16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+static int16_t read_s16(const uint8_t *p) {
+    return (int16_t)read16(p);
 }
 static uint32_t read32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
@@ -131,11 +139,11 @@ int main(void) {
     printf("  WAV Player Demo\n\n");
     printf("  Loading WAV file...\n");
 
-    /* This app's instance.json maps slot:3 to the WAV file.  We use
-     * the literal `slot:3` path here for portability — apps that want
-     * filename-based opens can use of_file_slot_register("song.wav", 3)
+    /* This app's instance.json maps slot:4 to the WAV file.  We use
+     * the literal `slot:4` path here for portability — apps that want
+     * filename-based opens can use of_file_slot_register(4, "song.wav")
      * before fopen("song.wav", "rb"). */
-    FILE *f = fopen("slot:3", "rb");
+    FILE *f = fopen("slot:4", "rb");
     if (!f) {
         printf("  Error: cannot open WAV\n");
         while (1) usleep(100 * 1000);
@@ -178,8 +186,10 @@ int main(void) {
     for (uint32_t i = 0; i < total_samples; i++) {
         int16_t s;
         if (wav.bits_per_sample == 16) {
-            const int16_t *pcm = (const int16_t *)(wav.data + i * wav.block_align);
-            s = (wav.channels >= 2) ? (int16_t)(((int32_t)pcm[0] + pcm[1]) >> 1) : pcm[0];
+            const uint8_t *pcm = wav.data + i * wav.block_align;
+            int16_t l = read_s16(pcm);
+            int16_t r = (wav.channels >= 2) ? read_s16(pcm + 2) : l;
+            s = (wav.channels >= 2) ? (int16_t)(((int32_t)l + r) >> 1) : l;
         } else {
             const uint8_t *pcm = wav.data + i * wav.block_align;
             s = (wav.channels >= 2)
@@ -197,8 +207,10 @@ int main(void) {
     for (uint32_t i = 0; i < total_samples; i++) {
         int16_t exp;
         if (wav.bits_per_sample == 16) {
-            const int16_t *pcm = (const int16_t *)(wav.data + i * wav.block_align);
-            exp = (wav.channels >= 2) ? (int16_t)(((int32_t)pcm[0] + pcm[1]) >> 1) : pcm[0];
+            const uint8_t *pcm = wav.data + i * wav.block_align;
+            int16_t l = read_s16(pcm);
+            int16_t r = (wav.channels >= 2) ? read_s16(pcm + 2) : l;
+            exp = (wav.channels >= 2) ? (int16_t)(((int32_t)l + r) >> 1) : l;
         } else {
             const uint8_t *pcm = wav.data + i * wav.block_align;
             exp = (wav.channels >= 2)

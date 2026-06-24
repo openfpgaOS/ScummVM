@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_midi.c -- Standard MIDI File parser driving the sample voice engine.
  *
@@ -5,7 +11,13 @@
  * them to of_smp_voice_* calls.  Per-channel controller state (volume,
  * expression, sustain, filter) is kept here because it's tracked at the
  * MIDI-event level and needs to survive across note-ons.
+ *
+ * MIDI is hardware-only; on the SDL2 desktop build (OF_PC) this file
+ * collapses to no-op stubs at the bottom so apps that pull it in still
+ * link without dragging in OF_SVC / fastram dependencies.
  */
+
+#ifndef OF_PC
 
 #include "include/of_midi.h"
 #include "include/of_smp_bank.h"
@@ -49,6 +61,7 @@ static OF_FASTDATA struct {
     uint16_t division;
 
     uint32_t us_per_beat;
+    uint64_t us_per_tick_q16;  /* (us_per_beat << 16) / division, cached */
     uint32_t last_pump_us;
     uint32_t tick_accum_us;   /* accumulates until >= 1000 µs → one voice tick (matches of_smp_tables.c 1 kHz envelope rate) */
 
@@ -92,6 +105,22 @@ static uint32_t read_var(midi_track_t *t) {
 }
 
 /* ========================================================================
+ * Tempo cache
+ * ======================================================================== */
+
+/* Precompute microseconds-per-MIDI-tick in Q16.16.  Recomputed only when the
+ * tempo (us_per_beat) or the file's division changes, so read_next_delta —
+ * called once per MIDI event — replaces the old per-event 64-bit division
+ * (delta * us_per_beat / division, a costly __divdi3 on RV32) with a 64-bit
+ * multiply + shift.  Q16 keeps sub-microsecond precision so accumulated timing
+ * drift is lower than the old integer-truncating divide. */
+static void recompute_us_per_tick(void) {
+    M.us_per_tick_q16 = M.division
+        ? (((uint64_t)M.us_per_beat << 16) / M.division)
+        : 0;
+}
+
+/* ========================================================================
  * Channel-state reset
  * ======================================================================== */
 
@@ -107,6 +136,7 @@ static void reset_channels(void) {
         M.resonance[i]  = 64;
     }
     M.us_per_beat = 500000;  /* 120 BPM */
+    recompute_us_per_tick();
 }
 
 /* ========================================================================
@@ -169,6 +199,15 @@ static void control_change(int ch, int cc, int val) {
         M.brightness[ch] = 64;
         M.resonance[ch]  = 64;
         smp_voice_update_sustain(ch, 0);
+        /* Re-sync the voice engine's cached per-channel state.  Without this,
+         * a prior CC11 expression dip / CC1 mod-wheel stays latched in
+         * ch_vol_combined / ch_mod_depth and keeps scaling the channel until
+         * the next explicit CC7/CC11.  GM RAC leaves CC7 volume and CC10 pan
+         * untouched; it does recentre pitch bend. */
+        smp_voice_update_volume(ch, M.volume[ch], 127);
+        smp_voice_update_mod(ch, 0);
+        smp_voice_update_filter(ch, 64, 64);
+        smp_voice_update_bend(ch, 0);
         break;
     }
 }
@@ -199,6 +238,9 @@ static int process_event(midi_track_t *t) {
     uint8_t cmd = status & 0xF0;
     uint8_t ch  = status & 0x0F;
 
+    /* System messages (0xF0–0xFF) are not channel-voice messages and must be
+     * handled before the channel dispatch, since `cmd` would collapse them
+     * all to 0xF0. */
     if (status == 0xFF) {
         /* Meta event */
         if (!trk_need(t, 1)) return 0;
@@ -209,49 +251,65 @@ static int process_event(midi_track_t *t) {
             M.us_per_beat = ((uint32_t)t->data[t->pos] << 16) |
                             ((uint32_t)t->data[t->pos+1] << 8) |
                             t->data[t->pos+2];
+            recompute_us_per_tick();
         } else if (meta == 0x2F) {
             t->done = 1;
         }
         t->pos += mlen;
-    } else if (status >= 0xF0 && status <= 0xF7) {
+        return !t->done;
+    }
+    if (status >= 0xF0 && status <= 0xF7) {
         /* SysEx */
         uint32_t slen = read_var(t);
         if (slen > t->len - t->pos) { t->done = 1; return 0; }
         t->pos += slen;
-    } else if (cmd == 0x90) {
+        return !t->done;
+    }
+
+    switch (cmd) {
+    case 0x90: {  /* Note on (velocity 0 == note off) */
         if (!trk_need(t, 2)) return 0;
         uint8_t note = t->data[t->pos++];
         uint8_t vel  = t->data[t->pos++];
         if (vel > 0) note_on(ch, note, vel);
         else         smp_voice_note_off(ch, note);
-    } else if (cmd == 0x80) {
+        break;
+    }
+    case 0x80: {  /* Note off */
         if (!trk_need(t, 2)) return 0;
         uint8_t note = t->data[t->pos++];
         t->pos++;
         smp_voice_note_off(ch, note);
-    } else if (cmd == 0xC0) {
+        break;
+    }
+    case 0xC0:    /* Program change */
         if (!trk_need(t, 1)) return 0;
         M.program[ch] = t->data[t->pos++];
-    } else if (cmd == 0xB0) {
+        break;
+    case 0xB0: {  /* Control change */
         if (!trk_need(t, 2)) return 0;
         uint8_t cc  = t->data[t->pos++];
         uint8_t val = t->data[t->pos++];
         control_change(ch, cc, val);
-    } else if (cmd == 0xE0) {
+        break;
+    }
+    case 0xE0: {  /* Pitch bend */
         if (!trk_need(t, 2)) return 0;
         uint8_t lsb = t->data[t->pos++];
         uint8_t msb = t->data[t->pos++];
         int16_t bend = (int16_t)(((uint16_t)msb << 7) | lsb) - 8192;
         smp_voice_update_bend(ch, bend);
-    } else if (cmd == 0xD0) {
+        break;
+    }
+    case 0xD0:    /* Channel pressure (1 data byte) */
         if (!trk_need(t, 1)) return 0;
         t->pos += 1;
-    } else if (cmd == 0xA0) {
+        break;
+    case 0xA0:    /* Polyphonic aftertouch (2 data bytes) */
+    default:      /* Any other voice message: skip its 2 data bytes */
         if (!trk_need(t, 2)) return 0;
         t->pos += 2;
-    } else {
-        if (!trk_need(t, 2)) return 0;
-        t->pos += 2;
+        break;
     }
 
     return !t->done;
@@ -263,7 +321,10 @@ static void read_next_delta(midi_track_t *t) {
         return;
     }
     uint32_t delta = read_var(t);
-    t->pending_us += (int64_t)delta * M.us_per_beat / M.division;
+    /* delta * (us_per_beat / division), via the cached Q16.16 µs-per-tick — no
+     * per-event 64-bit divide.  (division==0 is rejected in parse_header, so
+     * us_per_tick_q16 is always valid while playing.) */
+    t->pending_us += (int64_t)(((uint64_t)delta * M.us_per_tick_q16) >> 16);
 }
 
 /* ========================================================================
@@ -283,6 +344,9 @@ static int parse_header(void) {
 
     if (M.format > 1)      return OF_MIDI_ERR_FORMAT;
     if (M.num_tracks == 0) return OF_MIDI_ERR_NO_TRACKS;
+    /* division is the per-tick divisor in read_next_delta; 0 would divide by
+     * zero (and SMPTE-format division with bit 15 set is not supported). */
+    if (M.division == 0)   return OF_MIDI_ERR_BAD_HDR;
     if (M.num_tracks > MIDI_MAX_TRACKS) M.num_tracks = MIDI_MAX_TRACKS;
 
     uint32_t offset = 8 + hdr_len;
@@ -442,17 +506,18 @@ void of_midi_pump(void) {
         smp_voice_tick_record_pump((uint32_t)elapsed, ticks_fired,
                                    budget_exceeded);
 
+        /* Single pass: decrement each live track's pending clock and fire its
+         * due events.  (The decrement and dispatch were two loops; merging is
+         * safe because the per-track work is independent and the overrun goto
+         * only fires inside a non-done track, which has already set
+         * any_active.) */
         int any_active = 0;
+        int safety = 10000;
         for (int i = 0; i < M.num_tracks; i++) {
             midi_track_t *t = &M.tracks[i];
             if (t->done) continue;
             any_active = 1;
             t->pending_us -= elapsed;
-        }
-
-        int safety = 10000;
-        for (int i = 0; i < M.num_tracks; i++) {
-            midi_track_t *t = &M.tracks[i];
             while (!t->done && t->pending_us <= 0 && safety > 0) {
                 process_event(t);
                 if (!t->done) read_next_delta(t);
@@ -497,3 +562,22 @@ int of_midi_get_program(int ch) {
     if (ch < 0 || ch > 15) return 0;
     return M.program[ch];
 }
+
+#else /* OF_PC — desktop has no hardware MIDI path; provide silent stubs */
+
+#include "include/of_midi.h"
+#include <stdint.h>
+
+int  of_midi_init(void)                                 { return 0; }
+int  of_midi_play(const uint8_t *d, uint32_t l, int lp) { (void)d; (void)l; (void)lp; return 0; }
+void of_midi_stop(void)                                 {}
+void of_midi_pause(void)                                {}
+void of_midi_resume(void)                               {}
+void of_midi_pump(void)                                 {}
+int  of_midi_playing(void)                              { return 0; }
+int  of_midi_paused(void)                               { return 0; }
+int  of_midi_get_volume(void)                           { return 100; }
+void of_midi_set_volume(int v)                          { (void)v; }
+int  of_midi_get_program(int ch)                        { (void)ch; return 0; }
+
+#endif /* OF_PC */

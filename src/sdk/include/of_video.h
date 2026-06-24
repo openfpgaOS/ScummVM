@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_video.h -- Video subsystem API for openfpgaOS
  *
@@ -39,14 +45,14 @@ typedef struct of_video_timing {
 #define OF_DISPLAY_OVERLAY     2  /* White terminal text over framebuffer */
 
 #define OF_VIDEO_VTOTAL_AUTO     0u
-#define OF_VIDEO_VTOTAL_MIN      257u
-#define OF_VIDEO_VTOTAL_MAX      375u
-#define OF_VIDEO_VTOTAL_61_25HZ  257u  /* experimental; current clock measures ~61.30 Hz */
-#define OF_VIDEO_VTOTAL_60HZ     262u  /* conservative normal LCD timing, measured ~60.13 Hz */
-#define OF_VIDEO_VTOTAL_55HZ     285u
-#define OF_VIDEO_VTOTAL_50HZ     310u
-#define OF_VIDEO_VTOTAL_45HZ     340u
-#define OF_VIDEO_VTOTAL_42HZ     375u
+#define OF_VIDEO_VTOTAL_MIN      514u
+#define OF_VIDEO_VTOTAL_MAX      750u
+#define OF_VIDEO_VTOTAL_61_25HZ  514u  /* experimental; 24.576 MHz clock measures ~61.30 Hz */
+#define OF_VIDEO_VTOTAL_60HZ     525u  /* conservative normal LCD timing, ~60.02 Hz at 24.576 MHz */
+#define OF_VIDEO_VTOTAL_55HZ     573u
+#define OF_VIDEO_VTOTAL_50HZ     630u
+#define OF_VIDEO_VTOTAL_45HZ     700u
+#define OF_VIDEO_VTOTAL_42HZ     750u
 
 /* Color mode + framebuffer-size constants — referenced by both branches
  * (the PC SDL2 stub uses them too), so define here above the OF_PC fence. */
@@ -397,6 +403,16 @@ uint32_t of_video_vblank_count(void);
 static inline void of_video_set_refresh_vtotal(uint32_t v_total) {
     (void)v_total;
 }
+
+/* Get surface as 16-bit for direct color modes (mirrors the HW inline). */
+static inline uint16_t *of_video_surface16(void) {
+    return (uint16_t *)of_video_surface();
+}
+
+/* Triple-buffer indexing — PC stubs live in of_sdl2.c (no GPU-triggered
+ * flip path on desktop, so acquire_next just hands back the draw surface). */
+int      of_video_acquire_next(int just_flipped_idx, uint32_t fence_token);
+uint8_t *of_video_buffer_addr(int idx);
 
 /* Convert and set a VGA 6-bit palette (768 bytes: R,G,B triplets, 0-63 range).
  * Converts to 8-bit 0x00RRGGBB and sets all 256 entries at once. */

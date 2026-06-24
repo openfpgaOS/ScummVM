@@ -1,6 +1,6 @@
 /*
  * openfpga_mixer.cpp -- ScummVM MixerManager bridging Audio::MixerImpl
- *                       to the SDK's stereo PCM FIFO.
+ *                       to the SDK's stereo PCM path.
  *
  * The SDK exposes two audio paths:
  *
@@ -9,25 +9,23 @@
  *   of_audio_init /
  *   of_audio_write /    -- STEREO interleaved s16 at 48 kHz, with
  *   of_audio_free          of_audio_free() returning the exact number
- *                          of free stereo pairs in the hardware FIFO.
+ *                          of free stereo pairs in the hardware ring.
  *
- * We use the low-level stereo API because (a) our mix is stereo and
+ * We use the low-level stereo path because (a) our mix is stereo and
  * (b) of_audio_free gives us precise backpressure, letting us match
- * production to the DAC's consumption rate exactly.
+ * production to the DAC's consumption rate exactly.  of_audio_write copies
+ * into the OS-owned uncached SDRAM ring, so no cache flush is needed on our
+ * side (unlike the of_mixer voice DMA path used for CD-audio).
  *
- * Architecture:
+ * The HW ring (~2.7 s on pocket) absorbs producer stalls and holds position
+ * on underrun, so there is no app-side ring buffer here -- update() mixes
+ * straight into a one-block scratch buffer and pushes it synchronously.
  *
- *   producer (update)  ->  ring buffer (~170 ms)  ->  drainer (drain)
- *   - main thread          - in SDRAM                 - main thread
- *   - variable cadence     - 8192 frames stereo       - frequent (1 kHz)
- *   - expensive            - lock-free SPSC           - cheap memcpy + write
- *
- * IRQ-side drain is NOT used: of_audio_write is not re-entrant with
- * respect to the main-thread allocator and corrupts the heap when
- * invoked from the 1 kHz timer ISR.  Instead, drain() is wired into
- * the OSystem delayMillis sleep loop at 1 ms granularity (see
- * openfpga_osystem.cpp::delayMillis), and is also called from
- * pollEvent and updateScreen so blits/event handling don't starve it.
+ * Everything runs on the main thread.  An IRQ-side drain was tried and
+ * abandoned: of_audio_write from the 1 kHz timer ISR corrupts the heap /
+ * produces audible vibrato (see openfpga_midi.cpp).  drain() is wired into
+ * the OSystem delayMillis sleep loop at 1 ms granularity and is also called
+ * from pollEvent and updateScreen (see openfpga_osystem.cpp).
  */
 
 #define FORBIDDEN_SYMBOL_ALLOW_ALL
@@ -39,24 +37,25 @@ extern "C" {
 #include <stdlib.h>
 #include <string.h>
 #include <of_mixer.h>
-
-void midi_tick_irq(void);   /* in openfpga_midi.cpp */
 }
 
 OpenFPGAMixerManager::OpenFPGAMixerManager()
     : MixerManager(),
-      _streamOpen(false),
+      _initDone(false),
       _outputRate(OF_AUDIO_RATE),  /* 48000 -- SDK's fixed stream rate */
       _framesPerBlock(256),
       _buffer(nullptr),
-      _ring(nullptr),
-      _ringHead(0),
-      _ringTail(0) {}
+      _ringCapacity(0) {}
+
+/* Target buffered depth.  The OS hardware ring is ~2.7 s deep on pocket; if
+ * we keep it full, a sound ScummVM mixes "now" lands at the FIFO tail and is
+ * heard ~2.7 s later.  Hold only a small low-latency cushion instead so
+ * SFX/speech are prompt.  48 stereo pairs = 1 ms @ 48 kHz. */
+static const int kTargetBufferedPairs = 48 * 120;  /* ~120 ms */
 
 OpenFPGAMixerManager::~OpenFPGAMixerManager() {
     /* of_audio has no explicit close; just stop pushing. */
     free(_buffer);
-    free(_ring);
 }
 
 void OpenFPGAMixerManager::init() {
@@ -66,75 +65,59 @@ void OpenFPGAMixerManager::init() {
     /* Scratch buffer used by mixCallback (one block of stereo PCM). */
     _buffer = (int16_t *)calloc(_framesPerBlock * 2, sizeof(int16_t));
 
-    /* Ring buffer: pre-mixed audio waiting to be pushed to FIFO. */
-    _ring = (int16_t *)calloc(RING_FRAMES * 2, sizeof(int16_t));
-
-    /* Match the Duke3D SDK audio setup.  ScummVM's Audio::MixerImpl keeps
-     * music/SFX/speech volume policy internally and then feeds one stereo
-     * PCM stream through of_audio_write().  The SDK groups below apply to
-     * direct SDK mixer voices, currently the openfpga MIDI synth; those
-     * voices are allocated in OF_MIXER_GROUP_MUSIC by of_smp_voice. */
-    of_mixer_init(48, OF_MIXER_OUTPUT_RATE);
+    /* ScummVM's Audio::MixerImpl keeps music/SFX/speech volume policy
+     * internally and feeds one stereo PCM stream through of_audio_write().
+     * The SDK groups below apply to direct SDK mixer voices -- currently the
+     * openfpga MIDI synth (OF_MIXER_GROUP_MUSIC) and CD-audio
+     * (OF_MIXER_GROUP_AUX). */
+    of_mixer_init(OF_MIXER_MAX_VOICES, OF_MIXER_OUTPUT_RATE);
     of_mixer_set_master_volume(255);
     of_mixer_set_group_volume(OF_MIXER_GROUP_SFX, 255);
     of_mixer_set_group_volume(OF_MIXER_GROUP_MUSIC, 255);
     of_mixer_set_group_volume(OF_MIXER_GROUP_VOICE, 255);
     of_mixer_set_group_volume(OF_MIXER_GROUP_AUX, 255);
 
-    of_audio_init();
-    /* of_audio_stream_open is intentionally NOT called.  The SDL2
-     * shim calls it only to retarget mixer voice 31 to a non-48 kHz
-     * rate; at 48 kHz the SDK's default config already plays
-     * of_audio_write samples 1:1.  Calling it disturbs the FIFO in
-     * a way that produces resonance / vibrato on CD-audio PCM. */
-    _streamOpen = true;
+    /* Audio HW (of_audio_init) is brought up once in main().  Voice 31 is
+     * configured 1:1 on the first of_audio_write at 48 kHz, so
+     * of_audio_stream_open is intentionally NOT called -- at 48 kHz it only
+     * retargets voice 31 for HW resampling and disturbs the FIFO, producing
+     * resonance / vibrato on CD-audio PCM. */
 
-    /* IRQ-side audio drain (commented out): of_audio_write turned out
-     * to be unsafe from the timer ISR after all -- IRQ-driven drain
-     * produced a vibrating modulation in playback, worse than the
-     * occasional underrun we get with main-thread drain.  The drain
-     * is now called only from delayMillis / pollEvent / updateScreen
-     * (see openfpga_osystem.cpp). */
-    /* of_timer_set_callback(midi_tick_irq, 1000); */
+    /* Measure the ring depth: of_audio_init ran in main() and voice 31 is
+     * still inactive here, so of_audio_free() reports the full capacity. */
+    _ringCapacity = of_audio_free();
 
-    /* Publish ourselves to the IRQ-side drain shim (no-op currently
-     * because the ISR call site is disabled; kept for future use if
-     * the SDK ever provides an IRQ-safe write path). */
-    extern OpenFPGAMixerManager *g_pumpMixerMgrForIrq;
-    g_pumpMixerMgrForIrq = this;
+    _initDone = true;
 }
 
 void OpenFPGAMixerManager::update() {
-    if (_audioSuspended || !_streamOpen || !_mixer || !_buffer) return;
+    if (_audioSuspended || !_initDone || !_mixer || !_buffer) return;
 
-    /* Bare-bones SDL2 shim pattern: query free space, mix one block,
-     * push.  No cache flush -- the shim doesn't do one, suggesting
-     * of_audio_write does an internal CPU memcpy (no DMA from our
-     * buffer) so coherency isn't our concern. */
-    while (of_audio_free() >= (int)_framesPerBlock) {
+    /* Refill only up to a small cushion (kTargetBufferedPairs), never topping
+     * the ~2.7 s ring -- otherwise newly-triggered SFX/speech queue behind
+     * seconds of already-buffered audio.  of_audio_write copies into the
+     * OS-owned uncached SDRAM ring, so no cache flush is required here. */
+    for (;;) {
+        int freePairs = of_audio_free();
+        if (freePairs < (int)_framesPerBlock)
+            break;                                      /* ring full */
+        int buffered = (_ringCapacity > 0) ? (_ringCapacity - freePairs) : 0;
+        if (buffered < 0)
+            buffered = 0;
+        if (kTargetBufferedPairs - buffered < (int)_framesPerBlock)
+            break;                                      /* cushion reached */
         _mixer->mixCallback((uint8 *)_buffer, _framesPerBlock * 4);
         int wrote = of_audio_write(_buffer, (int)_framesPerBlock);
-        if (wrote <= 0) break;
+        if (wrote <= 0)
+            break;
     }
 }
 
 void OpenFPGAMixerManager::drain() {
-    if (!_streamOpen)
+    if (!_initDone)
         return;
     of_mixer_pump();
 }
-
-/* Legacy alias kept so the existing IRQ shim symbol still resolves.
- * Not called from IRQ (see file header). */
-void OpenFPGAMixerManager::drainFromIRQ() { drain(); }
-
-extern "C" void openfpga_mixer_drain_irq(void) {
-    extern OpenFPGAMixerManager *g_pumpMixerMgrForIrq;
-    if (g_pumpMixerMgrForIrq)
-        g_pumpMixerMgrForIrq->drain();
-}
-
-OpenFPGAMixerManager *g_pumpMixerMgrForIrq = nullptr;
 
 void OpenFPGAMixerManager::suspendAudio() {
     _audioSuspended = true;

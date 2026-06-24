@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_services.h -- openfpgaOS OS Services Table
  *
@@ -166,7 +172,6 @@ struct of_services_table {
     void      (*mixer_set_group)(int voice, int group);
     void      (*mixer_set_group_volume)(int group, int volume);
     void      (*mixer_set_master_volume)(int volume);
-    void      (*mixer_set_filter)(int voice, int cutoff_q016, int q, int enable);
     int       (*audio_stream_open)(int sample_rate);
     int       (*audio_stream_write)(const int16_t *samples, int count);
     int       (*audio_stream_ready)(void);
@@ -268,10 +273,6 @@ struct of_services_table {
                                        int vol_l,
                                        int vol_r);
     void      (*mixer_set_vol_rate_h)(uint64_t handle, int rate);
-    void      (*mixer_set_filter_h)(uint64_t handle,
-                                    int cutoff_q016,
-                                    int q,
-                                    int enable);
     uint32_t  (*mixer_poll_ended_h)(uint64_t *out_handles,
                                     uint32_t max_handles);
 
@@ -311,6 +312,15 @@ struct of_services_table {
     int       (*config_next)(const char *section, uint32_t *cursor,
                              char *key_out, uint32_t key_len,
                              char *value_out, uint32_t value_len);
+
+    /* -- File I/O idle hook (append-only) --
+     * Hook invoked repeatedly from the blocking file-read DMA wait
+     * (file_wait_complete) so the app can keep latency-critical work running
+     * while a synchronous SD read is in flight -- e.g. feeding the audio ring
+     * from an already-decoded buffer so music does not stall during SD access.
+     * The hook MUST NOT issue a blocking file read (nested invocation is
+     * suppressed by the kernel). Pass NULL to clear. */
+    void      (*file_set_idle_hook)(void (*hook)(void));
 };
 
 #ifndef OF_PC
@@ -321,6 +331,13 @@ struct of_services_table {
 extern const struct of_services_table *_of_svc_ptr;
 
 #define OF_SVC (_of_svc_ptr)
+
+#else /* OF_PC — no OS service table on the desktop.  OF_SVC is a null
+       * pointer of the right type so `if (OF_SVC && OF_SVC->...)` checks
+       * typecheck and short-circuit (the soft renderer / SDL video path
+       * runs instead of the GPU service path). */
+
+#define OF_SVC ((const struct of_services_table *)0)
 
 #endif /* OF_PC */
 

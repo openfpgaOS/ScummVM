@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_cache.h -- Cache management API for openfpgaOS
  *
@@ -81,6 +87,7 @@ static inline void of_cache_flush_video(void) { /* no-op on PC */ }
 static inline void of_cache_flush(void) { /* no-op on PC */ }
 static inline void of_cache_clean_range(void *addr, uint32_t size) { (void)addr; (void)size; }
 static inline void of_cache_inval_range(void *addr, uint32_t size) { (void)addr; (void)size; }
+static inline void of_cache_flush_range(void *addr, uint32_t size) { (void)addr; (void)size; }
 static inline void of_cache_invalidate_icache(void) { /* no-op on PC */ }
 
 /* PC: no cache — just access directly */

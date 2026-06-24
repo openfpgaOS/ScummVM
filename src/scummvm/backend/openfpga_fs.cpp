@@ -5,6 +5,7 @@
 #define FORBIDDEN_SYMBOL_ALLOW_ALL
 #include "openfpga_fs.h"
 #include "common/stream.h"
+#include "common/bufferedstream.h"
 
 extern "C" {
 #include <dirent.h>
@@ -242,12 +243,39 @@ Common::SeekableReadStream *OpenFPGAFSNode::createReadStream() {
     }
 
     if (fd < 0) return nullptr;
-    off_t end = lseek(fd, 0, SEEK_END);
-    if (end < 0 || lseek(fd, 0, SEEK_SET) < 0) {
-        close(fd);
-        return nullptr;
+
+    /* Get the size from the directory record via fstat, NOT lseek(SEEK_END).
+     * The engine re-opens the container per resource access (ScummEngine::
+     * openFile -> file.open(_containerFile)), and on a streamed mount a
+     * seek-to-end can be served by reading the file through to EOF -- which for
+     * MI1's 1.24 GB monkey1.pak would mean re-reading the whole pak on every
+     * open.  ISO9660 stores the size in the directory entry, so fstat is O(1).
+     * Fall back to lseek only if fstat yields nothing usable. */
+    off_t end;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+        end = st.st_size;
+    } else {
+        end = lseek(fd, 0, SEEK_END);
+        if (end < 0 || lseek(fd, 0, SEEK_SET) < 0) {
+            close(fd);
+            return nullptr;
+        }
     }
-    return new FdReadStream(fd, (int64)end);
+
+    /* The mounted ISO is streamed over the APF bridge, where every read()
+     * is a syscall round-trip, and FdReadStream is deliberately unbuffered
+     * (the kernel stdio buffer is unsafe on this path -- see above).  The
+     * engine, though, parses files with byte- and word-granular reads:
+     * SCUMM resource headers, the XWB/XSB indices, and worst of all MI2's
+     * 11 MB speech.info, which Common::ReadStream::readString() walks one
+     * readByte() at a time.  Unbuffered that is ~11 million bridge syscalls
+     * for one file -- engineInit appears to hang.  Wrap every stream in a
+     * memory buffer so those tiny reads are served locally and the bridge
+     * only ever sees full-block reads.  The buffer lives in our address
+     * space, so it sidesteps the kernel-stdio trap entirely. */
+    Common::SeekableReadStream *raw = new FdReadStream(fd, (int64)end);
+    return Common::wrapBufferedSeekableReadStream(raw, 32 * 1024, DisposeAfterUse::YES);
 }
 
 Common::SeekableWriteStream *OpenFPGAFSNode::createWriteStream(bool /*atomic*/) {

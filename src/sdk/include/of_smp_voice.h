@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_smp_voice.h -- Software voice engine for sample-based MIDI synthesis.
  *
@@ -51,13 +57,27 @@ typedef struct {
     uint8_t voice_base_vol;  /* Pre-baked at note-on: (velocity_gain × initial_attn_scale) >> 8.
                                 Collapses two multiplies into one slot, drops one mul/tick. */
     uint8_t sustain_held; /* CC64 holding this note in sustain */
+    uint8_t hw_index;     /* HW mixer voice index (0..31), cached at note-on.
+                             Lets orphan reaping match by index when the mixer
+                             handle's generation goes stale.  0xFF = unknown. */
     uint64_t mixer_voice; /* stable hardware mixer handle */
     env_state_t vol_env;
     env_state_t mod_env;
     lfo_state_t mod_lfo;
     lfo_state_t vib_lfo;
     uint32_t base_rate_fp16; /* base 16.16 playback rate (no bend/LFO) */
+    /* Cached L/R pan multipliers (Q0.PAN_SHIFT).  Recomputed at note-on and
+     * when CC10 changes for this channel, so the per-tick volume path is two
+     * multiplies + shift with no divide.  One side is always full-scale
+     * (1<<PAN_SHIFT); the other carries the equal-volume pan attenuation. */
+    int32_t pan_mul_l;
+    int32_t pan_mul_r;
     uint32_t age;
+    /* tick_counter at which this voice last entered (or has been held in)
+     * ENV_SUSTAIN.  Reset every tick the voice is in any other stage, so
+     * tick_counter - sustain_since measures time spent CONTINUOUSLY in
+     * sustain -- used by the hung-voice guard (SMP_VOICE_MAX_SUSTAIN_TICKS). */
+    uint32_t sustain_since;
     /* Countdown of smp_voice_tick calls until the underlying non-looping
      * sample has played to its natural end.  0 = not tracked (looping
      * sample, or untracked).  When this reaches 0 from a positive value,
@@ -141,6 +161,13 @@ void smp_voice_update_chorus_send(int midi_ch, int send_0_127);
 void smp_voice_all_off(int midi_ch);
 void smp_voice_all_off_global(void);
 void smp_voice_set_master_volume(int vol);
+
+/* Stop any MUSIC-group HW mixer voice the synth no longer owns -- a voice
+ * orphaned when its mixer handle's generation went stale and smp_voice dropped
+ * the slot without stopping the hardware (a looping sample then drones until
+ * the next global all-off).  Call periodically from the main thread (the MIDI
+ * pump).  Returns the number of voices stopped. */
+int smp_voice_reap_orphans(void);
 
 #ifdef __cplusplus
 }

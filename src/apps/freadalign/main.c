@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * freadalign — regression reproducer for fread() destination alignment
  *
@@ -12,8 +18,7 @@
  *   fread() of an SDK-opened FILE* used to silently return 0 bytes when
  *   the destination pointer was not 512-byte aligned.  Root cause was
  *   a kernel DMA path that latched the destination's low bits to zero
- *   and dropped the read.  See docs/bug-fread-alignment.md if you want
- *   the gory details.
+ *   and dropped the read.
  *
  * What this app does:
  *   1. opendir("/"), pick the first non-app file >= 512 bytes
@@ -58,7 +63,9 @@ static const char *pick_file(char *out, size_t outsz) {
         struct stat st;
         if (stat(e->d_name, &st) != 0) continue;
         if (st.st_size < 512) continue;
-        snprintf(out, outsz, "%s", e->d_name);
+        size_t name_len = strlen(e->d_name);
+        if (name_len >= outsz) continue;
+        memcpy(out, e->d_name, name_len + 1);
         closedir(d);
         return out;
     }
@@ -76,7 +83,7 @@ int main(void) {
     printf("\033[2J\033[H");
     printf("freadalign — fread destination-alignment regression test\n\n");
 
-    char fname[64];
+    char fname[256];
     if (!pick_file(fname, sizeof(fname))) {
         printf("No suitable file found on card (need >= 512 B).\n");
         park();
@@ -108,7 +115,7 @@ int main(void) {
         printf("PASS — kernel handles unaligned fread correctly.\n");
     } else if (g1 == 16 && g2 == 0) {
         printf("FAIL — unaligned fread returned 0 bytes (classic alignment bug).\n");
-        printf("       See docs/bug-fread-alignment.md for the fix.\n");
+        printf("       Update the kernel fread DMA path before rerunning this test.\n");
     } else {
         printf("FAIL — unexpected mismatch (g1=%d g2=%d).\n", g1, g2);
     }

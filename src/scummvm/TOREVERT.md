@@ -24,7 +24,7 @@ openfpgaOS. These should be revisited as the port matures.
 - `initBackend()` has an idempotent guard (`if (_ofGfx) return`) because `scummvm_main()` calls it again. This is a hack — should properly separate first-time init from re-init.
 - `createConfigReadStream()` / `createConfigWriteStream()` return nullptr — Config is never saved. Should eventually write to an APF save slot.
 - `getTimeAndDate()` returns a fixed date (2025-01-01 12:00) — No RTC available.
-- `NullMixerManager` used — No audio output yet for sound effects/voice. Replace with a real mixer that calls `of_audio_stream_write()`.
+- ~~`NullMixerManager` used — No audio output yet~~ **Done:** a real `OpenFPGAMixerManager` (`backend/openfpga_mixer.cpp`) mixes ScummVM's stereo bus and streams it via `of_audio_write()` (the stereo low-level path), with `of_audio_free()` backpressure. SFX/voice/music all output.
 - Mouse cursor compositing done in software on the framebuffer — could flicker. Consider double-buffering the cursor overlay.
 
 ## backend/openfpga_midi.cpp

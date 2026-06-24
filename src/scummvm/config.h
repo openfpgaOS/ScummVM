@@ -16,8 +16,9 @@
 #define ENABLE_SCUMM 1
 /* Do NOT define ENABLE_SCUMM_7_8 — we only want v0-v6 */
 /* Do NOT define ENABLE_HE — no Humongous Entertainment games */
-#define ENABLE_SCI 1
-#define ENABLE_SCI32 1
+/* SCI/SCI32 (Sierra) intentionally NOT enabled — this build focuses only on
+ * LucasArts SCUMM titles.  The sci/ sources are also dropped from the Makefile
+ * and LINK_PLUGIN(SCI)/LINK_PLUGIN(SCI_DETECTION) from the engine tables. */
 
 /* Feature flags */
 #define SCUMMVM_USE_PRAGMA_PACK

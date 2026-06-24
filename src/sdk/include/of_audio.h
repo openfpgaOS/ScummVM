@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_audio.h -- Audio subsystem API for openfpgaOS
  *
@@ -19,7 +25,16 @@ extern "C" {
 #include <stdint.h>
 
 #define OF_AUDIO_RATE   48000
-#define OF_AUDIO_FIFO   1024   /* stereo pairs; matches audio_output.v dcfifo depth */
+#define OF_AUDIO_FIFO   1024   /* stereo pairs; HW dcfifo depth in audio_output.v
+                                * — NOT the SW ring size (see OF_AUDIO_RING_PAIRS) */
+
+/* SW SDRAM audio-ring capacity in stereo pairs — POCKET target only
+ * (each target derives its real depth from its own OF_TARGET_AUDIO_
+ * STREAM_SIZE: mister 16384, sim 4096).  Fallback only: code that needs
+ * the depth should measure it at runtime — of_audio_free() returns the
+ * full capacity while the stream voice is inactive (right after
+ * of_audio_init) — as of_sdl2.c's queued-size accounting does. */
+#define OF_AUDIO_RING_PAIRS  131072
 
 #ifndef OF_PC
 

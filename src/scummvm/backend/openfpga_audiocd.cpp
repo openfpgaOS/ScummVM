@@ -14,7 +14,9 @@
 #include "common/textconsole.h"
 
 extern "C" {
+#include <of_cache.h>
 #include <of_file.h>
+#include <of_mixer.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +33,10 @@ constexpr uint32 kCDRingBytes = 512 * 1024;
 constexpr uint32 kCDPrimeBytes = 192 * 1024;
 constexpr uint32 kCDSyncReadBytes = 16 * 1024;
 constexpr uint32 kCDAsyncReadBytes = 64 * 1024;
+constexpr uint32 kCDHWFrames = 65536;       /* ~1.5 s at 44.1 kHz */
+constexpr uint32 kCDHWChunkFrames = 4096;   /* ~93 ms refill unit */
+constexpr uint32 kCDHWGuardFrames = 512;
+constexpr uint32 kCDHWSilenceFrames = 2048;
 
 class StdioSeekableReadStream : public Common::SeekableReadStream {
 public:
@@ -576,11 +582,346 @@ private:
     bool _err;
 };
 
+class HardwareCDDARing {
+public:
+    HardwareCDDARing(Common::SeekableReadStream *stream,
+                     uint32 streamBytes, int numLoops,
+                     Audio::Mixer *mixer, Audio::Mixer::SoundType soundType,
+                     byte volume, int8 balance)
+        : _stream(stream), _streamBytes(streamBytes & ~3u), _sourcePos(0),
+          _left(nullptr), _right(nullptr), _io(nullptr),
+          _ringFrames(kCDHWFrames), _writtenFrames(0), _playedFrames(0),
+          _lastHWPos(0), _haveLastHWPos(false),
+          _leftVoice(OF_MIXER_HANDLE_INVALID),
+          _rightVoice(OF_MIXER_HANDLE_INVALID),
+          _initialLoops((numLoops < 0) ? 0u : (uint)((numLoops <= 1) ? 1 : numLoops)),
+          _loopsLeftAfterCurrent(0), _infinite(numLoops < 0),
+          _tailSilenceWritten(false), _finishedFeeding(false),
+          _started(false), _paused(false), _done(false), _err(false),
+          _mixer(mixer), _soundType(soundType), _volume(volume),
+          _balance(balance), _lastVolL(-1), _lastVolR(-1) {
+        _left = (int16 *)calloc(_ringFrames, sizeof(int16));
+        _right = (int16 *)calloc(_ringFrames, sizeof(int16));
+        _io = (byte *)malloc(kCDHWChunkFrames * kBytesPerStereoFrame);
+        resetLoops();
+        if (!_stream || !_left || !_right || !_io || _streamBytes == 0)
+            _err = true;
+    }
+
+    ~HardwareCDDARing() {
+        stop();
+        delete _stream;
+        free(_left);
+        free(_right);
+        free(_io);
+    }
+
+    bool start() {
+        if (_err)
+            return false;
+
+        uint32 primed = fillAvailable(_ringFrames - kCDHWGuardFrames);
+        if (primed == 0)
+            return false;
+
+        of_cache_flush_range(_left, _ringFrames * sizeof(int16));
+        of_cache_flush_range(_right, _ringFrames * sizeof(int16));
+
+        _leftVoice = of_mixer_alloc_for_group_h(OF_MIXER_GROUP_AUX,
+                                                (const uint8_t *)_left,
+                                                _ringFrames, kCDRate, 2, 0);
+        _rightVoice = of_mixer_alloc_for_group_h(OF_MIXER_GROUP_AUX,
+                                                 (const uint8_t *)_right,
+                                                 _ringFrames, kCDRate, 2, 0);
+        if (_leftVoice == OF_MIXER_HANDLE_INVALID ||
+            _rightVoice == OF_MIXER_HANDLE_INVALID) {
+            stop();
+            return false;
+        }
+
+        of_mixer_set_loop_h(_leftVoice, 0, _ringFrames);
+        of_mixer_set_loop_h(_rightVoice, 0, _ringFrames);
+        of_mixer_set_rate_raw_h(_leftVoice, OF_MIXER_RATE_FP16(kCDRate));
+        of_mixer_set_rate_raw_h(_rightVoice, OF_MIXER_RATE_FP16(kCDRate));
+        applyVolume();
+
+        int pos = of_mixer_get_position_h(_leftVoice);
+        _lastHWPos = (pos >= 0) ? (uint32)pos % _ringFrames : 0;
+        _haveLastHWPos = true;
+        _started = true;
+        return true;
+    }
+
+    void stop() {
+        if (_leftVoice != OF_MIXER_HANDLE_INVALID)
+            of_mixer_stop_h(_leftVoice);
+        if (_rightVoice != OF_MIXER_HANDLE_INVALID)
+            of_mixer_stop_h(_rightVoice);
+        _leftVoice = OF_MIXER_HANDLE_INVALID;
+        _rightVoice = OF_MIXER_HANDLE_INVALID;
+        _started = false;
+    }
+
+    void pump() {
+        if (!_started || _paused || _done)
+            return;
+
+        updateCursor();
+        if (!_started || _done)
+            return;
+
+        if (!of_mixer_handle_active(_leftVoice) ||
+            !of_mixer_handle_active(_rightVoice)) {
+            stop();
+            _done = true;
+            return;
+        }
+
+        applyVolume();
+        fillAvailable(kCDHWChunkFrames * 2);
+        updateCursor();
+    }
+
+    bool isActive() const {
+        if (_done)
+            return false;
+        if (_started)
+            return of_mixer_handle_active(_leftVoice) &&
+                   of_mixer_handle_active(_rightVoice);
+        return false;
+    }
+
+    void setPaused(bool paused) {
+        if (!_started || _paused == paused)
+            return;
+        updateCursor();
+        _paused = paused;
+        uint32 rate = paused ? 0u : OF_MIXER_RATE_FP16(kCDRate);
+        of_mixer_set_rate_raw_h(_leftVoice, rate);
+        of_mixer_set_rate_raw_h(_rightVoice, rate);
+    }
+
+    void setVolume(byte volume, int8 balance) {
+        _volume = volume;
+        _balance = balance;
+        applyVolume();
+    }
+
+    void quiesce() {
+        updateCursor();
+    }
+
+private:
+    void resetLoops() {
+        _loopsLeftAfterCurrent = (_infinite || _initialLoops == 0) ? 0 : _initialLoops - 1;
+    }
+
+    bool advanceLoop() {
+        if (_streamBytes == 0)
+            return false;
+        if (!_infinite) {
+            if (_loopsLeftAfterCurrent == 0)
+                return false;
+            --_loopsLeftAfterCurrent;
+        }
+        _sourcePos = 0;
+        return _stream && _stream->seek(0);
+    }
+
+    uint64 bufferedFrames() const {
+        return (_writtenFrames > _playedFrames) ? (_writtenFrames - _playedFrames) : 0;
+    }
+
+    void updateCursor() {
+        if (!_started || !_haveLastHWPos)
+            return;
+
+        int posRaw = of_mixer_get_position_h(_leftVoice);
+        if (posRaw < 0)
+            return;
+        uint32 pos = (uint32)posRaw % _ringFrames;
+        uint32 delta = (pos >= _lastHWPos)
+                       ? (pos - _lastHWPos)
+                       : (_ringFrames - _lastHWPos + pos);
+        _lastHWPos = pos;
+        if (delta == 0)
+            return;
+
+        uint64 buffered = bufferedFrames();
+        if ((uint64)delta > buffered)
+            delta = (uint32)buffered;
+        _playedFrames += delta;
+
+        if (_finishedFeeding && bufferedFrames() == 0) {
+            stop();
+            _done = true;
+        }
+    }
+
+    uint32 fillAvailable(uint32 frameBudget) {
+        uint32 filled = 0;
+        while (!_finishedFeeding && frameBudget > 0) {
+            uint64 buffered = bufferedFrames();
+            if (buffered + kCDHWGuardFrames >= _ringFrames)
+                break;
+
+            uint32 freeFrames = _ringFrames - (uint32)buffered - kCDHWGuardFrames;
+            uint32 dst = (uint32)(_writtenFrames % _ringFrames);
+            uint32 contiguous = _ringFrames - dst;
+            uint32 want = freeFrames;
+            if (want > contiguous)
+                want = contiguous;
+            if (want > frameBudget)
+                want = frameBudget;
+            if (want > kCDHWChunkFrames)
+                want = kCDHWChunkFrames;
+            if (want == 0)
+                break;
+
+            uint32 got = readAndWrite(dst, want);
+            if (got == 0) {
+                if (!_tailSilenceWritten) {
+                    uint32 silence = freeFrames;
+                    if (silence > contiguous)
+                        silence = contiguous;
+                    if (silence > kCDHWSilenceFrames)
+                        silence = kCDHWSilenceFrames;
+                    if (silence == 0)
+                        break;
+                    writeSilence(dst, silence);
+                    _writtenFrames += silence;
+                    _tailSilenceWritten = true;
+                    _finishedFeeding = true;
+                    filled += silence;
+                    break;
+                }
+                _finishedFeeding = true;
+                break;
+            }
+
+            _writtenFrames += got;
+            frameBudget -= got;
+            filled += got;
+        }
+        return filled;
+    }
+
+    uint32 readAndWrite(uint32 dstFrame, uint32 maxFrames) {
+        while (_sourcePos >= _streamBytes) {
+            if (!advanceLoop())
+                return 0;
+        }
+
+        uint32 remainingFrames = (_streamBytes - _sourcePos) / kBytesPerStereoFrame;
+        uint32 wantFrames = maxFrames;
+        if (wantFrames > remainingFrames)
+            wantFrames = remainingFrames;
+        if (wantFrames > kCDHWChunkFrames)
+            wantFrames = kCDHWChunkFrames;
+        if (wantFrames == 0)
+            return 0;
+
+        uint32 wantBytes = wantFrames * kBytesPerStereoFrame;
+        uint32 gotBytes = _stream ? _stream->read(_io, wantBytes) : 0;
+        gotBytes &= ~3u;
+        if (gotBytes == 0) {
+            _err = _stream && _stream->err();
+            _sourcePos = _streamBytes;
+            return 0;
+        }
+
+        uint32 frames = gotBytes / kBytesPerStereoFrame;
+        const int16 *src = (const int16 *)_io;
+        for (uint32 i = 0; i < frames; ++i) {
+            _left[dstFrame + i] = src[i * 2 + 0];
+            _right[dstFrame + i] = src[i * 2 + 1];
+        }
+
+        flushWritten(dstFrame, frames);
+        _sourcePos += gotBytes;
+        return frames;
+    }
+
+    void writeSilence(uint32 dstFrame, uint32 frames) {
+        memset(_left + dstFrame, 0, frames * sizeof(int16));
+        memset(_right + dstFrame, 0, frames * sizeof(int16));
+        flushWritten(dstFrame, frames);
+    }
+
+    void flushWritten(uint32 dstFrame, uint32 frames) {
+        of_cache_flush_range(_left + dstFrame, frames * sizeof(int16));
+        of_cache_flush_range(_right + dstFrame, frames * sizeof(int16));
+    }
+
+    void applyVolume() {
+        if (_leftVoice == OF_MIXER_HANDLE_INVALID ||
+            _rightVoice == OF_MIXER_HANDLE_INVALID)
+            return;
+
+        int base = 0;
+        if (_mixer && !_mixer->isSoundTypeMuted(_soundType)) {
+            base = (_mixer->getVolumeForSoundType(_soundType) * _volume) /
+                   Audio::Mixer::kMaxMixerVolume;
+        }
+        if (base < 0) base = 0;
+        if (base > 255) base = 255;
+
+        int vl = base;
+        int vr = base;
+        if (_balance < 0)
+            vr = ((127 + _balance) * base) / 127;
+        else if (_balance > 0)
+            vl = ((127 - _balance) * base) / 127;
+        if (vl < 0) vl = 0;
+        if (vr < 0) vr = 0;
+        if (vl > 255) vl = 255;
+        if (vr > 255) vr = 255;
+
+        if (vl == _lastVolL && vr == _lastVolR)
+            return;
+
+        of_mixer_set_vol_lr_h(_leftVoice, vl, 0);
+        of_mixer_set_vol_lr_h(_rightVoice, 0, vr);
+        _lastVolL = vl;
+        _lastVolR = vr;
+    }
+
+    Common::SeekableReadStream *_stream;
+    uint32 _streamBytes;
+    uint32 _sourcePos;
+    int16 *_left;
+    int16 *_right;
+    byte *_io;
+    uint32 _ringFrames;
+    uint64 _writtenFrames;
+    uint64 _playedFrames;
+    uint32 _lastHWPos;
+    bool _haveLastHWPos;
+    of_mixer_handle_t _leftVoice;
+    of_mixer_handle_t _rightVoice;
+    uint _initialLoops;
+    uint _loopsLeftAfterCurrent;
+    bool _infinite;
+    bool _tailSilenceWritten;
+    bool _finishedFeeding;
+    bool _started;
+    bool _paused;
+    bool _done;
+    bool _err;
+    Audio::Mixer *_mixer;
+    Audio::Mixer::SoundType _soundType;
+    byte _volume;
+    int8 _balance;
+    int _lastVolL;
+    int _lastVolR;
+};
+
 } // namespace OpenFPGA
 
 OpenFPGAAudioCDManager::OpenFPGAAudioCDManager()
     : DefaultAudioCDManager(), _cueLoaded(false), _trackOffset(0),
-      _implicitTrackOffset(0), _activeStream(nullptr), _paused(false) {
+      _implicitTrackOffset(0), _activeStream(nullptr), _activeHW(nullptr),
+      _paused(false) {
     /* Defer loadCueSheet() to open(): the ctor runs from
      * OSystem::initBackend() before main.cpp adds the game zip to
      * SearchMan, so the cue is invisible here. */
@@ -796,6 +1137,39 @@ bool OpenFPGAAudioCDManager::play(int track, int numLoops, int startFrame,
     }
     uint32 windowBytes = (endByte - startByte) & ~3u;
 
+    Common::SeekableReadStream *hwWindow =
+        new Common::SafeSeekableSubReadStream(bin, startByte,
+                                              startByte + windowBytes,
+                                              DisposeAfterUse::YES);
+    OpenFPGA::HardwareCDDARing *hw =
+        new OpenFPGA::HardwareCDDARing(hwWindow, windowBytes, numLoops,
+                                       _mixer, soundType, _cd.volume,
+                                       _cd.balance);
+    if (hw->start()) {
+        _cd.playing  = true;
+        _cd.track    = track;
+        _cd.start    = startFrame;
+        _cd.duration = duration;
+        _cd.numLoops = numLoops;
+        _emulating   = true;
+        _activeHW = hw;
+        _paused = false;
+
+        debug(1, "[audiocd] HW mixer track=%d startFrame=%d duration=%d bytes=%u",
+              track, startFrame, duration, windowBytes);
+        return true;
+    }
+
+    warning("[audiocd] HW mixer path failed; falling back to ScummVM stream");
+    delete hw; /* also deletes hwWindow/bin */
+
+    bin = openNamedStream(e->binFile, _cuePath);
+    if (!bin) {
+        warning("[audiocd] failed to reopen '%s' for fallback track %d",
+                e->binFile.c_str(), track);
+        return false;
+    }
+
     Common::SeekableReadStream *syncWindow =
         new Common::SafeSeekableSubReadStream(bin, startByte,
                                               startByte + windowBytes,
@@ -832,8 +1206,12 @@ bool OpenFPGAAudioCDManager::play(int track, int numLoops, int startFrame,
 }
 
 void OpenFPGAAudioCDManager::stop() {
-    if (_emulating)
+    if (_activeHW) {
+        delete _activeHW;
+        _activeHW = nullptr;
+    } else if (_emulating) {
         _mixer->stopHandle(_handle);
+    }
     delete _activeStream;
     _activeStream = nullptr;
     _emulating = false;
@@ -841,9 +1219,41 @@ void OpenFPGAAudioCDManager::stop() {
     _paused = false;
 }
 
+bool OpenFPGAAudioCDManager::isPlaying() const {
+    if (_activeHW)
+        return _activeHW->isActive();
+    return DefaultAudioCDManager::isPlaying();
+}
+
+void OpenFPGAAudioCDManager::setVolume(byte volume) {
+    _cd.volume = volume;
+    if (_activeHW)
+        _activeHW->setVolume(_cd.volume, _cd.balance);
+    else if (_emulating && DefaultAudioCDManager::isPlaying())
+        _mixer->setChannelVolume(_handle, _cd.volume);
+}
+
+void OpenFPGAAudioCDManager::setBalance(int8 balance) {
+    _cd.balance = balance;
+    if (_activeHW)
+        _activeHW->setVolume(_cd.volume, _cd.balance);
+    else if (_emulating && DefaultAudioCDManager::isPlaying())
+        _mixer->setChannelBalance(_handle, _cd.balance);
+}
+
 void OpenFPGAAudioCDManager::update() {
     if (_paused)
         return;
+    if (_activeHW) {
+        _activeHW->pump();
+        if (!_activeHW->isActive()) {
+            delete _activeHW;
+            _activeHW = nullptr;
+            _emulating = false;
+            _cd.playing = false;
+        }
+        return;
+    }
     pump();
     if (_emulating && !_mixer->isSoundHandleActive(_handle)) {
         delete _activeStream;
@@ -854,7 +1264,9 @@ void OpenFPGAAudioCDManager::update() {
 }
 
 void OpenFPGAAudioCDManager::setPaused(bool paused) {
-    if (paused && _activeStream)
+    if (_activeHW)
+        _activeHW->setPaused(paused);
+    else if (paused && _activeStream)
         _activeStream->quiesce();
     _paused = paused;
 }
@@ -869,12 +1281,18 @@ bool OpenFPGAAudioCDManager::existExtractedCDAudioFiles(uint track) {
 }
 
 void OpenFPGAAudioCDManager::pump() {
-    if (!_paused && _activeStream)
+    if (_paused)
+        return;
+    if (_activeHW)
+        _activeHW->pump();
+    else if (_activeStream)
         _activeStream->pump(false);
 }
 
 void OpenFPGAAudioCDManager::quiesce() {
-    if (_activeStream)
+    if (_activeHW)
+        _activeHW->quiesce();
+    else if (_activeStream)
         _activeStream->quiesce();
 }
 

@@ -25,7 +25,7 @@
                 "required": false,
                 "parameters": 0,
                 "extensions": ["ini"],
-                "deferload": true
+                "address": "0x203C0000"
             },
             {
                 "id": 3,

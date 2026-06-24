@@ -1,8 +1,14 @@
+#------------------------------------------------------------------------------
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileType: SOURCE
+# SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+#------------------------------------------------------------------------------
+
 # openfpgaOS SDK — Per SDK app build rules
 #
 # Included by each src/apps/<name>/Makefile. Drives the SDK app build
 # path: intermediate objects under .obj/sdk/<name>/, final ELF picked
-# up by src/apps/Makefile's release step and dropped into build/sdk/.
+# up by src/apps/Makefile's release step and dropped into build/pocket/sdk/.
 #
 # For the custom-core path (a standalone openFPGA core wrapping a
 # single app under src/<name>/) see scripts/customize.sh and the

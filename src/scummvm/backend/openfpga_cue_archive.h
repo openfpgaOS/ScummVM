@@ -32,6 +32,7 @@ class Mode1RawStream;
 class CueArchive : public Common::Archive {
 public:
     static CueArchive *create(const Common::String &cuePath);
+    static CueArchive *createISO(const Common::String &isoPath);
 
     ~CueArchive() override;
 
@@ -50,7 +51,7 @@ private:
     bool parseISO9660();
     bool parseDirectory(uint32 lba, uint32 size, const Common::String &prefix);
 
-    Mode1RawStream *_cooked;             /* owns the underlying .bin */
+    Common::SeekableReadStream *_cooked; /* owns cooked ISO stream */
     Common::HashMap<Common::String, Entry,
                     Common::IgnoreCase_Hash, Common::IgnoreCase_EqualTo> _files;
 };

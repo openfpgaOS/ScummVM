@@ -109,6 +109,12 @@ struct GameConfig {
                              * Compilation discs (e.g. Madness) reorder
                              * tracks vs the standalone-CD baked into
                              * the game data; this offset re-aligns. */
+    bool voices;            /* Special-Edition speech.  When true the
+                             * launcher sets use_remastered_audio=true so
+                             * the SCUMM SE path (shouldInjectMISEAudio)
+                             * plays the bundled Speech.xwb over the classic
+                             * scripts.  Requires variant=SE + the SE pak and
+                             * speech bank on the disc.  Default off. */
 };
 
 static void cfgDefaults(GameConfig &c) {
@@ -204,6 +210,16 @@ static bool isSoundBank(const char *name) {
     return hasExtensionI(name, ".ofsf") || hasExtensionI(name, ".dat");
 }
 
+static bool slotFileExists(const char *name) {
+    if (!name || !name[0])
+        return false;
+    FILE *f = fopen(name, "rb");
+    if (!f)
+        return false;
+    fclose(f);
+    return true;
+}
+
 static void rememberPath(char *dst, size_t cap, const char *name) {
     if (!dst[0])
         snprintf(dst, cap, "%s", name);
@@ -218,6 +234,21 @@ static void rememberDataPath(const char *name, char *isoPath, size_t isoCap,
         rememberPath(zipPath, zipCap, name);
     else if (hasExtensionI(name, ".cue"))
         rememberPath(cuePath, cueCap, name);
+}
+
+static void statusExpectedDataFile(const GameConfig &cfg, bool cfgLoaded) {
+    if (cfgLoaded && cfg.data_file[0]) {
+        char buf[240];
+        snprintf(buf, sizeof(buf), "    slot 4: %s", cfg.data_file);
+        status(buf);
+        if (hasExtensionI(cfg.data_file, ".cue"))
+            status("    slot 7: matching .bin for that .cue");
+        return;
+    }
+
+    status("    slot 4: <game>.zip  (zipped game data)");
+    status("    slot 4: <game>.iso  (cooked ISO)");
+    status("    slot 4: <game>.cue  + slot 7 .bin");
 }
 
 static void readInstanceArg(int argc, char **argv, char *out, size_t cap) {
@@ -265,6 +296,7 @@ static bool loadGameConfigFromOS(GameConfig &cfg) {
     getOSConfigString("scummvm", "cue_file",    cfg.cue_file,    sizeof(cfg.cue_file));
     getOSConfigString("scummvm", "subdir",      cfg.subdir,      sizeof(cfg.subdir));
     cfg.cd_track_offset = of_config_get_int("scummvm", "cd_track_offset", 0);
+    cfg.voices = of_config_get_bool("scummvm", "voices", 0) != 0;
 
     return cfg.gameid[0] != '\0';
 }
@@ -311,6 +343,10 @@ extern "C" int main(int argc, char **argv) {
 
             const long slotId = (long)e->d_ino - 1;
             bool handled = false;
+
+            /* TEMP diag: show every slot file the launcher actually bound, so
+             * a missing data slot (e.g. slot 7 .bin) is visible at boot. */
+            { char sm[180]; snprintf(sm, sizeof(sm), "  slot %ld: %s", slotId, n); status(sm); }
 
             switch (slotId) {
             case 1:
@@ -398,7 +434,8 @@ extern "C" int main(int argc, char **argv) {
     GameConfig cfg;
     bool cfgLoaded = loadGameConfigFromOS(cfg);
 
-    if (!zipPath[0] && cfgLoaded && cfg.data_file[0]) {
+    if (!zipPath[0] && !isoPath[0] && !cuePath[0] &&
+        cfgLoaded && cfg.data_file[0] && slotFileExists(cfg.data_file)) {
         if (hasExtensionI(cfg.data_file, ".zip"))
             snprintf(zipPath, sizeof(zipPath), "%s", cfg.data_file);
         else if (hasExtensionI(cfg.data_file, ".iso"))
@@ -408,18 +445,17 @@ extern "C" int main(int argc, char **argv) {
     }
 
     if (!cuePath[0] && cfgLoaded && cfg.cue_file[0] &&
-        hasExtensionI(cfg.cue_file, ".cue") && !zipPath[0])
+        hasExtensionI(cfg.cue_file, ".cue") && !zipPath[0] &&
+        slotFileExists(cfg.cue_file))
         snprintf(cuePath, sizeof(cuePath), "%s", cfg.cue_file);
 
-    if (!zipPath[0] && !cuePath[0] && (!cfgLoaded || !isoPath[0])) {
+    if (!zipPath[0] && !isoPath[0] && !cuePath[0]) {
         /* Diagnostic: list every file the launcher actually exposed so we
          * can see what was bound and what's missing. */
         showFailureTerminal();
         status("ERROR: instance is missing its game data file.");
-        status("  expected one of:");
-        status("    monkeyN.zip                   (zipped game data)");
-        status("    monkeyN.iso  + slot-2 config  (cooked ISO)");
-        status("    monkeyN.cue  + slot-2 config  (raw .cue/.bin)");
+        status("  expected:");
+        statusExpectedDataFile(cfg, cfgLoaded);
         status("Slots seen by the launcher:");
         DIR *d = opendir("/");
         if (d) {
@@ -437,6 +473,7 @@ extern "C" int main(int argc, char **argv) {
 
     char buf[320];
     Common::Archive *gameZip = nullptr;
+    Common::Archive *gameIso = nullptr;
     if (zipPath[0]) {
         snprintf(buf, sizeof(buf), "Opening %s ...", zipPath);
         status(buf);
@@ -464,8 +501,15 @@ extern "C" int main(int argc, char **argv) {
     if (!gameZip && isoPath[0]) {
         snprintf(buf, sizeof(buf), "Mounting %s -> /cd ...", isoPath);
         status(buf);
-        if (of_iso_mount(isoPath, "/cd") < 0)
-            halt("ERROR: of_iso_mount failed");
+        int mountRc = of_iso_mount(isoPath, "/cd");
+        if (mountRc < 0) {
+            snprintf(buf, sizeof(buf), "of_iso_mount failed: %d", mountRc);
+            status(buf);
+            status("Trying app-side ISO9660 mount...");
+            gameIso = OpenFPGA::CueArchive::createISO(isoPath);
+            if (!gameIso)
+                halt("ERROR: failed to mount ISO image");
+        }
     }
 
     status("Init backend...");
@@ -517,14 +561,21 @@ extern "C" int main(int argc, char **argv) {
     if (cfg.variant[0])
         ConfMan.set("extra", cfg.variant, gid);
 
-    /* Force classic MIDI for SE variants.  MI1/MI2 SE's remastered
-     * audio is xWMA inside the XACT wave banks, and ScummVM's WMA
-     * codec is a stub for the SE path (HeaderlessWMAStream is TODO
-     * in upstream).  With use_remastered_audio=false the engine
-     * plays the AdLib/MT-32 MIDI scores from the classic LFL
-     * resources via our openfpga MIDI driver -- same audio as the
-     * original floppy/CD release. */
-    ConfMan.setBool("use_remastered_audio", false, gid);
+    /* Special-Edition voices.  `use_remastered_audio` gates the SCUMM
+     * SE speech path (shouldInjectMISEAudio, sound.cpp:2254), which
+     * also requires variant=SE (GF_DOUBLEFINE_PAK) and the SE pak +
+     * Speech.xwb on the disc.  We map it from the per-instance `voices`
+     * ini key (default off) so an instance opts in only when its ISO
+     * actually carries the speech bank.
+     *
+     * Caveat: the SE *music* banks are xWMA and the port's WMA path is
+     * a stub (returns null -> silence; soundse.cpp:672-679).  Speech is
+     * PCM (MI1) / MS-ADPCM (MI2) and decodes natively, so voices play
+     * even though SE music does not.  For MI2 the classic iMUSE MIDI
+     * still plays (separate _musicEngine path); for MI1 enabling SE
+     * removes the CD-audio WAV fallback, so MI1 music goes silent --
+     * that is the documented trade for MI1 voices. */
+    ConfMan.setBool("use_remastered_audio", cfg.voices, gid);
 
     /* Skip copy-protection screens.  MI2's Dial-A-Pirate, Indy 4's
      * passport-Q&A, and DOTT's "type word from manual" are all gated
@@ -636,6 +687,32 @@ extern "C" int main(int argc, char **argv) {
         if (!cueArchive)
             halt("ERROR: failed to mount .cue/.bin disc image");
         SearchMan.add("openfpga_cue_archive", cueArchive, /*priority=*/100);
+    } else if (gameIso) {
+        /* Kernel ISO mount failed, but the app-side ISO9660 parser can
+         * expose the same files through SearchMan. */
+        SearchMan.add("openfpga_iso_archive", gameIso, /*priority=*/100);
+    }
+
+    /* Make the kernel-mounted ISO tree visible to SearchMan BEFORE
+     * createInstance.  SCUMM's skip-detection picks a game-filename pattern
+     * by probing Common::File::exists() for each candidate; that probe runs
+     * inside createInstance, before the engine's own initializePath/flat
+     * pass (below) registers /cd.  Without this early registration the probe
+     * finds nothing and the pick falls back to the FIRST gameFilenamesTable
+     * entry -- for "monkey" that is the EGA "%03d.LFL" layout, wrong for the
+     * CD "monkey.000" data, so the engine finds no resources and never
+     * starts.  Flat + depth 4 so files in an ISO subdir collapse to bare
+     * names (matches the post-createInstance flat pass; distinct name so
+     * both can coexist harmlessly). */
+    if (!gameZip && !cuePath[0] && !gameIso && isoPath[0]) {
+        char probePath[160] = "/cd";
+        if (cfg.subdir[0])
+            snprintf(probePath, sizeof(probePath), "/cd/%s", cfg.subdir);
+        SearchMan.add("openfpga_iso_probe",
+                      new Common::FSDirectory(Common::FSNode(probePath),
+                                              /*depth=*/4, /*flat=*/true,
+                                              /*ignoreClashes=*/true),
+                      /*priority=*/0);
     }
 
     Common::Error err = metaEngine.createInstance(g_system, &engine, game, nullptr);
@@ -649,7 +726,8 @@ extern "C" int main(int argc, char **argv) {
     if (cfg.subdir[0])
         snprintf(gamePath, sizeof(gamePath), "/cd/%s", cfg.subdir);
     Common::FSNode dir(gamePath);
-    const bool archiveBackedGame = (gameZip != nullptr) || cuePath[0];
+    const bool archiveBackedGame =
+        (gameZip != nullptr) || cuePath[0] || (gameIso != nullptr);
     if (!archiveBackedGame)
         engine->initializePath(dir);
 
@@ -688,11 +766,15 @@ extern "C" int main(int argc, char **argv) {
     of_video_set_display_mode(OF_DISPLAY_FRAMEBUFFER);
     of_video_set_color_mode(OF_VIDEO_MODE_8BIT);
 
+    /* Show the ScummVM logo while the engine loads its data; it stays up until
+     * the engine pushes its first frame (engine->run() does the slow load). */
+    openfpga_show_splash();
+
     Common::Error result = engine->run();
 
-    /* Engine returned -- show terminal again for the "Game ended"
-     * status and the press-START-to-exit prompt. */
-    of_video_set_display_mode(OF_DISPLAY_TERMINAL);
+    /* Engine returned.  Keep the framebuffer up -- the console is reserved
+     * for crashes now (halt() / fatalError()).  Log the exit code over UART
+     * and wait for START with the last game frame still on screen. */
     snprintf(buf, sizeof(buf), "Game ended: %d", result.getCode());
     status(buf);
 

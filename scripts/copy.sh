@@ -1,9 +1,15 @@
 #!/bin/bash
+#------------------------------------------------------------------------------
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileType: SOURCE
+# SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+#------------------------------------------------------------------------------
+
 #
 # openfpgaOS SDK — Copy to Pocket SD Card
 #
-# Copies build/sdk/ (the complete SD card image) to the mounted SD card.
-# Run 'make' from src/apps/ first to assemble build/sdk/.
+# Copies build/pocket/sdk/ (the complete SD card image) to the mounted SD card.
+# Run 'make' from src/apps/ first to assemble build/pocket/sdk/.
 #
 # Usage:
 #   ./scripts/copy.sh                       Auto-detect Pocket SD card
@@ -13,15 +19,23 @@
 set -e
 
 GREEN='\033[92m'
-RED='\033[91m'
 RESET='\033[0m'
 
+# The SDK demo core is a Pocket-only bundle; on MiSTer each app is its own
+# disk image, so there is no single "SDK demo core" image to copy.  Steer
+# the user to the per-app path instead of silently copying a Pocket tree.
+if [ "${TARGET:-pocket}" = "mister" ]; then
+    echo "The SDK demo core ships per-app on MiSTer (one disk image each)."
+    echo "Push a single app instead, e.g.: make copy APP=<app> TARGET=mister"
+    exit 1
+fi
+
 SDK_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="$SDK_DIR/build/sdk"
+BUILD_DIR="$SDK_DIR/build/pocket/sdk"
 
 # ── Check build exists ───────────────────────────────────────────────
 if [ ! -d "$BUILD_DIR/Cores" ]; then
-    echo "Error: build/sdk/ not found. Run 'make' from src/apps/ first."
+    echo "Error: build/pocket/sdk/ not found. Run 'make' from src/apps/ first."
     exit 1
 fi
 
@@ -29,7 +43,7 @@ fi
 SDCARD="$1"
 source "$(dirname "$0")/sdcard.sh"
 
-echo "Deploying build/sdk/ to $SDCARD"
+echo "Deploying build/pocket/sdk/ to $SDCARD"
 
 # ── Sync (only modified files) ───────────────────────────────────────
 RSYNC_OPTS=(-rlptv --checksum)

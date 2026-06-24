@@ -84,6 +84,10 @@ public:
     int16 getMouseY() const { return _cursorY; }
     void moveMouse(int dx, int dy);
 
+    /* Draw the ScummVM logo splash directly to the framebuffer (shown while
+     * the engine loads, before it produces its first frame). */
+    void showSplash();
+
 private:
     uint _screenW, _screenH;
     int _screenChangeID;
@@ -112,9 +116,11 @@ private:
 
     void ensureGpuReady();
     uint8_t *acquireFrameBuffer();
-    void clearFrameBorders(uint8_t *fb, int xOff, int yOff, uint copyW, uint copyH);
+    void clearFrameBorders(uint8_t *fb, uint fbW, uint fbH, uint fbStride,
+                           int xOff, int yOff, uint copyW, uint copyH);
     void presentFrame();
-    void drawCursor(uint8_t *dst, int xOff, int yOff) const;
+    void drawCursor(uint8_t *dst, uint fbW, uint fbH, uint fbStride,
+                    int xOff, int yOff) const;
 };
 
 /* Per-instance scummvm.ini filename, set by main() after it discovers
@@ -127,6 +133,10 @@ void openfpga_set_config_path(const char *path);
  * (pollEvent, updateScreen, delayMillis). */
 void openfpga_drive_audio_and_timers(void);
 void openfpga_mixer_pump_only(void);
+
+/* Draw the ScummVM logo splash to the framebuffer (called from main() while
+ * the engine loads, before it produces its first frame). */
+void openfpga_show_splash(void);
 
 /* Forward decl for header consumers. */
 namespace Common { class TimerManager; }
@@ -146,6 +156,12 @@ public:
     void initBackend() override;
 
     bool pollEvent(Common::Event &event) override;
+
+    /* Intercept kFeatureVirtualKeyboard (the engine's MI2 room-108
+     * copy-protection signal); all other features forward to the
+     * graphics backend. */
+    void setFeatureState(Feature f, bool enable) override;
+    bool getFeatureState(Feature f) override;
 
     Common::MutexInternal *createMutex() override;
     uint32 getMillis(bool skipRecord = false) override;
@@ -174,6 +190,28 @@ private:
     bool _mouseButtonL, _mouseButtonR;
     int  _autoDismissCounter;
     bool _ignoreInitialButtons;
+    bool _keypadMode;   /* SELECT toggles a controller numeric keypad so a
+                         * keyboard-less user can type codes (e.g. MI2's
+                         * copy-protection numbers). */
+
+    /* MI2 copy-protection auto-bypass.  The engine raises
+     * kFeatureVirtualKeyboard while its room-108 code screen is up; our
+     * build accepts any digits there, so we auto-type until it clears.
+     * Capped (_copyProtectKeys) so a screen that does not auto-accept
+     * hands control back instead of spinning forever. */
+    bool _copyProtectActive;
+    int  _copyProtectKeys;
+
+    /* Live volume (0..255), SELECT acts as a hold-modifier:
+     *   SELECT + Up/Down    -> master output volume
+     *   SELECT + Left/Right -> music volume (ScummVM kMusicSoundType for CD
+     *                          music + the of_mixer MUSIC group for MIDI synth)
+     * A SELECT *tap* (released with no volume change) toggles keypad mode. */
+    int  _masterVolume;
+    int  _musicVolume;
+    bool _selectHeld;
+    bool _selectConsumed;
+
     uint32 _lastMouseTick;
     int32 _mouseAccumX, _mouseAccumY;
     Common::Queue<Common::Event> _eventQueue;

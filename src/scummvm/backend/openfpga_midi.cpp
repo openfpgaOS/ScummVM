@@ -17,6 +17,7 @@ extern "C" {
 #include <of_smp_bank.h>
 #include <of_smp_voice.h>
 #include <string.h>
+#include <stdio.h>
 }
 
 extern "C" void midi_tick_irq(void);
@@ -35,6 +36,13 @@ namespace {
  * them from the main thread. */
 #define MIDI_TICK_US  10000u   /* must match MidiDriver_MPU401::getBaseTempo() */
 #define MIDI_STUCK_NOTE_TIMEOUT_US 4000000u
+/* Max time a channel may keep the sustain pedal (CC64) latched before we
+ * force-release it.  A note-off received while sustain is held parks a
+ * looping voice in ENV_SUSTAIN until the sustain-off arrives; iMUSE jumps /
+ * track changes occasionally drop that sustain-off, hanging pads/organ
+ * forever.  Bound it.  Generous so legitimately long pedal passages survive;
+ * only voices already key-released (sustain_held) are affected. */
+#define MIDI_SUSTAIN_MAX_US 8000000u
 #define MIDI_PANIC_QUIET_US 250000u
 #define MIDI_MAX_PENDING_TICKS 512u
 #define MIDI_MAX_PUMP_TICKS 128u
@@ -51,6 +59,9 @@ volatile bool                            g_midiTimerArmed = false;
 volatile bool                            g_midiInIrq = false;
 volatile bool                            g_midiPanicActive = false;
 uint32_t                                 g_midiActiveNotes[16][4];
+/* Per-channel timestamp of when CC64 sustain was engaged (0 = pedal up).
+ * Used by the sustain-hang watchdog in midi_tick_irq. */
+volatile uint32_t                        g_sustainSinceUs[16];
 
 void stopMusicMixerVoices() {
     /* Do not call of_mixer_stop_all() from MIDI panic.  ScummVM speech,
@@ -119,8 +130,10 @@ bool midiSuppressed(uint32_t now) {
 }
 
 void panicVoicesUnlocked(bool suppressParser) {
-    for (int ch = 0; ch < 16; ++ch)
+    for (int ch = 0; ch < 16; ++ch) {
         smp_voice_update_sustain(ch, false);
+        g_sustainSinceUs[ch] = 0;
+    }
     smp_voice_all_off_global();
     stopMusicMixerVoices();
     clearActiveNotes();
@@ -212,23 +225,41 @@ extern "C" void midi_tick_irq(void) {
             (uint32_t)(now - g_midiLastEventUs) > MIDI_STUCK_NOTE_TIMEOUT_US) {
             panicVoicesUnlocked(true);
         }
+
+        /* Sustain-hang watchdog: if a channel held the sustain pedal longer
+         * than MIDI_SUSTAIN_MAX_US, the sustain-off was almost certainly
+         * dropped across an iMUSE jump/track change.  Force-release just that
+         * channel (releases key-up voices parked in ENV_SUSTAIN) -- targeted,
+         * so no global all-off / song mute. */
+        for (int ch = 0; ch < 16; ++ch) {
+            if (g_sustainSinceUs[ch] &&
+                (uint32_t)(now - g_sustainSinceUs[ch]) > MIDI_SUSTAIN_MAX_US) {
+                smp_voice_update_sustain(ch, false);
+                g_sustainSinceUs[ch] = 0;
+            }
+        }
     }
 
-    /* IRQ-side audio drain disabled.  Tried both stream_write (mono
-     * API, heap-corrupted) and audio_write (stereo, low-level FIFO);
-     * the latter caused audible modulation/vibrato instead of crashes
-     * but is still wrong.  Hypothesis: of_audio_write's FIFO write
-     * path is non-reentrant in some way that's only exposed at sub-
-     * 1 ms preemption granularity.  Drain runs from main thread now
+    /* IRQ-side audio drain is intentionally NOT done here.  Tried both
+     * stream_write (mono API, heap-corrupted) and audio_write (stereo,
+     * low-level FIFO); the latter caused audible modulation/vibrato instead
+     * of crashes but is still wrong.  Hypothesis: of_audio_write's FIFO write
+     * path is non-reentrant in some way that's only exposed at sub-1 ms
+     * preemption granularity.  Audio drain runs entirely from the main thread
      * (delayMillis 1 ms tick + pollEvent/updateScreen). */
-    /* openfpga_mixer_drain_irq(); */
     g_midiInIrq = false;
 }
 
 void openfpga_midi_pump_pending(void) {
+    /* Reap orphaned HW music voices left looping by the SDK mixer's stale-handle
+     * path (see smp_voice_reap_orphans).  Main-thread, cheap, runs every pump so
+     * a dropped looping voice drones for at most ~one frame instead of forever. */
+    smp_voice_reap_orphans();
+
     Common::TimerManager::TimerProc proc =
         (Common::TimerManager::TimerProc)g_midiTimerProc;
     void *param = g_midiTimerParam;
+
     if (!proc) {
         g_midiPendingTicks = 0;
         return;
@@ -364,6 +395,7 @@ void OpenFPGAMidiDriver::resetChannelState(int ch, bool resetProgram) {
     _resonance[ch]  = 64;
     smp_voice_update_mod(ch, 0);
     smp_voice_update_sustain(ch, false);
+    g_sustainSinceUs[ch] = 0;
     smp_voice_update_volume(ch, _volume[ch], _expression[ch]);
     smp_voice_update_pan(ch, 64);
     smp_voice_update_bend(ch, 0);
@@ -437,6 +469,12 @@ void OpenFPGAMidiDriver::send(uint32 b) {
             break;
         case 0x40:  /* CC64 sustain */
             smp_voice_update_sustain(ch, d2 >= 64);
+            if (d2 >= 64) {
+                if (!g_sustainSinceUs[ch])
+                    g_sustainSinceUs[ch] = g_midiLastEventUs;  /* engaged now */
+            } else {
+                g_sustainSinceUs[ch] = 0;                      /* released */
+            }
             break;
         case 0x47:  /* CC71 resonance */
             _resonance[ch] = d2;
@@ -454,6 +492,7 @@ void OpenFPGAMidiDriver::send(uint32 b) {
             break;
         case 0x78:  /* CC120 all sound off */
             smp_voice_update_sustain(ch, false);
+            g_sustainSinceUs[ch] = 0;
             clearChannelNotes(ch);
             smp_voice_all_off(ch);
             break;
@@ -466,6 +505,7 @@ void OpenFPGAMidiDriver::send(uint32 b) {
         case 0x7E:  /* CC126 mono on, also all notes off */
         case 0x7F:  /* CC127 poly on, also all notes off */
             smp_voice_update_sustain(ch, false);
+            g_sustainSinceUs[ch] = 0;
             clearChannelNotes(ch);
             smp_voice_all_off(ch);
             break;

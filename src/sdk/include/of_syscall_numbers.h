@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_syscall_numbers.h -- openfpgaOS SBI Extension/Function IDs
  *
@@ -84,6 +90,12 @@ extern "C" {
 /* -- OF_EID_BASE -- */
 enum of_base_fid {
     OF_BASE_FID_GET_VERSION = 0,
+    OF_BASE_FID_RELAUNCH    = 1,  /* (instance, elf): swap to another app in-OS;
+                                   * does NOT return on success.  MiSTer only. */
+    OF_BASE_FID_SET_MENU    = 2,  /* (instance, elf): register the launcher to
+                                   * re-enter when an app exit()s. */
+    OF_BASE_FID_LIST_INSTANCES = 3, /* (names, stride, max): enumerate game
+                                   * instances under /games; returns count. */
 };
 
 /* -- OF_EID_VIDEO -- */

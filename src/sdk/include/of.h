@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of.h -- openfpgaOS Application API
  *
@@ -71,6 +77,7 @@ extern "C" {
 #include "of_caps.h"
 #include "of_services.h"
 #include "of_config.h"
+#include "of_launch.h"
 /* Note: of_gpu.h is intentionally NOT included here -- it has per-app
  * static state (ring buffer pointers) and must be included from exactly
  * one TU. Standard C library functions come from upstream musl headers

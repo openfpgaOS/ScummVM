@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_cxxabi.cpp -- Minimal C++ ABI shim for openfpgaOS apps.
  *
@@ -21,7 +27,14 @@
  *   - RTTI / dynamic_cast (-fno-rtti)
  *
  * For std::cout-style I/O, use printf from <stdio.h> instead.
+ *
+ * The whole file is HW-only: on the SDL2 desktop build (OF_PC) the
+ * system libstdc++ already provides operator new/delete, the __cxa_*
+ * personality, and the EH-frame symbols — duplicating them here would
+ * break the link.  Collapse to an empty translation unit on OF_PC.
  */
+
+#ifndef OF_PC
 
 #include <stdint.h>     /* uintptr_t */
 #include <stdio.h>      /* musl: printf */
@@ -156,3 +169,5 @@ void  operator delete(void *p) noexcept      { free(p); }
 void  operator delete[](void *p) noexcept    { free(p); }
 void  operator delete(void *p, size_t) noexcept   { free(p); }
 void  operator delete[](void *p, size_t) noexcept { free(p); }
+
+#endif /* !OF_PC */

@@ -18,7 +18,10 @@
 #include "common/array.h"
 #include "common/str.h"
 
-namespace OpenFPGA { class BufferedCDDAStream; }
+namespace OpenFPGA {
+class BufferedCDDAStream;
+class HardwareCDDARing;
+}
 
 class OpenFPGAAudioCDManager : public DefaultAudioCDManager {
 public:
@@ -44,11 +47,14 @@ public:
         if (path && *path) _cuePath = path;
     }
 
-    bool open() override;
+	bool open() override;
 
     bool play(int track, int numLoops, int startFrame, int duration,
               bool onlyEmulate = false,
               Audio::Mixer::SoundType soundType = Audio::Mixer::kMusicSoundType) override;
+	bool isPlaying() const override;
+	void setVolume(byte volume) override;
+	void setBalance(int8 balance) override;
 	void stop() override;
 	void update() override;
 	void setPaused(bool paused);
@@ -74,6 +80,7 @@ private:
 	int  _implicitTrackOffset;
 	Common::String _cuePath;
 	OpenFPGA::BufferedCDDAStream *_activeStream;
+	OpenFPGA::HardwareCDDARing *_activeHW;
 	bool _paused;
 };
 

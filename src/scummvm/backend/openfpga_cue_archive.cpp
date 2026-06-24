@@ -322,6 +322,27 @@ CueArchive::CueArchive() : _cooked(nullptr) {}
 
 CueArchive::~CueArchive() { delete _cooked; }
 
+CueArchive *CueArchive::createISO(const Common::String &isoPath) {
+    Common::SeekableReadStream *isoStream = openNamedStreamOnce(isoPath);
+    if (!isoStream) {
+        warning("[iso-archive] cannot open iso '%s'", isoPath.c_str());
+        return nullptr;
+    }
+
+    CueArchive *a = new CueArchive();
+    a->_cooked = isoStream;
+    if (!a->parseISO9660()) {
+        warning("[iso-archive] ISO9660 parse failed for '%s'",
+                isoPath.c_str());
+        delete a;
+        return nullptr;
+    }
+
+    debug(1, "[iso-archive] mounted '%s' (%u files)",
+          isoPath.c_str(), (uint32)a->_files.size());
+    return a;
+}
+
 CueArchive *CueArchive::create(const Common::String &cuePath) {
     /* Open the cue via SearchMan's archive members rather than
      * Common::File::open, so we don't get tangled in path encoding

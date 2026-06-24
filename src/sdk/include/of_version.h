@@ -1,3 +1,9 @@
+//------------------------------------------------------------------------------
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileType: SOURCE
+// SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+//------------------------------------------------------------------------------
+
 /*
  * of_version.h -- API versioning for openfpgaOS
  */
@@ -11,8 +17,8 @@ extern "C" {
 
 #include <stdint.h>
 
-#define OF_API_VERSION_MAJOR  1
-#define OF_API_VERSION_MINOR  0
+#define OF_API_VERSION_MAJOR  0
+#define OF_API_VERSION_MINOR  7
 #define OF_API_VERSION_PATCH  0
 
 /* Packed version: major(8).minor(8).patch(8) in bits [23:0] */

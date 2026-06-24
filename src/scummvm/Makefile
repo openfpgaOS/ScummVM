@@ -178,18 +178,11 @@ SCUMMVM_ENGINE_SRCS = $(filter-out $(SCUMM_EXCLUDE), $(wildcard $(SCUMMVM)/engin
 	$(SCUMMVM)/engines/scumm/he/script_v70he.cpp \
 	$(SCUMMVM)/engines/scumm/he/sound_he.cpp
 
-# ── ScummVM SCI engine sources (Sierra adventures: KQ, LSL, SQ, PQ, GK, ...) ─
-SCUMMVM_ENGINE_SRCS += \
-	$(wildcard $(SCUMMVM)/engines/sci/*.cpp) \
-	$(wildcard $(SCUMMVM)/engines/sci/engine/*.cpp) \
-	$(wildcard $(SCUMMVM)/engines/sci/graphics/*.cpp) \
-	$(wildcard $(SCUMMVM)/engines/sci/graphics/drivers/*.cpp) \
-	$(wildcard $(SCUMMVM)/engines/sci/parser/*.cpp) \
-	$(wildcard $(SCUMMVM)/engines/sci/resource/*.cpp) \
-	$(wildcard $(SCUMMVM)/engines/sci/sound/*.cpp) \
-	$(wildcard $(SCUMMVM)/engines/sci/sound/decoders/*.cpp) \
-	$(wildcard $(SCUMMVM)/engines/sci/sound/drivers/*.cpp) \
-	$(wildcard $(SCUMMVM)/engines/sci/video/*.cpp)
+# ── ScummVM SCI engine (Sierra) intentionally NOT built ────────────
+# This build focuses only on LucasArts SCUMM titles.  The sci/ sources are
+# excluded here, ENABLE_SCI/ENABLE_SCI32 are undefined in config.h, and
+# LINK_PLUGIN(SCI)/LINK_PLUGIN(SCI_DETECTION) are removed from the engine
+# tables (engines/plugins_table.h, engines/detection_table.h).
 
 # ── ScummVM engine framework ───────────────────────────────────────
 SCUMMVM_ENGINES_SRCS = $(wildcard $(SCUMMVM)/engines/*.cpp)
@@ -250,11 +243,16 @@ ALL_OBJS      = $(LOCAL_OBJS) $(SCUMMVM_OBJS) $(OF_INIT_OBJ) $(OF_SDK_C_OBJS)
 # build/<app>/ is the assembled SD-card image consumed by copy.sh /
 # package.sh.
 APP       = scummvm
-TARGET    = pocket
+TARGET   ?= pocket
+MISTER_IP ?= mister.local
 ROOT      = $(realpath $(CURDIR)/../..)
+OBJ_DIR   = $(CURDIR)
 DIST      = $(ROOT)/dist/$(APP)
-OUT       = $(ROOT)/build/$(APP)
+OUT       = $(ROOT)/build/$(TARGET)/$(APP)
 RUNTIME   = $(ROOT)/runtime
+# Game data files shipped into the per-target deliverable, when present
+# alongside the Makefile (game discs/data are usually user-supplied).
+GAME_ASSETS = $(wildcard *.dat *.bin *.cfg)
 
 # ── Targets ─────────────────────────────────────────────────────────
 
@@ -285,31 +283,19 @@ $(SCUMMVM)/%.o: $(SCUMMVM)/%.cpp
 # bitstream + loader (per-Core), os.bin + scummvm.elf (per-platform
 # common), so the result is a tree the user can drop straight onto
 # the Pocket SD card.
-release: app.elf
-	@rm -rf $(OUT)
-	@mkdir -p $(dir $(OUT))
-	@cp -r $(DIST) $(OUT)
-	@for d in $(OUT)/Cores/*/; do \
-		cp $(RUNTIME)/bitstream.rbf_r $(RUNTIME)/loader.bin "$$d"; \
-	done
-	@for d in $(OUT)/Assets/*/; do \
-		mkdir -p "$$d/common"; \
-		cp $(RUNTIME)/os.bin "$$d/common/"; \
-		cp app.elf "$$d/common/$(APP).elf"; \
-		[ -f $(RUNTIME)/bank.ofsf ] && cp $(RUNTIME)/bank.ofsf "$$d/common/" || true; \
-	done
-	@echo "Ready: build/$(APP)/"
+release: $(OBJ_DIR)/app.elf
+	@$(SDK_DIR)/platforms/$(TARGET)/image.sh "$(APP)" "$(OBJ_DIR)/app.elf" "$(ROOT)" "$(DIST)" $(GAME_ASSETS)
 
 # ── Deploy / package wrappers ───────────────────────────────────────
-copy: release
-	@$(SDK_DIR)/platforms/$(TARGET)/copy.sh "$(APP)" "$$(ls -d $(OUT)/Assets/*/common)/$(APP).elf"
+copy: all
+	@MISTER_IP="$(MISTER_IP)" $(SDK_DIR)/platforms/$(TARGET)/copy.sh "$(APP)" "$(OBJ_DIR)/app.elf"
 
 package: release
 	@$(ROOT)/scripts/package.sh $(APP)
 
 # ── UART push + console (single-app debug) ──────────────────────────
-debug: app.elf
-	@$(ROOT)/scripts/debug.sh app.elf
+debug: all
+	@$(ROOT)/scripts/debug.sh "$$(ls -d $(OUT)/Assets/*/common 2>/dev/null)/$(APP).elf"
 
 clean:
 	rm -f $(ALL_OBJS) app.elf

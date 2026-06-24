@@ -1,3 +1,9 @@
+#------------------------------------------------------------------------------
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileType: SOURCE
+# SPDX-FileCopyrightText: (c) 2026, ThinkElastic <Think@Elastic.com>
+#------------------------------------------------------------------------------
+
 # openfpgaOS SDK — Build Rules
 #
 # Shared by both build paths:
@@ -139,6 +145,19 @@ $(OF_INIT_OBJ): $(OF_INIT_SRC)
 	@mkdir -p $(dir $@)
 	$(CC) $(ALL_CFLAGS) -c -o $@ $<
 
+# of_sdl2.c is the single implementation TU for the SDL2 / SDL_mixer
+# compatibility layer (<SDL2/SDL.h>, <SDL2/SDL_mixer.h>). It is auto-linked
+# into every app so SDL ports need no extra Makefile wiring; --gc-sections
+# drops it entirely from apps that call no SDL_* function, so non-SDL apps
+# pay nothing. Apps that use SDL_mixer *music* (Mix_PlayMusic) also append
+# $(OF_MIDI_SRC) to SRCS, since that path pulls in of_midi.
+OF_SDL2_SRC = $(SDK_DIR)/of_sdl2.c
+OF_SDL2_OBJ = $(OBJ_DIR)/of_sdl2.o
+
+$(OF_SDL2_OBJ): $(OF_SDL2_SRC)
+	@mkdir -p $(dir $@)
+	$(CC) $(ALL_CFLAGS) -c -o $@ $<
+
 # ── Sources / objects ────────────────────────────────────────────────
 SRCS_CXX ?=
 APP_C_OBJS   = $(patsubst %.c,$(OBJ_DIR)/%.o,$(filter %.c,$(SRCS)))
@@ -148,10 +167,11 @@ APP_OBJS     = $(APP_C_OBJS) $(APP_CXX_OBJS)
 # ── Pocket build ─────────────────────────────────────────────────────
 # OF_INIT_OBJ is linked alongside the app objects so its constructor
 # (in .init_array, KEEP'd by app.ld) is picked up by the linker even
-# under --gc-sections.
-$(BUILD_DIR)/app.elf: $(APP_OBJS) $(OF_INIT_OBJ) $(APP_LD) $(CRT_OBJS)
+# under --gc-sections. OF_SDL2_OBJ supplies the SDL2/SDL_mixer shim and is
+# garbage-collected away when unused.
+$(BUILD_DIR)/app.elf: $(APP_OBJS) $(OF_INIT_OBJ) $(OF_SDL2_OBJ) $(APP_LD) $(CRT_OBJS)
 	@mkdir -p $(dir $@)
-	$(LD) $(ALL_LDFLAGS) -o $@ $(CRT_OBJS) $(APP_OBJS) $(OF_INIT_OBJ) $(LIBS)
+	$(LD) $(ALL_LDFLAGS) -o $@ $(CRT_OBJS) $(APP_OBJS) $(OF_INIT_OBJ) $(OF_SDL2_OBJ) $(LIBS)
 
 $(OBJ_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -162,25 +182,33 @@ $(OBJ_DIR)/%.o: %.cpp
 	$(CXX) $(ALL_CXXFLAGS) -c -o $@ $<
 
 # ── PC build (SDL2) ──────────────────────────────────────────────────
-PC_CC ?= cc
+PC_CC  ?= cc
+PC_CXX ?= c++
 SDL_CFLAGS := $(shell sdl2-config --cflags 2>/dev/null || pkg-config --cflags sdl2 2>/dev/null)
 SDL_LIBS   := $(shell sdl2-config --libs 2>/dev/null || pkg-config --libs sdl2 2>/dev/null)
 
 # PC-side CFLAGS. Separate from SDK_CFLAGS because the host build uses
 # the system libc/toolchain (no -nostdinc, no -march/-mabi, no musl
-# headers) and has its own include + warning defaults. User-supplied
-# CFLAGS flow in via ALL_PC_CFLAGS so apps with subdir layouts or
-# third-party code can customize without overriding this recipe.
+# headers) and has its own include + warning defaults. Per-app extras
+# arrive via PC_EXTRA_CFLAGS / PC_EXTRA_LIBS (celeste uses these for
+# SDL2_mixer); user-supplied CFLAGS flow in via ALL_PC_CFLAGS so apps
+# with subdir layouts or third-party code can customize without
+# overriding this recipe.
 SDK_PC_CFLAGS  = -DOF_PC -O2 -Wall -Wextra
 SDK_PC_CFLAGS += -I$(SDK_DIR)/include -I.
-ALL_PC_CFLAGS  = $(SDK_PC_CFLAGS) $(CFLAGS)
+ALL_PC_CFLAGS  = $(SDK_PC_CFLAGS) $(CFLAGS) $(PC_EXTRA_CFLAGS)
 
-app_pc: $(SRCS) $(SDK_DIR)/pc/of_sdl2.c $(OF_INIT_SRC) $(SDK_DIR)/include/of.h
-	$(PC_CC) $(ALL_PC_CFLAGS) \
-		$(SRCS) $(SDK_DIR)/pc/of_sdl2.c $(OF_INIT_SRC) \
-		$(SDL_CFLAGS) $(SDL_LIBS) -lm -o $@
+# Use the C++ frontend when the app pulls in any .cpp source (cxxdemo,
+# etc.); it compiles both languages and links the C++ runtime that a
+# pure-C app does not need.
+PC_LINK = $(if $(strip $(SRCS_CXX)),$(PC_CXX),$(PC_CC))
+
+app_pc: $(SRCS) $(SRCS_CXX) $(SDK_DIR)/pc/of_sdl2.c $(OF_INIT_SRC) $(SDK_DIR)/include/of.h
+	$(PC_LINK) $(ALL_PC_CFLAGS) \
+		$(SRCS) $(SRCS_CXX) $(SDK_DIR)/pc/of_sdl2.c $(OF_INIT_SRC) \
+		$(SDL_CFLAGS) $(SDL_LIBS) $(PC_EXTRA_LIBS) -lm -o $@
 
 # ── Clean ────────────────────────────────────────────────────────────
 sdk-clean:
-	rm -f $(APP_OBJS) $(BUILD_DIR)/app.elf app_pc
+	rm -f $(APP_OBJS) $(OF_INIT_OBJ) $(OF_SDL2_OBJ) $(BUILD_DIR)/app.elf app_pc
 	@if [ "$(OBJ_DIR)" != "." ] && [ -d "$(OBJ_DIR)" ]; then rm -rf "$(OBJ_DIR)"; fi
