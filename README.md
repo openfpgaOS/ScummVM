@@ -1,612 +1,154 @@
-# openfpgaOS SDK
+# ScummVM for Analogue Pocket (openfpgaOS)
 
-Build games for the [Analogue Pocket](https://www.analogue.co/pocket) in C or C++.
+A native port of [ScummVM](https://www.scummvm.org/) to the Analogue Pocket
+running [openfpgaOS](https://github.com/ThinkElastic/openfpgaOS-SDK) — a
+bare-metal RISC-V game runtime (VexiiRiscv rv32imafc @ 100 MHz, 64 MB SDRAM,
+320×240 video, 48 kHz stereo audio). It plays the classic LucasArts SCUMM
+point-and-click adventures, with MIDI + CD-style music, save slots in
+non-volatile storage, and one launcher entry per game.
 
-**Hardware:** VexiiRiscv rv32imafc @ 100 MHz, 8 KB I-cache + 32 KB D-cache, 64 MB SDRAM, 320x240 video, 48 kHz stereo audio, 32-voice hardware PCM mixer, and sample-based MIDI playback.
-
-> **New here?** See [GETTING_STARTED.md](GETTING_STARTED.md) — clone to running code in 5 minutes.
-
-## Quick Start
-
-```bash
-git clone https://github.com/openfpgaOS/openfgpaSDK.git
-cd openfgpaSDK
-make setup                    # install RISC-V toolchain
-make core                     # create your app (follow the prompts)
-cd src/mygame
-make                          # build mygame.elf
-make copy                   # copy to Pocket SD card
-```
-
-### Toolchain
-
-`make setup` detects your OS and offers to install automatically:
-
-- **Arch:** `pacman -S riscv64-elf-gcc`
-- **Ubuntu/Debian:** `apt install gcc-riscv64-unknown-elf`
-- **Fedora:** `dnf install gcc-riscv64-linux-gnu`
-- **macOS:** `brew install riscv64-elf-gcc`
-- **NixOS:** `pkgsCross.riscv64.buildPackages.gcc`
-- **MSYS2:** `pacman -S mingw-w64-ucrt-x86_64-riscv64-unknown-elf-gcc`
-
-`make core` prompts for your app name and author, then creates `src/<app>/` with a self-contained Makefile, stub code, and instance JSON. Your app gets its own core identity from the start.
+Each game is a separate **instance** that shows up directly in the Pocket's
+core menu. Pick *Monkey Island 1* and you boot straight into the game — there
+is no on-device ScummVM launcher to navigate.
 
 ---
 
-## Writing Your App
+## Games supported
 
-Edit `src/mygame/main.c`:
+This build compiles the **SCUMM engine, versions 0–6 only**. That covers the
+classic LucasArts catalogue; it deliberately excludes SCUMM v7/v8 (Curse of
+Monkey Island, The Dig, Full Throttle — 640×480, compressed resources),
+Humongous Entertainment titles, and every non-SCUMM engine (Sierra SCI,
+Beneath a Steel Sky, GrimE, …). See [Limitations](#limitations).
 
-```c
-#include "of.h"
-#include <stdio.h>
-#include <unistd.h>
+| Game | gameid | Music | Speech | Status |
+|---|---|---|---|---|
+| The Secret of Monkey Island (SE) | `monkey` | ✓ (CD audio, offline-decoded) | ✓ SE voices | **Tested** |
+| Monkey Island 2: LeChuck's Revenge (SE) | `monkey2` | ✓ iMUSE MIDI | ✓ SE voices | **Tested** |
+| Day of the Tentacle | `tentacle` | ✓ MIDI | ✓ digital | **Tested** |
+| Indiana Jones and the Fate of Atlantis | `atlantis` | ✓ MIDI | ✓ digital | **Tested** |
+| Loom | `loom` | ✓ MIDI | — | Tested |
+| Maniac Mansion, Zak McKracken, Indy 3, … | (various) | ✓ MIDI | — | Should work (SCUMM v0–v6); untested |
 
-int main(void) {
-    of_video_init();
-
-    /* Set up a palette */
-    for (int i = 0; i < 256; i++)
-        of_video_palette(i, (i << 16) | ((255 - i) << 8) | 128);
-
-    /* Draw to the framebuffer */
-    uint8_t *fb = of_video_surface();
-    for (int y = 0; y < 240; y++)
-        for (int x = 0; x < 320; x++)
-            fb[y * 320 + x] = x ^ y;
-
-    of_video_flip();
-    printf("Hello from openfpgaOS!\n");
-
-    /* Main loop */
-    while (1) {
-        of_input_poll();
-        if (of_btn_pressed(OF_BTN_A)) {
-            /* handle button press */
-        }
-        usleep(16000);  /* ~60 fps */
-    }
-}
-```
-
-### Standard C library
-
-Apps statically link a full C standard library (upstream musl). Include the standard headers:
-
-```c
-#include <stdio.h>    // printf, snprintf, sscanf,
-                      // fopen, fclose, fread, fwrite, fseek, ftell
-#include <stdlib.h>   // malloc, free, calloc, realloc, atoi, atof,
-                      // strtol, strtod, qsort, bsearch, rand, abs
-#include <string.h>   // memcpy, memset, strlen, strcmp, strdup,
-                      // strcat, strtok, memchr, strspn, strcspn, ...
-#include <math.h>     // sinf, cosf, sqrtf, powf, logf, atan2f, fabsf, ...
-#include <ctype.h>    // toupper, tolower, isalpha, isdigit, isspace, ...
-#include <unistd.h>   // usleep, sleep, open, close, read, write, lseek
-#include <time.h>     // clock_ms, clock_us, clock_gettime
-```
-
-### C++ support
-
-The SDK supports C++ (freestanding, no exceptions, no RTTI). Place `.cpp` files alongside `.c` files and they are compiled automatically.
-
-What works:
-- Classes, inheritance, virtual methods
-- `operator new` / `delete` (backed by the OS `malloc`/`free`)
-- Templates
-- Static constructors and destructors (`.init_array` / `.fini_array`)
-- All SDK headers are `extern "C"` compatible
-- `<iostream>` — `std::cout`, `std::cerr`, `std::cin` (lightweight)
-
-What is **not** available (freestanding environment):
-- Exceptions (`-fno-exceptions`)
-- RTTI / `dynamic_cast` (`-fno-rtti`)
-- The rest of the C++ Standard Library (`<vector>`, `<string>`, `<algorithm>`, etc.)
-
-#### `<iostream>` — cout / cerr / cin
-
-```cpp
-#include <iostream>
-
-int main(void) {
-    std::cout << "Hello from cout!\n";
-    std::cout << "int=" << 42 << " float=" << 3.14f << std::endl;
-    std::cerr << "error message\n";
-
-    int n;
-    std::cin >> n;                         // reads from fd 0 (stdin / serial)
-    std::cout << "you entered: " << n << "\n";
-}
-```
-
-`std::cout` and `std::cerr` write through `write(1, …)` / `write(2, …)` syscalls — identical to calling `printf`. `std::cin` reads from fd 0 character-by-character; on the Analogue Pocket there is no keyboard, so `cin` is mainly useful when stdin is connected to a serial port or redirected by the host OS.
-
-Supported `operator<<` types: `bool`, `char`, `unsigned char`, `const char*`, `short`, `unsigned short`, `int`, `unsigned int`, `long`, `unsigned long`, `long long`, `unsigned long long`, `float`, `double`, `void*`.
-
-Supported `operator>>` types: `char`, `char*` (one word), `int`, `unsigned int`, `long`, `unsigned long`, `float`, `double`, `bool`.
-
-Example (`main.cpp`):
-
-```cpp
-#include "of.h"
-#include <stdio.h>
-#include <unistd.h>
-
-class Game {
-    int score;
-public:
-    Game() : score(0) {}
-    void tick() {
-        of_input_poll();
-        if (of_btn_pressed(OF_BTN_A)) score++;
-    }
-    void draw() {
-        of_video_clear(0);
-        printf("Score: %d\n", score);
-        of_video_flip();
-    }
-};
-
-int main(void) {
-    of_video_init();
-    Game game;
-    while (1) {
-        game.tick();
-        game.draw();
-        usleep(16000);
-    }
-}
-```
-
-You can add custom `CXXFLAGS` in your Makefile before including `sdk.mk`:
-
-```makefile
-CXXFLAGS = -std=c++17
-```
-
-### PC build
-
-Test on your computer with SDL2:
-
-```bash
-make test
-./app_pc
-```
+"SE" instances run the Steam **Special Edition** data in *classic* mode: the
+original pixel-art game with the remastered SE voice-over mixed in. The SE
+*remastered* graphics/UI are not used (320×240, 8-bit). See
+[Special Edition: MI1 / MI2](#special-edition-mi1--mi2) for how the audio is
+built.
 
 ---
 
-## Porting SDL2 Games
+## Quick start
 
-The SDK ships an **SDL2 compatibility layer** so existing 2D SDL games
-(DevilutionX, ECWolf, Doom, ScummVM, …) port with little or no source
-change. Just `#include <SDL2/SDL.h>` (and `<SDL2/SDL_mixer.h>` for audio) —
-there is no extra Makefile wiring: `sdk.mk` auto-links the implementation
-(`src/sdk/of_sdl2.c`) into every app, and `--gc-sections` removes it from
-apps that don't call any `SDL_*` function, so non-SDL apps pay nothing.
+If you already have the SD-card-ready ZIP from a release, just unzip it to the
+root of your Pocket's SD card, add your game data (below), and boot. To build
+from source:
 
-See **`src/apps/sdldemo/`** for a complete, minimal template (8-bit surface
-+ palette, colorkey blit, callback audio, input) that builds for both the
-Pocket (`make`) and the desktop (`make test`).
+```sh
+# 1. Build the core (host toolchain) and copy it to the SD card
+make build CORE=scummvm
+make copy  CORE=scummvm          # auto-detects the SD card; or POCKETDEV=/path
 
-**What's implemented** (over the `of_*` HAL, CPU/surface based — no GPU dep):
+# 2. Add a game's data file next to its instance, e.g.
+#    <SD>/Assets/scummvm/ThinkElastic.ScummVM/monkey1.iso
 
-- **Video** — 8-bit indexed window surface, palette (`SDL_SetPaletteColors`),
-  full `SDL_Surface` create/convert/blit (colorkey + clip + scale), software
-  `SDL_Renderer`/`SDL_Texture`, and SDL 1.2 `SDL_SetVideoMode`/`SDL_Flip`.
-  When the window size matches the active video mode the surface aliases the
-  OS triple-buffer (zero-copy present); otherwise present nearest-neighbor
-  scales into the framebuffer.
-- **Input** — the Analogue Pocket gamepad is exposed three ways at once:
-  `SDL_PollEvent` emits **both** `SDL_CONTROLLERBUTTON*`/axis events **and**
-  keyboard `SDL_KEYDOWN`/`SDL_KEYUP` events, and `SDL_GetKeyboardState()`
-  returns a live keystate. Game-controller and joystick query APIs work too.
-- **Audio** — `SDL_AudioCallback` is **auto-pumped** from `SDL_PollEvent` /
-  `SDL_Delay` / `SDL_RenderPresent` / `SDL_Flip` (no audio thread needed);
-  `SDL_QueueAudio`, `SDL_LoadWAV`, and `SDL_mixer` (SFX via `of_mixer`, MIDI
-  music via `of_midi`) are supported.
-- **Misc** — `SDL_RWops` (file + memory), timers, threads (run cooperatively),
-  mutex/cond/sem (no-ops on the single core), hints, message boxes.
+# 3. Insert SD, boot Pocket → Cores → ThinkElastic.ScummVM → pick a game
+```
 
-**Tuning knobs** (compile-time `-D…`):
+No RISC-V toolchain installed? Use the **container build** instead — it needs
+only Docker:
 
-| Define | Effect |
-|---|---|
-| `OF_SDL_NO_KEYBOARD_EVENTS` | Suppress the keyboard event stream (controller-only games) |
-| `OF_SDL_NO_CONTROLLER_EVENTS` | Suppress the controller event stream (keyboard-only games) |
+```sh
+cd src/scummvm
+make container-all               # compiles scummvm.elf + SD tree inside Docker
+cd ../..
+make copy CORE=scummvm           # rsync to SD card (host-side, no toolchain)
+```
 
-A game that uses **SDL_mixer music** (`Mix_PlayMusic`) also appends
-`$(OF_MIDI_SRC)` to `SRCS` (that path pulls in the MIDI engine). The button →
-SDL scancode map lives in `of_to_scancode()` in `src/sdk/of_sdl2.c`; tweak it
-there for a specific game's controls. Truecolor (RGB) rendering is approximated
-to the 8-bit screen palette — the layer is indexed-color first, like the games
-it targets.
+See [Building from source](#building-from-source) for both paths in full.
 
 ---
 
-## API Reference
-
-Include `"of.h"` for the entire API, or include individual headers.
-
-### Video — `of_video.h`
-
-320x240 framebuffer with double buffering. Default mode is 8-bit indexed (256-color palette).
-
-```c
-of_video_init();                              // Initialize video
-uint8_t *fb = of_video_surface();             // Get back buffer (write here)
-of_video_flip();                              // Swap front/back buffers
-of_video_sync();                              // Wait until flip completes
-of_video_vsync();                             // Wait for next vblank (no flip)
-of_video_clear(0);                            // Fill back buffer with palette index
-of_video_pixel(x, y, color);                  // Set one pixel (bounds-checked)
-of_video_flush();                             // Flush D-cache (advanced)
-```
-
-**Palette:**
-
-```c
-of_video_palette(index, 0x00RRGGBB);          // Set one palette entry (0-255)
-of_video_palette_bulk(rgb_array, count);       // Set multiple entries at once
-of_video_palette_vga6(vga_triplets, count);    // Convert 6-bit VGA palette (0-63 per channel)
-```
-
-**Color modes:**
-
-Six video modes, switched at runtime. Indexed modes use the palette; direct modes encode color per pixel.
-
-```c
-of_video_set_color_mode(OF_VIDEO_MODE_8BIT);      // 256 colors, 1 byte/pixel (default)
-of_video_set_color_mode(OF_VIDEO_MODE_4BIT);      // 16 colors,  2 pixels/byte
-of_video_set_color_mode(OF_VIDEO_MODE_2BIT);      // 4 colors,   4 pixels/byte
-of_video_set_color_mode(OF_VIDEO_MODE_RGB565);    // 16-bit direct, 2 bytes/pixel
-of_video_set_color_mode(OF_VIDEO_MODE_RGB555);    // 15-bit direct, 2 bytes/pixel
-of_video_set_color_mode(OF_VIDEO_MODE_RGBA5551);  // 15-bit + alpha, 2 bytes/pixel
-
-uint16_t *fb16 = of_video_surface16();   // Use for 16-bit modes
-```
-
-| Mode | Framebuffer size | Pixels per byte |
-|------|-----------------|-----------------|
-| 8-bit indexed | 76,800 B | 1 |
-| 4-bit indexed | 38,400 B | 2 (low nibble first) |
-| 2-bit indexed | 19,200 B | 4 (LSB first) |
-| RGB565 | 153,600 B | 0.5 (16-bit per pixel) |
-| RGB555 | 153,600 B | 0.5 |
-| RGBA5551 | 153,600 B | 0.5 (bit 0 = alpha) |
-
-**Display mode:**
-
-```c
-of_video_set_display_mode(0);    // Terminal only (text console)
-of_video_set_display_mode(1);    // Framebuffer only (default after of_video_init)
-of_video_set_display_mode(2);    // Overlay: white terminal text over framebuffer
-```
-
-**Blitting helpers:**
-
-```c
-of_blit(dx, dy, w, h, src, src_stride);               // Blit with transparency (pixel 0 = skip)
-of_blit_pal(dx, dy, w, h, src, src_stride, offset);   // Blit with palette offset
-of_fill_rect(x, y, w, h, color);                       // Solid filled rectangle
-of_video_blit_letterbox(src, src_w, src_h);             // Center vertically, black bars
-```
-
-### Audio — `of_audio.h`
-
-48 kHz stereo PCM output. `of_audio_write` accepts interleaved signed
-16-bit stereo pairs and streams them through a reserved hardware mixer
-voice.
-
-```c
-of_audio_init();                                      // Initialize audio system
-of_audio_write(samples, count);                       // Queue stereo int16_t pairs
-int free = of_audio_free();                           // Stereo pairs free in ring buffer
-of_audio_stream_open(sample_rate);                    // Gapless mono stream, resampled
-of_audio_stream_write(samples, count);                // Write mono int16_t samples
-of_audio_stream_close();                              // Stop stream playback
-```
-
-### MIDI Playback — `of_midi.h`
-
-Plays Standard MIDI Files (Format 0 and 1) through the sample-based
-MIDI engine. Ship a `.ofsf` SoundFont bank in a data slot; the kernel
-auto-loads the first bank it finds and exposes it to the MIDI runtime.
-
-```c
-of_midi_init();                              // Init sample voice engine
-of_midi_play(midi_data, midi_len, 1);        // Play (1 = loop)
-of_midi_stop();                              // Stop and silence all
-of_midi_pause();                             // Pause
-of_midi_resume();                            // Resume
-of_midi_set_volume(200);                     // Master volume 0-255
-int playing = of_midi_playing();             // Query state
-```
-
-`of_midi_play()` installs the MIDI pump on the timer ISR. Do not call
-`of_midi_pump()` from the main loop while playback is active.
-
-**Features:** Format 0 + Format 1 (multi-track), velocity-scaled volume, channel volume (CC7), pan (CC10), pitch bend, tempo changes, looping, and `.ofsf` instrument banks. Error codes: `OF_MIDI_OK`, `OF_MIDI_ERR_BAD_HDR`, `OF_MIDI_ERR_FORMAT`, `OF_MIDI_ERR_NO_TRACKS`, `OF_MIDI_ERR_PLAYING`, `OF_MIDI_ERR_NO_BANK`.
-
-**Example (mididemo):**
-
-```c
-#include "of.h"
-#include <unistd.h>
-
-static uint8_t midi_buf[256 * 1024] __attribute__((aligned(512)));
-
-int main(void) {
-    of_file_slot_register(3, "music.mid");
-    FILE *f = fopen("music.mid", "rb");
-    uint32_t n = fread(midi_buf, 1, sizeof(midi_buf), f);
-    fclose(f);
-
-    of_midi_init();
-    of_midi_play(midi_buf, n, 1);     // loop
-
-    while (1) {
-        usleep(1000);
-    }
-}
-```
-
-### Audio Mixer — `of_mixer.h`
-
-32-voice hardware PCM mixer with automatic resampling to 48 kHz. Native
-input is signed 16-bit mono PCM stored in the SDRAM mixer sample pool.
-The 8-bit API accepts signed 8-bit mono PCM and expands it to 16-bit.
-
-```c
-of_mixer_init(32, OF_MIXER_OUTPUT_RATE);             // 32 voices, 48 kHz output
-int16_t *pcm = of_mixer_alloc_samples(count * 2);    // SDRAM sample pool
-int voice = of_mixer_play((const uint8_t *)pcm, count, rate, pri, vol);
-of_mixer_set_volume(voice, 200);                     // Volume: 0-255
-of_mixer_set_pan(voice, 128);                        // 0=left, 128=center, 255=right
-of_mixer_set_loop(voice, loop_start, loop_end);      // Forward loop
-of_mixer_stop(voice);                                // Stop one voice
-of_mixer_stop_all();                                 // Stop all voices
-int active = of_mixer_voice_active(voice);           // 1 if playing, 0 if done
-```
-
-`of_mixer_pump()` is a compatibility no-op on current firmware. The
-`of_mixer_set_bidi()` and `of_mixer_set_filter()` entry points remain
-for older source compatibility, but current hardware ignores them.
-
-### Input — `of_input.h`
-
-Two controllers with d-pad, face buttons, shoulders, triggers, and analog sticks.
-
-```c
-of_input_poll();                          // Read hardware (call once per frame)
-
-/* Player 1 */
-if (of_btn(OF_BTN_A))          { ... }   // Held this frame
-if (of_btn_pressed(OF_BTN_A))  { ... }   // Just pressed (edge)
-if (of_btn_released(OF_BTN_A)) { ... }   // Just released (edge)
-
-/* Player 2 */
-if (of_btn_p2(OF_BTN_START))          { ... }
-if (of_btn_pressed_p2(OF_BTN_START))  { ... }
-```
-
-**Button constants:** `OF_BTN_UP`, `DOWN`, `LEFT`, `RIGHT`, `A`, `B`, `X`, `Y`, `L1`, `R1`, `L2`, `R2`, `L3`, `R3`, `SELECT`, `START`
-
-**Full state (sticks, triggers):**
-
-```c
-of_input_state_t state;
-of_input_state(0, &state);            // Player 0
-int16_t lx = state.joy_lx;           // Left stick X: -32768..32767
-int16_t ly = state.joy_ly;           // Left stick Y
-uint16_t lt = state.trigger_l;       // Left trigger: 0..65535
-
-of_input_set_deadzone(4000);          // Stick deadzone (default: 0)
-```
-
-### Timer — `of_timer.h` / `<time.h>` / `<unistd.h>`
-
-100 MHz hardware timer. Time queries via `<time.h>`, delays via `<unistd.h>`.
-
-```c
-#include <time.h>
-uint32_t ms = clock_ms();             // Milliseconds since boot
-uint32_t us = clock_us();             // Microseconds since boot
-
-#include <unistd.h>
-usleep(100);                          // Sleep 100 microseconds
-usleep(16000);                        // Sleep 16 ms (~60 fps frame time)
-sleep(1);                             // Sleep 1 second
-```
-
-**Periodic timer interrupt** (advanced — runs in interrupt context):
-
-```c
-of_timer_set_callback(my_func, 60);   // Call my_func at 60 Hz
-of_timer_stop();                      // Disable callback
-```
-
-### File I/O — `of_file.h`
-
-Apps register filenames at startup, then use standard C file I/O:
-
-```c
-/* Register data files (call once at startup) */
-of_file_slot_register(3, "game.dat");
-
-/* Then use standard fopen */
-FILE *f = fopen("game.dat", "rb");    // Resolves to slot 3
-fread(buf, 1, size, f);
-fclose(f);
-
-/* Or access slots directly without registration */
-FILE *f = fopen("slot:3", "rb");
-```
-
-**Low-level (bypasses stdio):**
-
-```c
-int n = of_file_read(slot_id, offset, dest, length);   // DMA read from data slot
-long sz = of_file_size(slot_id);                         // File size in bytes
-```
-
-**Idle hook** — called during DMA waits for background work (e.g., audio pump):
-
-```c
-of_set_idle_hook(my_audio_pump);      // Called by OS during bridge waits
-of_set_idle_hook(NULL);               // Disable
-```
-
-### Save Files
-
-10 persistent save slots (256 KB each), mapped to APF file IDs 10-19.
-Slot 8 is reserved for SDK/shared config and is not an app save slot.
-Dirty save files are committed through the bridge when closed.
-
-**Preferred: standard C file I/O with the save filename from the instance JSON:**
-
-```c
-FILE *f = fopen("MyGame_0.sav", "wb");
-fwrite(data, sizeof(data), 1, f);
-fclose(f);
-
-FILE *f = fopen("MyGame_0.sav", "rb");
-fread(data, sizeof(data), 1, f);
-fclose(f);
-```
-
-The aliases `"save_0"` through `"save_9"` and `"save:0"` through `"save:9"` remain available for compatibility. The SDK intentionally exposes saves through POSIX file I/O rather than a separate save API.
-
-### Terminal — `of_terminal.h`
-
-40x30 text console with CP437 character set. Useful for debug output.
-
-```c
-of_print("Hello\n");                  // Print string
-of_print_char('X');                   // Print one character
-of_print_clear();                     // Clear screen
-of_print_at(col, row);               // Move cursor (0-indexed)
-printf("Score: %d\n", score);         // Standard printf works too
-```
-
-**Box drawing (CP437, ncurses-compatible names):**
-
-```c
-of_print_char(ACS_ULCORNER);  of_print_char(ACS_HLINE);  of_print_char(ACS_URCORNER);
-of_print_char(ACS_VLINE);     of_print(" text ");         of_print_char(ACS_VLINE);
-of_print_char(ACS_LLCORNER);  of_print_char(ACS_HLINE);  of_print_char(ACS_LRCORNER);
-```
-
-Available: single-line (`ACS_VLINE`, `ACS_HLINE`, corners, tees, `ACS_PLUS`), double-line (`ACS_D_*`), block elements (`ACS_BLOCK`, `ACS_CKBOARD`), arrows (`ACS_UARROW`, etc.), symbols (`ACS_BULLET`, `ACS_DEGREE`).
-
-### Tile Engine — `of_tile.h`
-
-Hardware tile layer (64x32 tilemap of 8x8 tiles, 4bpp) plus 64 hardware sprites (8x8, 4bpp).
-
-```c
-/* Tile layer */
-of_tile_enable(1);                                    // Enable tile layer
-of_tile_scroll(scroll_x, scroll_y);                   // Pixel-level scrolling
-of_tile_set(col, row, tile_index);                    // Set one tile
-of_tile_load_map(map_data, count);                    // Load tilemap
-of_tile_load_chr(chr_data, size);                     // Load tile graphics
-
-/* Sprites */
-of_sprite_enable(1);                                  // Enable sprite layer
-of_sprite_set(id, tile, palette, flip_h, flip_v);     // Configure sprite
-of_sprite_move(id, x, y);                             // Position sprite
-of_sprite_load_chr(chr_data, size);                   // Load sprite graphics
-of_sprite_hide(id);                                   // Hide one sprite
-of_sprite_hide_all();                                 // Hide all sprites
-```
-
-### Link Cable — `of_link.h`
-
-Inter-device communication for multiplayer:
-
-```c
-int ok = of_link_send(data_32bit);         // Send 32-bit word (0=success)
-int ok = of_link_recv(&data_32bit);        // Receive 32-bit word (0=success)
-uint32_t status = of_link_status();        // Connection status
-```
-
-### Interact — `of_interact.h`
-
-Read Pocket menu options (defined in `interact.json`). Up to 64 variables.
-
-```c
-uint32_t val = of_interact_get(0);    // Read variable at index 0
-```
-
-Variable indices match `interact.json` order. The first 4 are reserved by the SDK (Analogizer, SNAC, video offsets). App-specific options start at index 4.
-
-### Analogizer — `of_analogizer.h`
-
-```c
-int enabled = of_analogizer_enabled();    // 1 if Analogizer hardware present
-uint32_t state = of_analogizer_state();   // SNAC type, video mode, offsets
-```
-
-### Audio Codec — `of_codec.h`
-
-Parse VOC and WAV audio files into raw PCM:
-
-```c
-of_codec_result_t result;
-of_codec_parse_wav(wav_data, wav_size, &result);
-// result.pcm, result.pcm_len, result.sample_rate, result.bits_per_sample, result.channels
-```
-
-### LZW Compression — `of_lzw.h`
-
-Build Engine compatible LZW compression:
-
-```c
-int32_t compressed_size = of_lzw_compress(in, in_len, out);
-int32_t decompressed_size = of_lzw_uncompress(in, comp_len, out);
-```
-
-### Cache — `of_cache.h`
-
-For advanced users. Most apps never need this.
-
-```c
-of_cache_flush_video();           // Flush D-cache for framebuffer
-of_cache_invalidate_icache();     // Invalidate I-cache (after code loading)
-```
-
-### BRAM Hot Path — `of_bram.h`
-
-Place performance-critical functions in on-chip BRAM for zero-wait-state execution (~55 KB available). Normal code runs from SDRAM with cache; BRAM code has guaranteed zero-cycle latency.
-
-```c
-#include "of.h"
-
-OF_FASTTEXT void inner_loop(void) {
-    /* Runs from BRAM — no cache misses */
-}
-
-OF_FASTDATA int lookup_table[256];       // Initialized data in BRAM
-OF_FASTRODATA const int constants[16];   // Read-only data in BRAM
-
-int main(void) {
-    inner_loop();    // Direct call to BRAM address
-}
-```
-
-The linker places `OF_FASTTEXT` code in BRAM (VMA 0x2000-0xFE00) with load data in SDRAM. The OS copies it to BRAM at app startup. No runtime API needed — just annotate functions.
-
-### Version — `of_version.h`
-
-```c
-uint32_t v = of_get_version();     // Runtime API version from kernel
-// OF_API_VERSION_MAJOR, OF_API_VERSION_MINOR, OF_API_VERSION_PATCH
-```
+## How a game is laid out
+
+The Pocket's launcher binds files to numbered **data slots** defined in
+`Cores/ThinkElastic.ScummVM/data.json`. An **instance JSON** says which file
+goes in which slot for one game; the port reads them at boot by scanning the
+mounted root.
+
+| Slot | Contents | Filename | Notes |
+|---|---|---|---|
+| 0 | Instance manifest | `<Game>.json` | The launcher entry itself |
+| 1 | OS kernel | `os.bin` | Shared, shipped by the core |
+| 2 | OS / launch config | `<game>_os.ini` | Per-game; `[os]` + `[scummvm]` (see below) |
+| 3 | Engine binary | `scummvm.elf` | Shared, built from source |
+| 4 | **Game data** | `<game>.iso` / `.zip` / `.cue` | **You provide this** |
+| 5 | MIDI sound bank | `bank.ofsf` | Shared soundfont for the synth |
+| 7 | Raw disc image | `<game>.bin` | Only for `.cue`/`.bin` games (paired with slot 4) |
+| 9 | ScummVM settings | `<game>.ini` | Non-volatile, 256 KB |
+| 10–18 | Save slots 0–8 | `<game>_0.sav` … `<game>_8.sav` | Non-volatile, 256 KB each — **9 saves** |
+
+Slots 9–18 are non-volatile flash regions, written transparently as you play.
+Delete the `.sav` files to wipe saves.
 
 ---
 
-## Instance JSON
+## Adding a game
 
-Each app has an `instance.json` that maps filenames to data slots. This is the only config file you maintain — all core JSON configs (data.json, audio.json, video.json, etc.) are SDK-owned and deployed automatically.
+A game needs three things on the SD card: a **launch config** (slot 2), an
+**instance JSON** (slot 0), and a **data file** (slot 4). The five instances
+this core ships are the templates — copy one and change the names.
+
+### 1. Write the launch config — `<game>_os.ini`
+
+Plain INI, lives in `Assets/scummvm/common/`. The `[os]` section tells the
+launcher which ELF to run; the `[scummvm]` section is read by the port at boot
+(`main.cpp`) to pick the game and how to mount its data.
+
+```ini
+[os]
+ELF=scummvm.elf
+ARGS=monkey
+
+[scummvm]
+gameid=monkey
+engineid=scumm
+description=The Secret of Monkey Island
+platform=pc
+language=en
+music=openfpga
+variant=SE
+data_file=monkey1.iso
+cd_track_offset=0
+voices=true
+```
+
+**`[scummvm]` keys** (max lengths in parentheses):
+
+| Key | Required | Default | Meaning |
+|---|---|---|---|
+| `gameid` (31) | **yes** | — | ScummVM canonical id: `monkey`, `monkey2`, `tentacle`, `atlantis`, `loom`, `maniac`, `zak`, … |
+| `engineid` (31) | no | `scumm` | Always `scumm` in this build |
+| `description` (95) | no | `gameid` | Name shown while booting |
+| `platform` (15) | no | `pc` | `pc`, `amiga`, `mac` — affects resource detection |
+| `language` (7) | no | `en` | ISO 639-1 code: `en`, `de`, `fr`, `es`, `it`, `ja`, … |
+| `music` (15) | no | `openfpga` | `openfpga` = hardware-PCM sample synth (`bank.ofsf`) |
+| `variant` (15) | no | *(auto)* | Pin a variant from ScummVM's table: `SE`, `VGA`, `EGA`, `""` = first match |
+| `data_type` (7) | no | `""` | `""` = ISO/ZIP; `cue` = raw BIN/CUE disc |
+| `data_file` (159) | no | — | Slot-4 filename: must match what you drop on the SD |
+| `cue_file` (159) | no | — | `.cue` member path when `data_file` is a ZIP wrapping a CUE/BIN pair |
+| `subdir` (63) | no | `""` | Subdirectory for compilation discs (e.g. one ISO, many games) |
+| `cd_track_offset` | no | `0` | Added to every CD track number (compilation discs renumber tracks) |
+| `voices` | no | `false` | Enable SE remastered speech (MI1/MI2 only; needs `variant=SE` + `Speech.xwb` on the disc) |
+
+The port does **not** run ScummVM's MD5 auto-detection (it would stall the
+boot link). The config above is authoritative — a wrong `gameid`/`variant`
+picks the wrong game or fails to start.
+
+### 2. Write the instance JSON — `<Game>.json`
+
+Lives in `Assets/scummvm/ThinkElastic.ScummVM/`. The filename is what the
+launcher shows. It just maps slots to filenames:
 
 ```json
 {
@@ -614,300 +156,271 @@ Each app has an `instance.json` that maps filenames to data slots. This is the o
         "magic": "APF_VER_1",
         "variant_select": { "id": 666, "select": false },
         "data_slots": [
-            { "id": 1, "filename": "os.bin" },
-            { "id": 2, "filename": "mygame.elf" },
-            { "id": 3, "filename": "music.mod" },
-            { "id": 10, "filename": "mygame.sav" }
+            { "id": 1,  "filename": "os.bin"         },
+            { "id": 2,  "filename": "monkey1_os.ini" },
+            { "id": 3,  "filename": "scummvm.elf"    },
+            { "id": 4,  "filename": "monkey1.iso"    },
+            { "id": 5,  "filename": "bank.ofsf"      },
+            { "id": 9,  "filename": "monkey1.ini"    },
+            { "id": 10, "filename": "monkey1_0.sav"  },
+            { "id": 11, "filename": "monkey1_1.sav"  },
+            { "id": 12, "filename": "monkey1_2.sav"  },
+            { "id": 13, "filename": "monkey1_3.sav"  },
+            { "id": 14, "filename": "monkey1_4.sav"  },
+            { "id": 15, "filename": "monkey1_5.sav"  },
+            { "id": 16, "filename": "monkey1_6.sav"  },
+            { "id": 17, "filename": "monkey1_7.sav"  },
+            { "id": 18, "filename": "monkey1_8.sav"  }
         ]
     }
 }
 ```
 
-When there's only one instance JSON for your app, the Pocket auto-selects it — no file picker is shown.
+For a `.cue`/`.bin` game, point slot 4 at the `.cue` and add slot 7 for the
+`.bin`:
 
-### Data Slot Layout
+```json
+{ "id": 4, "filename": "monkey1.cue" },
+{ "id": 7, "filename": "monkey1.bin" },
+```
 
-| Slot ID | Name | Purpose |
-|---------|------|---------|
-| 0 | Game | Instance selector (SDK-owned in data.json) |
-| 1 | OS Binary | `os.bin` — loaded by bootloader via DMA |
-| 2 | Application | Your app ELF — loaded by OS kernel |
-| 3-6 | Data 1-4 | App data files (WAD, GRP, images, audio, etc.) |
-| 7 | Sound Bank | Optional `.ofsf` SoundFont bank for MIDI |
-| 8 | Shared Config | SDK/system-owned nonvolatile config, 256 KB |
-| 10-19 | Save 0-9 | Nonvolatile CRAM0 save slots (256 KB each) |
+### 3. Provide the game data (slot 4)
 
-**Rules:**
-- Slot 0 (Game selector) is defined in the SDK's `data.json` — don't add it to your instance
-- Slot 8 is reserved by the SDK/system — do not use it for app data or saves
-- Save slots use bridge address `0x20100000` (CRAM0 save window) with 256 KB stride
-- Place data files in your app directory — copy copies them to the SD card
+Three delivery formats are supported. Drop the file alongside the instance JSON
+at `Assets/scummvm/ThinkElastic.ScummVM/`.
+
+- **ISO 9660** (`.iso`) — the kernel mounts it at `/cd` and the engine reads it
+  as a normal directory. Best for CD games. **Recommended.**
+- **CUE + BIN** (`.cue` + `.bin`) — a `MODE1/2352` data track plus Red Book
+  audio tracks, for games whose music is CD audio (see
+  [Creating game ISOs](#creating-game-isos)).
+- **ZIP** (`.zip`, **STORE / `-0`**) — a no-compression archive read in place
+  via ScummVM's `SearchMan`. Good for loose-folder distributions (GOG/Steam
+  extracts). Entries must be stored, not deflated. Files ≤ 16 MB are pulled
+  into RAM on first access; larger files are streamed from the SD.
+
+> **Size cap:** a single slot file must stay under ~2 GB. If a game is bigger,
+> split it across a second data slot or trim unused assets.
 
 ---
 
-## UART Development (PHDP)
+## Creating game ISOs
 
-The **Pocket-Host Debug Protocol** streams binaries over UART at 2 Mbaud, bypassing the SD card for rapid iteration. Requires a DevKey cartridge connected via USB-UART adapter.
+The port ships pure-Python ISO/CUE builders (no `mkisofs`, `xorriso`, or
+`pycdlib` needed) plus a turnkey script for the Monkey Island Special Editions.
 
-### Architecture
+### Roll your own from a folder of game files
 
-Two host-side tools in `src/tools/phdp/`:
+```sh
+# Bare ISO 9660 image (keeps full, untruncated filenames):
+scripts/lib_iso9660.py monkey1.iso SCUMMVM  monkey1.000 monkey1.001 ...
 
-- **`phdpd`** — background daemon that owns the UART connection and manages protocol state
-- **`phdp`** — CLI client that talks to the daemon via Unix socket
-
-### Workflow
-
-```bash
-# Start the daemon (once)
-phdpd                               # auto-detects /dev/ttyUSB0
-phdpd -d /dev/ttyACM0               # or specify device
-
-# Queue files for the next boot
-phdp push --slot 1 build/Assets/openfpgaos/common/os.bin
-phdp push --slot 2 build/Assets/openfpgaos/common/myapp.elf
-
-# Reboot the core and stream
-phdp reset
-phdp wait                           # blocks until OS is running
-phdp logs                           # tail console output
+# Or a CUE/BIN disc with CD-audio tracks (track2.wav, track3.wav = Red Book PCM):
+python3 - <<'PY'
+from scripts.lib_cuebin import build_cuebin
+build_cuebin("monkey1.bin", "monkey1.cue", "monkey1.iso",
+             [(2, "track2.wav"), (3, "track3.wav")])
+PY
 ```
 
-### Protocol phases
+`lib_iso9660.py` writes a sector-aligned ISO 9660 Level 1 image and preserves
+long names (`speech.info` → `SPEECH.INF;1`, not truncated), which the engine
+needs. `lib_cuebin.py` wraps that ISO as track 1 (`MODE1/2352`) and appends
+44.1 kHz / 16-bit stereo PCM audio tracks.
 
-1. **Discovery** (250ms) — Pocket broadcasts `EVT_BOOT_ALIVE` over UART. If no host responds, boots from SD.
-2. **Override** (200ms per slot) — before loading each data slot, Pocket asks the host. Host responds with `RES_STREAM` (send over UART) or `RES_USE_SD` (load from SD).
-3. **Streaming** — host sends `DATA_CHUNK` packets (up to 512B), Pocket ACKs with `REPORT_PROGRESS`. CRC-16/CCITT on every packet.
-4. **Monitoring** — after `EVT_EXEC_START`, terminal output is mirrored to UART as raw ASCII.
+If you already have a real CD, a plain rip works too:
 
-### CLI commands
-
-| Command | Description |
-|---------|-------------|
-| `phdp status` | Connection state, queued slots, transfer progress |
-| `phdp push --slot N file` | Queue binary for slot N |
-| `phdp clear [--slot N]` | Clear queued overrides |
-| `phdp reset` | Reboot the RISC-V core |
-| `phdp wait` | Block until OS is running |
-| `phdp logs [--last N]` | Tail or show last N lines of console output |
-
-### Building PHDP tools
-
-```bash
-make tools                          # build phdpd + phdp
-cd src/tools/phdp
-sudo make install                   # install to /usr/local/bin
+```sh
+dd if=/dev/sr0 of=mygame.iso bs=2048      # data-only games
 ```
 
-### Typical dev loop
+Verify any image in **desktop ScummVM** before deploying.
 
-```bash
-make                                # rebuild your app
-./scripts/debug.sh src/mygame/mygame.elf
+### Special Edition: MI1 / MI2
+
+`scripts/build_monkey_iso.sh` turns the **Steam Special Edition** install into
+port-playable ISOs with SE voices — no transcoding of speech, because the
+on-device decoders handle the SE banks directly (MI1 `Speech.xwb` = PCM,
+MI2 = MS-ADPCM):
+
+```sh
+scripts/build_monkey_iso.sh all \
+    --mi1-dir "/path/to/Monkey Island 1 SE" \
+    --mi2-dir "/path/to/Monkey Island 2 SE" \
+    --out ./build/monkey
+# → build/monkey/monkey1.iso, build/monkey/monkey2.iso
 ```
 
-`debug.sh` starts the daemon if needed, clears pending slots, pushes the file (auto-detects slot 1 for `os.bin`, slot 2 for app ELFs), resets the core, and streams console output until Ctrl+C.
+What it does:
+
+- Slims each `monkey?.pak` DoubleFine container down to the classic data
+  (~5 MB) and ships it whole — the `variant=SE` flag makes the engine read
+  resources from the `.pak` and inject the SE speech over the classic scripts.
+- **MI1 music:** the SE music bank is xWMA, which the port **cannot decode at
+  runtime** (the WMA Pro path is a stub). The script decodes it **offline** with
+  `ffmpeg` into `track%d.wav`, and the engine plays those as classic CD audio.
+  Without `ffmpeg` the ISO still builds — just music-less.
+- **MI2 music:** untouched — it is iMUSE AdLib/MT-32 MIDI through the openfpga
+  synth, independent of the SE audio.
+
+Match the build with `variant=SE` and `voices=true` in the game's
+`<game>_os.ini` (the shipped `monkey1_os.ini` / `monkey2_os.ini` already do).
 
 ---
 
-## Memory Map
+## Controls
+
+The Pocket has no keyboard or mouse, so the gamepad drives a virtual cursor and
+the common adventure-game keys:
+
+| Input | Action |
+|---|---|
+| D-pad / analog stick | Move mouse cursor |
+| Hold **L1** / **R1** while moving | Slow / fast cursor |
+| **A** | Left click (walk / interact) |
+| **B** | Right click (default verb / inventory) |
+| **X** | Enter / Return |
+| **Y** | Space (skip cutscene / pause) |
+| **START** | F5 (in-game save/load menu) |
+| **SELECT** (hold) + D-pad ↑/↓ | Master volume |
+| **SELECT** (hold) + D-pad ←/→ | Music volume |
+| **SELECT** (tap) | Toggle numeric keypad (for typed copy-protection codes) |
+
+In **keypad mode**, the buttons map to digits (D-pad ↑↓←→ = 1/2/3/4, A/B/X/Y =
+5/6/7/8, L1/R1 = 9/0, START = Enter) so games that demand a typed code are
+playable. Copy protection is disabled by default (`copy_protection=false`); set
+it to `true` in the game's `.ini` to re-enable the original dial/code screens.
+
+---
+
+## Audio
+
+- **MIDI (iMUSE / AdLib):** music routes through a sample-based synth driven by
+  the `bank.ofsf` soundfont (slot 5) and the Pocket's 32-voice hardware PCM
+  mixer. General MIDI / GS programs, percussion (channel 10), volume, pan,
+  expression, sustain, pitch bend, and reverb/chorus sends are honoured. If no
+  bank is present, ScummVM falls back to its built-in OPL3 (AdLib) emulator.
+- **CD audio:** Red Book tracks from `.cue`/`.bin` images (or the offline-decoded
+  SE `track%d.wav` files) stream through the mixer at 44.1 kHz, resampled to
+  48 kHz.
+- **Digital speech:** standard SCUMM `.SOU` / `MONSTER.SOU` (DOTT, Atlantis) and
+  the SE speech banks decode on-device.
+- **Mixing:** ScummVM's software mixer feeds a 48 kHz stereo stream out through
+  the SDK audio ring. To avoid heap corruption in malloc-heavy games, audio is
+  pumped from the main thread (during engine sleeps and screen updates) rather
+  than an interrupt, which trades ~120 ms of latency for gapless, crash-free
+  playback.
+
+**Not supported:** runtime **xWMA / WMA Pro** decoding (the SE music banks —
+decode them offline as above), and **MT-32** emulation (MT-32-specific SysEx is
+ignored; games fall back to GM/AdLib).
+
+---
+
+## Saves and config
+
+- **Saves:** 9 slots, one per non-volatile flash region (slots 10–18, 256 KB
+  each). Save/load from inside the game (START → F5, or game-specific menus).
+  Each `.sav` carries a small header (`'SVMS'` magic, original ScummVM filename,
+  length) followed by the payload; max ~262 KB per save.
+- **Config:** the per-game `<game>.ini` (slot 9) holds ScummVM's settings.
+  **Runtime persistence is disabled** on this port (writing config mid-session
+  starved the launcher's UART pump), so volume/option changes you make in-game
+  last for the session only. To change a setting permanently, edit the `.ini`
+  on the SD card before booting.
+
+---
+
+## Limitations
+
+- **Engines:** SCUMM **v0–v6** only. No v7/v8 (Curse of Monkey Island, The Dig,
+  Full Throttle), no Humongous Entertainment, no Sierra SCI, no GrimE. Those
+  sources are dropped from the build.
+- **Resolution:** fixed **320×240, 8-bit indexed**. 320×200 games are
+  letterboxed; anything larger (640×480 hi-res SCUMM) is clamped and unplayable.
+  No aspect-ratio correction, no scalers, no overlay/in-game GUI theme.
+- **Compressed resources:** zlib/inflate is stubbed — games that store data in
+  compressed archives won't load.
+- **SE remastered audio:** the *graphics* are classic-mode only; SE *music*
+  must be decoded offline at build time (no runtime xWMA).
+- **MT-32:** not emulated.
+- **No on-device launcher / save dialog:** game choice happens in the Pocket's
+  core menu (one instance per game); the original ScummVM save UI is disabled
+  (it depends on theme assets this build doesn't ship) — use F5 from inside the
+  game.
+- **Config not persisted** across sessions (edit the `.ini` on the SD instead).
+- **Memory:** 64 MB SDRAM with fixed per-subsystem pools; the tested LucasArts
+  classics fit comfortably, but there is no graceful out-of-memory recovery.
+- **2 GB** maximum per slot file.
+
+---
+
+## Building from source
+
+Prerequisite: a RISC-V toolchain (`riscv64-elf-gcc`) **or** Docker. The build
+also needs the vendored ScummVM submodule — the Makefile fetches it
+automatically on first build (one-time, needs network), or run
+`git submodule update --init src/scummvm/scummvm` yourself.
+
+**With a host toolchain** — `make setup` (in the parent SDK) installs one on
+Arch / Debian / Fedora / macOS / NixOS / MSYS2:
+
+```sh
+make build CORE=scummvm
+make copy  CORE=scummvm          # POCKETDEV=/path to target a specific SD card
+```
+
+**With Docker (no host toolchain)** — prefix the port's build target with
+`container-`; the wrapper runs `make` inside the `openfpgaos-firmware` image
+(toolchain + musl pre-installed), building the image once on first use:
+
+```sh
+cd src/scummvm
+make container-all               # compiles scummvm.elf and the SD tree in Docker
+cd ../..
+make copy CORE=scummvm           # rsync to the SD card (runs on the host)
+```
+
+The submodule fetch always runs on the host even for `container-*` targets (the
+container has no network), so the first `make container-all` may pause to clone
+ScummVM. `make copy` only moves files, so it never needs the toolchain — run it
+on the host either way. Other useful targets: `make package CORE=scummvm`
+(build a distributable ZIP) and `make release CORE=scummvm` (draft a GitHub
+release, tag `scummvm-v<version>` from `core.json`).
+
+The build expects the openfpgaOS SDK side-by-side; this tree pulls headers,
+musl libc, and the `os.bin` kernel from there (update with `git pull`).
+
+---
+
+## Repository layout
 
 ```
-0x00000000 ┌──────────────────────┐
-           │ BRAM (32 KB)         │
-           │ 0x0000-0x1FFF: OS    │  Boot, trap handler
-           │ 0x2000-0x7DFF: App   │  OF_FASTTEXT (~24 KB)
-           │ 0x7E00-0x7FFF: Stack │  Trap frame
-0x00008000 ├──────────────────────┤
-           │                      │
-0x10300000 ├──────────────────────┤
-           │ OS Kernel (SDRAM)    │  ~128 KB
-0x10400000 ├──────────────────────┤
-           │ App Code + Data      │  Up to 48 MB
-           │ (loaded from ELF)    │
-0x13400000 ├──────────────────────┤
-           │ App heap / mmap      │
-0x13700000 ├──────────────────────┤
-           │ Mixer Sample Pool    │  8 MB SDRAM
-0x13F00000 ├──────────────────────┤
-           │ Runtime reserve      │  Stack / cache-evict area
-0x13FFFFFF └──────────────────────┘
-
-0x20100000   CRAM0 bridge save window: Save slots (10 x 256 KB)
-0x20380000   CRAM0 bridge shared config slot: 256 KB
+src/scummvm/                    port build root
+  main.cpp                      boot, slot discovery, config parse, engine launch
+  config.h                      enabled engines (SCUMM v0–v6 only)
+  backend/                      OSystem, mixer, MIDI synth, FS, save manager,
+                                CUE/ISO archives, audio CD
+  scummvm/                      vendored ScummVM tree (git submodule)
+dist/scummvm/                   core layout copied to the SD by `make copy`
+  Cores/ThinkElastic.ScummVM/   data.json (slots) + core/interact/input JSON + icon
+  Assets/scummvm/
+    common/                     shared bank.ofsf + per-game <game>_os.ini
+    ThinkElastic.ScummVM/       per-game instance JSONs (and your data files)
+scripts/                        packaging + ISO/CUE builders:
+  build_monkey_iso.sh           MI1/MI2 SE → playable ISOs (with voices)
+  lib_iso9660.py, lib_cuebin.py pure-Python ISO 9660 / CUE-BIN writers
+  lib_xwb.py, build_mi1_*.py    XACT wave-bank tooling for SE audio
+tools/
+  docker/Dockerfile.firmware    containerized RISC-V toolchain image
+  sdk-container.sh              `container-*` build wrapper
+  wmapro_test/                  PC-side WMA Pro decoder test harness
 ```
 
 ---
 
-## Multiplatform
+## License
 
-The SDK is designed for multiple hardware targets. Platform-specific logic — JSON templates, copy scripts, directory layout — lives in `src/sdk/platforms/<target>/`.
-
-```
-src/sdk/platforms/
-├── pocket/                  ← Analogue Pocket (current)
-│   ├── templates/*.json     ← APF JSON config templates
-│   └── copy.sh            ← SD card copy script
-└── mister/                  ← MiSTer FPGA (planned)
-    ├── templates/            ← MiSTer-specific configs
-    └── copy.sh             ← MiSTer copy script
-```
-
-Your C code is the same across all platforms. When creating an app:
-
-```bash
-make core                               # default: pocket
-make core --target mister              # future: MiSTer
-```
-
----
-
-## Makefile Targets
-
-### From your app directory (`src/<app>/`)
-
-| Command | What it does |
-|---------|-------------|
-| `make` | Build your app |
-| `make debug` | Build, push via UART, stream console |
-| `make copy` | Copy to Pocket SD card |
-| `make package` | Package core into a ZIP |
-| `make test` | Test on desktop (SDL2) |
-| `make clean` | Remove build artifacts |
-
-### From the demos directory (`src/apps/`)
-
-| Command | What it does |
-|---------|-------------|
-| `make` | Build all demos |
-| `make new APP=demo` | Create a new demo app |
-| `make copy` | Copy SDK + demos to SD card |
-| `make package` | Package SDK core into a ZIP |
-| `make clean` | Remove build artifacts |
-
-### From the repo root
-
-| Command | What it does |
-|---------|-------------|
-| `make setup` | Install RISC-V toolchain |
-| `make core` | Create your app (interactive) |
-| `make build` | Build everything |
-| `make build APP=<app>` | Build sdk or a specific app |
-| `make debug APP=<app>` | Build, push via UART, stream console |
-| `make copy` | Copy everything to SD card |
-| `make copy APP=<app>` | Copy sdk or a specific app |
-| `make tools` | Build PHDP host tools |
-| `make package` | Package all cores into ZIPs |
-| `make clean` | Remove all build artifacts |
-
----
-
-## Scripts
-
-| Script | What it does |
-|--------|-------------|
-| `scripts/setup.sh` | Detects OS, installs RISC-V toolchain |
-| `scripts/new.sh` | Creates a new app (Makefile, main.c) |
-| `scripts/customize.sh` | Creates a standalone core for distribution (interactive) |
-| `scripts/copy.sh` | Copies build/ to Pocket SD card |
-| `scripts/debug.sh` | Push binary via UART, reset core, stream output |
-| `scripts/package.sh` | ZIPs a core for distribution |
-
----
-
-## Packaging for Distribution
-
-When your app is ready to ship as its own Pocket menu entry:
-
-### Packaging and distribution
-
-```bash
-make                                   # build
-./scripts/package.sh MyGame            # creates releases/MyGame-v1.0.0.zip
-```
-
-Users extract the ZIP to their SD card root.
-
----
-
-## Porting Existing Apps
-
-For larger ports (Duke Nukem, Doom, etc.) that carry their own build system:
-
-1. Copy `src/sdk/include/`, `src/sdk/musl/`, and `src/sdk/sdk.mk` into your repo as `sdk/`
-2. Copy `src/sdk/app.ld`
-3. Write a `posix_shim.c` with app-specific stubs
-4. Use `sdk/of_posix.c` for POSIX I/O (`open`/`read`/`write`/`lseek`)
-5. Register data files: `of_file_slot_register(3, "game.grp")`
-
-**Important for POSIX I/O:** The kernel uses riscv32 `_llseek` (5-argument convention). Your `lseek()` wrapper must pass `(fd, off_hi, off_lo, &result, whence)` via syscall 62, not the traditional 3-argument form. See `src/sdk/include/of_posix.c` for the reference implementation.
-
----
-
-## Project Structure
-
-```
-openfgpaSDK/
-├── Makefile              <- Top-level: build, copy, debug, package
-├── GETTING_STARTED.md    <- Quick start guide for developers
-├── src/
-│   ├── <mygame>/         <- YOUR app (created by make core)
-│   │   └── main.c        <- Your code + Makefile
-│   ├── apps/             <- Bundled demo apps (SDK-owned)
-│   │   ├── bramdemo/     <- BRAM hot-path benchmarking
-│   │   ├── celeste/      <- Full game example
-│   │   ├── colordemo/    <- Video color mode demo (all 6 modes)
-│   │   ├── cray/         <- Real-time C raytracer
-│   │   ├── cxxdemo/      <- C++ classes, templates, iostream
-│   │   ├── fbdemo/       <- PNG framebuffer display
-│   │   ├── interactdemo/ <- Pocket menu variables
-│   │   ├── memdemo/      <- memset/memcpy throughput benchmark
-│   │   ├── mididemo/     <- Sample-based MIDI playback
-│   │   ├── moddemo/      <- MOD/tracker music playback
-│   │   ├── savea/        <- Save slot integrity test
-│   │   ├── saveb/        <- Save cross-pollution test
-│   │   ├── slotdemo/     <- File slot registry display
-│   │   ├── testdemo/     <- Kernel test suite (182 assertions)
-│   │   ├── triplebuf/    <- Triple-buffer framebuffer demo
-│   │   └── wavdemo/      <- WAV audio playback
-│   └── sdk/              <- Headers, musl libc, build rules (SDK-owned)
-│       ├── include/      <- openfpgaOS API headers
-│       ├── musl/         <- bundled musl C library + linker script
-│       ├── platforms/    <- Platform templates & copy scripts
-│       │   └── pocket/   <- Analogue Pocket target
-│       └── pc/           <- SDL2 shim for desktop builds
-├── dist/                 <- Static core configs (SD card layout)
-│   ├── sdk/              <- SDK core (Cores/, Assets/, Platforms/)
-│   └── <mygame>/         <- Your app's core (created by make core)
-├── scripts/              <- Build/copy/packaging scripts (SDK-owned)
-└── runtime/              <- FPGA bitstream, OS binary, loader (SDK-owned)
-```
-
-### What you change vs. what the SDK owns
-
-| Yours (edit freely) | SDK-owned (updated via git pull) |
-|---------------------|----------------------------------|
-| `src/<mygame>/` (your code) | `src/sdk/` (headers, build rules) |
-| `dist/<mygame>/` (your core configs) | `dist/sdk/` (SDK core configs) |
-| | `src/apps/` (demo apps) |
-| | `runtime/` (bitstream, os.bin) |
-| | `scripts/` |
-
-Core JSON configs in `dist/sdk/` are SDK-owned. Your app's configs live in `dist/<mygame>/` (created by `make core`). Both get assembled into `build/` at build time.
-
----
-
-## Updating the SDK
-
-```bash
-git pull                              # or: git fetch sdk-upstream && git merge sdk-upstream/main
-make clean && make                    # rebuild
-```
-
-SDK-owned files (headers, core configs, runtime, templates) update automatically. Your app source and instance.json are never touched.
-
----
-
-## Reference
-
-This SDK builds apps for [openfpgaOS](https://github.com/openfpgaOS/openfpgaOS) — a RISC-V operating system running on the Analogue Pocket's Cyclone V FPGA. The openfpgaOS repo is the source of truth for API headers and the OS kernel. See that repo for architecture details, FPGA design, and OS internals.
+ScummVM is GPLv3; this port inherits it — see
+`src/scummvm/scummvm/COPYING`. The openfpgaOS SDK (kernel, headers, libc) is
+licensed separately; see its repository.

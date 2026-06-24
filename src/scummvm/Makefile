@@ -28,6 +28,26 @@ APP_LD    = $(SDK_DIR)/app.ld
 # crti/crtn bracket .init/.fini for static constructors.
 CRT_OBJS = $(MUSL_DIR)/lib/crt1.o $(MUSL_DIR)/lib/crti.o $(MUSL_DIR)/lib/crtn.o
 
+# ── ScummVM submodule guard ─────────────────────────────────────────
+# Upstream ScummVM lives in a git submodule at $(SCUMMVM)/.  The source
+# lists further down are built with $(wildcard $(SCUMMVM)/...), which make
+# expands while it *parses* this file -- so the submodule has to be on disk
+# before those lines are read, or every SCUMMVM_* list comes out empty and
+# the link silently produces a stub binary with no clear error.  If the
+# sentinel header is missing, check the submodule out now (one-time; needs
+# network + the parent .git).  This runs on the host even for the
+# `make container-*` targets, because make always parses the whole Makefile
+# on the host before delegating into the container, and the container has
+# no network -- so the fetch must happen here, not inside it.
+SCUMMVM_SENTINEL := $(SCUMMVM)/common/scummsys.h
+ifeq ($(wildcard $(SCUMMVM_SENTINEL)),)
+$(info [scummvm] submodule not checked out -- fetching $(SCUMMVM) (one-time)...)
+$(info $(shell git -C $(CURDIR) submodule update --init -- $(SCUMMVM) 2>&1))
+endif
+ifeq ($(wildcard $(SCUMMVM_SENTINEL)),)
+$(error ScummVM submodule missing at '$(SCUMMVM)/'. Auto-fetch failed (no network?). Run on a networked host: git submodule update --init src/scummvm/scummvm)
+endif
+
 # ── Compiler flags ──────────────────────────────────────────────────
 COMMON_FLAGS  = -march=$(ARCH) -mabi=$(ABI) -Os -Wall
 COMMON_FLAGS += -ffunction-sections -fdata-sections
@@ -305,3 +325,19 @@ clean:
 .PHONY: all release copy package debug clean
 
 .PHONY: all clean
+
+# ── Containerized build (no host RISC-V toolchain needed) ────────────
+# This port Makefile is standalone (it doesn't include sdk.mk), so it
+# carries its own copy of the container passthrough.  Prefix any target
+# with `container-` and the SDK container wrapper runs `make <target>`
+# inside the openfpgaos-firmware image (toolchain + musl pre-installed),
+# so a fresh checkout needs only Docker — no host riscv64 toolchain.
+#
+# Examples:
+#     make container-all      → runs `make all` in the container
+#     make container-app.elf  → runs `make app.elf` in the container
+#     make container-clean    → cleans inside the container
+SDK_CONTAINER ?= $(ROOT)/tools/sdk-container.sh
+container-%:
+	@bash $(SDK_CONTAINER) make -f $(firstword $(MAKEFILE_LIST)) $*
+.PHONY: container-%
