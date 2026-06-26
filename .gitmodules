@@ -1,3 +1,0 @@
-[submodule "src/scummvm/scummvm"]
-	path = src/scummvm/scummvm
-	url = https://github.com/scummvm/scummvm.git
