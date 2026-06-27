@@ -91,9 +91,13 @@ C_RESET :=
 endif
 
 # ── Display name (detected custom core or <core> placeholder) ───────
-# Truncate to 10 chars with ... if too long, to keep help aligned
+# Truncate to 10 chars with ... if too long, to keep help aligned.
+# Kept POSIX + GNU Make 3.81 safe (the make Apple ships): no `#` (3.81
+# treats it as a comment even inside $(shell ...), eating the closing
+# paren), no `)` in the shell body (make matches parens), and no bashism
+# like $${n:0:7} (the $(shell) runs under /bin/sh).
 ifneq ($(APP_NAME),)
-A := $(shell n="$(APP_NAME)"; [ $${#n} -gt 10 ] && echo "$${n:0:7}..." || echo "$$n")
+A := $(shell n="$(APP_NAME)"; if [ `printf %s "$$n" | wc -c` -gt 10 ]; then printf %s "`printf %s "$$n" | cut -c1-7`..."; else printf %s "$$n"; fi)
 else
 A := <core>
 endif

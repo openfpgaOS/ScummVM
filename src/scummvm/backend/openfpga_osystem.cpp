@@ -98,10 +98,15 @@ void OpenFPGAGraphicsManager::initSize(uint width, uint height, const Graphics::
     _screenDirty = true;
 
     /* Game graphics only -- main() will flip to FRAMEBUFFER right
-     * before engine->run().  Configure the color mode and clear here. */
+     * before engine->run().  Re-assert the 8-bit mode here, but do NOT
+     * clear/flip: the engine calls initSize() at the very start of
+     * run(), long before its slow data load finishes and it pushes a
+     * first frame.  Clearing here (and via the legacy of_video_flip path,
+     * which also desyncs the GPU triple-buffer rotation set up by the
+     * splash) would blank the ScummVM logo for the whole load.  Leave the
+     * splash on the framebuffer; the first updateScreen() replaces it
+     * (clearFrameBorders + full-screen copy handle the size change). */
     configureFramebufferMode();
-    of_video_clear(0);
-    of_video_flip();
 }
 
 void OpenFPGAGraphicsManager::setPalette(const byte *colors, uint start, uint num) {
