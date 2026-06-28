@@ -114,6 +114,18 @@ private:
     uint32 _videoFence;
     uint32 _gpuCleanMask;
 
+    /* GPU stall guard.  When the platform menu (Pocket "Core Settings") is
+     * open the display controller stops retiring GPU fences.  The per-frame
+     * fence wait in clearFrameBorders() would then spin ~5 s and trap
+     * (of_gpu_wait -> __builtin_trap -> ebreak), and any further command
+     * emission would eventually hang forever on of_gpu's unbounded ring-space
+     * spin.  When a bounded wait times out we latch _gpuStalled, stop emitting
+     * GPU commands, and present nothing.  Each frame we re-probe the pending
+     * fence (a plain MMIO read -- no ring writes); once it retires the menu
+     * has closed and the display is live again, so rendering auto-resumes. */
+    bool _gpuStalled;
+    uint32 _gpuStallToken;
+
     /* True from showSplash() until the engine pushes its first real frame.
      * While set, initSize() must NOT blank the display so the logo stays up
      * through the engine's slow data load. */
@@ -121,6 +133,9 @@ private:
 
     void ensureGpuReady();
     uint8_t *acquireFrameBuffer();
+    /* Bounded, non-fatal replacement for of_gpu_wait(): returns true when the
+     * fence retired, false on timeout (caller latches the GPU as stalled). */
+    bool waitGpuFenceBounded(uint32 token);
     void clearFrameBorders(uint8_t *fb, uint fbW, uint fbH, uint fbStride,
                            int xOff, int yOff, uint copyW, uint copyH);
     void presentFrame();

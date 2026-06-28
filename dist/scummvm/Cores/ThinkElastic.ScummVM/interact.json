@@ -169,66 +169,6 @@
                     "adjust_small": 1,
                     "adjust_large": 4
                 }
-            },
-            {
-                "name": "App Option 1",
-                "id": 100,
-                "type": "list",
-                "enabled": true,
-                "persist": true,
-                "address": "0x03FE0000",
-                "defaultval": 0,
-                "mask": "0xFFFFFFFF",
-                "options": [
-                    {
-                        "value": "0x00",
-                        "name": "Off"
-                    },
-                    {
-                        "value": "0x01",
-                        "name": "On"
-                    }
-                ]
-            },
-            {
-                "name": "App Option 2",
-                "id": 101,
-                "type": "slider_u32",
-                "enabled": true,
-                "persist": true,
-                "address": "0x03FE0004",
-                "defaultval": 5,
-                "graphical": {
-                    "signed": false,
-                    "min": 0,
-                    "max": 10,
-                    "adjust_small": 1,
-                    "adjust_large": 2
-                }
-            },
-            {
-                "name": "App Option 3",
-                "id": 102,
-                "type": "list",
-                "enabled": true,
-                "persist": true,
-                "address": "0x03FE0008",
-                "defaultval": 0,
-                "mask": "0xFFFFFFFF",
-                "options": [
-                    {
-                        "value": "0x00",
-                        "name": "Easy"
-                    },
-                    {
-                        "value": "0x01",
-                        "name": "Normal"
-                    },
-                    {
-                        "value": "0x02",
-                        "name": "Hard"
-                    }
-                ]
             }
         ],
         "messages": []

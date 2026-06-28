@@ -43,6 +43,7 @@ OpenFPGAGraphicsManager::OpenFPGAGraphicsManager()
       _cursorX(160), _cursorY(100), _cursorHotX(0), _cursorHotY(0),
       _cursorW(0), _cursorH(0), _cursorKeycolor(0), _cursorVisible(false),
       _gpuReady(false), _videoBufIdx(-1), _videoFence(0), _gpuCleanMask(0),
+      _gpuStalled(false), _gpuStallToken(0),
       _splashActive(false) {
     memset(_screenBuf, 0, sizeof(_screenBuf));
     memset(_palette, 0, sizeof(_palette));
@@ -203,11 +204,37 @@ uint8_t *OpenFPGAGraphicsManager::acquireFrameBuffer() {
     return fb;
 }
 
+bool OpenFPGAGraphicsManager::waitGpuFenceBounded(uint32 token) {
+    /* of_gpu_wait() spins 50M iterations (~5 s) and then __builtin_trap()s,
+     * which crashes the whole machine whenever the platform menu freezes the
+     * display.  A healthy border clear retires in microseconds, so a much
+     * smaller budget never trips on a real frame yet lets us bail long before
+     * the trap.  ~8M ≈ 0.8 s at 100 MHz with a ~10-cycle body: comfortably
+     * above any legitimate frame, comfortably below the SDK's hang threshold.
+     * The one-time stall it costs on menu-open is hidden behind the menu. */
+    uint32_t spins = 8000000u;
+    while (!of_gpu_fence_reached(token)) {
+        if (--spins == 0)
+            return false;
+    }
+    return true;
+}
+
 void OpenFPGAGraphicsManager::clearFrameBorders(uint8_t *fb, uint fbW,
                                                 uint fbH, uint fbStride,
                                                 int xOff, int yOff,
                                                 uint copyW, uint copyH) {
-    if (!_gpuReady || !fb) {
+    /* If we latched a stall (menu open), re-probe the pending fence with a
+     * plain register read -- no command emission, so it can never hang on the
+     * unbounded ring-space spin.  Once it retires the menu has closed and the
+     * GPU is live again; fall through to the normal path and resume. */
+    if (_gpuStalled && fb)
+        _gpuStalled = !of_gpu_fence_reached(_gpuStallToken);
+
+    /* CPU fallback: GPU never came up, or it is stalled and we must not emit
+     * any commands.  Scrub the whole buffer; updateScreen() overwrites the
+     * centre with the game frame immediately after this returns. */
+    if (!_gpuReady || _gpuStalled || !fb) {
         if (fb)
             memset(fb, 0, fbStride * fbH);
         return;
@@ -242,11 +269,28 @@ void OpenFPGAGraphicsManager::clearFrameBorders(uint8_t *fb, uint fbW,
         issued = true;
     }
 
-    if (issued)
-        of_gpu_wait(of_gpu_submit());
+    if (issued) {
+        const uint32_t token = of_gpu_submit();
+        if (!waitGpuFenceBounded(token)) {
+            /* GPU went dark mid-frame (menu opened while we were emitting).
+             * Latch the stall, stop here, and scrub the borders on the CPU so
+             * the frame is not left half-cleared.  presentFrame() will skip
+             * the flip; we resume once `token` finally retires. */
+            _gpuStalled = true;
+            _gpuStallToken = token;
+            memset(fb, 0, fbStride * fbH);
+        }
+    }
 }
 
 void OpenFPGAGraphicsManager::presentFrame() {
+    /* While the GPU is stalled (menu open) emit nothing: a flip command would
+     * pile into a ring the frozen GPU never drains, and acquire_next() would
+     * block on a fence that never retires.  The menu owns the screen anyway;
+     * the first live frame after recovery presents normally. */
+    if (_gpuStalled)
+        return;
+
     if (_gpuReady && _videoBufIdx >= 0) {
         _videoFence = of_gpu_flip_to(_videoBufIdx);
         of_gpu_kick();
