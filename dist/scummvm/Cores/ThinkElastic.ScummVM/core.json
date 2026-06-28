@@ -7,8 +7,8 @@
             "description": "ScummVM on openfpgaOS",
             "author": "ThinkElastic",
             "url": "",
-            "version": "1.0.0",
-            "date_release": "2026-04-26"
+            "version": "1.0.1",
+            "date_release": "2026-06-28"
         },
         "framework": {
             "target_product": "Analogue Pocket",
