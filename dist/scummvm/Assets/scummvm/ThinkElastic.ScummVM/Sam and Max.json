@@ -1,0 +1,23 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": { "id": 666, "select": false },
+        "data_slots": [
+            { "id": 1,  "filename": "os.bin" },
+            { "id": 2,  "filename": "samnmax_os.ini" },
+            { "id": 3,  "filename": "scummvm_lucasarts.elf" },
+            { "id": 4,  "filename": "samnmax.iso" },
+            { "id": 5,  "filename": "bank.ofsf" },
+            { "id": 9,  "filename": "samnmax.ini" },
+            { "id": 10, "filename": "samnmax_0.sav" },
+            { "id": 11, "filename": "samnmax_1.sav" },
+            { "id": 12, "filename": "samnmax_2.sav" },
+            { "id": 13, "filename": "samnmax_3.sav" },
+            { "id": 14, "filename": "samnmax_4.sav" },
+            { "id": 15, "filename": "samnmax_5.sav" },
+            { "id": 16, "filename": "samnmax_6.sav" },
+            { "id": 17, "filename": "samnmax_7.sav" },
+            { "id": 18, "filename": "samnmax_8.sav" }
+        ]
+    }
+}
