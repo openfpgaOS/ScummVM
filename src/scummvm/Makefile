@@ -1,193 +1,43 @@
-# ScummVM port to openfpgaOS (Analogue Pocket)
+# ScummVM port to openfpgaOS (Analogue Pocket) -- per-engine multi-ELF build.
 #
-# Cross-compiles ScummVM (SCUMM engine only) for RISC-V rv32imafc.
-# Statically links upstream musl (bundled in the SDK at $(SDK_DIR)/musl/).
-# Uses the openfpgaOS SDK for video, audio, input, and file I/O.
+# Compiles the engine-agnostic ScummVM CORE once into build-multi/libcore.a,
+# then links one self-contained scummvm_<engine>.elf per engine, all sharing
+# that core. The shipped engines are SCUMM (label "lucasarts"), AGI and SCI;
+# each game instance's os.ini points [os] ELF= at the ELF for its engineid.
+#
+#   make                 build all engine ELFs + assemble build/<target>/scummvm/
+#   make copy            build, assemble, copy to the SD card
+#   make package         build, assemble, zip into releases/<target>/
+#   make debug           build, push the lucasarts ELF over UART, stream console
+#   make clean           remove build-multi/ and the assembled image
+#   make ENGINES=scumm   build a subset (default: scumm agi sci)
+#
+# Statically links upstream musl (SDK $(SDK_DIR)/musl/). Per-engine selection is
+# via -DENABLE_<X> + a generated plugins/detection table, independent of the
+# ENABLE_* macros in config.h (the core strips ENABLE_SCUMM from a config shadow).
 
-# ── Toolchain ───────────────────────────────────────────────────────
-CROSS ?= $(shell which riscv64-unknown-elf-gcc >/dev/null 2>&1 && echo riscv64-unknown-elf- || echo riscv64-elf-)
-CC      = $(CROSS)gcc
-CXX     = $(CROSS)g++
-LD      = $(CROSS)gcc
-AS      = $(CROSS)gcc
-OBJDUMP = $(CROSS)objdump
-SIZE    = $(CROSS)size
-STRIP   = $(CROSS)strip
+ENGINES ?= scumm agi sci
 
-# ── Architecture ────────────────────────────────────────────────────
-ARCH = rv32imafc
-ABI  = ilp32f
+# Utility/pattern rules precede the phony targets, so pin the default goal.
+.DEFAULT_GOAL := all
 
-# ── Paths ───────────────────────────────────────────────────────────
-SDK_DIR   = ../sdk
-MUSL_DIR  = $(SDK_DIR)/musl
-SCUMMVM   = scummvm
-APP_LD    = $(SDK_DIR)/app.ld
+# ── Per-engine source curation ──────────────────────────────────────
+# Feature-gated files whose feature is OFF in this port (mirrors each engine's
+# module.mk ifdef blocks). SCI drops the SCI32 set (needs 16-bit RGB / Tier-2).
+EXCLUDE_sci = %/sol.cpp %/hoyle5poker.cpp %/kgraphics32.cpp %/celobj32.cpp %/controls32.cpp \
+	%/cursor32.cpp %/frameout.cpp %/maccursor32.cpp %/paint32.cpp %/palette32.cpp %/plane32.cpp \
+	%/remap32.cpp %/screen_item32.cpp %/text32.cpp %/transitions32.cpp %/video32.cpp \
+	%/audio32.cpp %/robot_decoder.cpp
 
-# musl crt objects: crt1.o brings in _start and __libc_start_main,
-# crti/crtn bracket .init/.fini for static constructors.
-CRT_OBJS = $(MUSL_DIR)/lib/crt1.o $(MUSL_DIR)/lib/crti.o $(MUSL_DIR)/lib/crtn.o
+# Output label per engine (default = engine id). SCUMM ships as "lucasarts".
+LABEL_scumm = lucasarts
 
-# ── ScummVM submodule guard ─────────────────────────────────────────
-# Upstream ScummVM lives in a git submodule at $(SCUMMVM)/.  The source
-# lists further down are built with $(wildcard $(SCUMMVM)/...), which make
-# expands while it *parses* this file -- so the submodule has to be on disk
-# before those lines are read, or every SCUMMVM_* list comes out empty and
-# the link silently produces a stub binary with no clear error.  If the
-# sentinel header is missing, check the submodule out now (one-time; needs
-# network + the parent .git).  This runs on the host even for the
-# `make container-*` targets, because make always parses the whole Makefile
-# on the host before delegating into the container, and the container has
-# no network -- so the fetch must happen here, not inside it.
-SCUMMVM_SENTINEL := $(SCUMMVM)/common/scummsys.h
-ifeq ($(wildcard $(SCUMMVM_SENTINEL)),)
-$(info [scummvm] submodule not checked out -- fetching $(SCUMMVM) (one-time)...)
-$(info $(shell git -C $(CURDIR) submodule update --init -- $(SCUMMVM) 2>&1))
-endif
-ifeq ($(wildcard $(SCUMMVM_SENTINEL)),)
-$(error ScummVM submodule missing at '$(SCUMMVM)/'. Auto-fetch failed (no network?). Run on a networked host: git submodule update --init src/scummvm/scummvm)
-endif
-
-# ── Compiler flags ──────────────────────────────────────────────────
-COMMON_FLAGS  = -march=$(ARCH) -mabi=$(ABI) -Os -Wall
-COMMON_FLAGS += -ffunction-sections -fdata-sections
-COMMON_FLAGS += -fno-tree-loop-distribute-patterns
-
-# Includes: openfpgaOS headers + bundled musl headers, in that order so
-# `#include "of.h"` and `#include <stdio.h>` both resolve. -nostdinc keeps
-# the host system headers out of the search path entirely.
-COMMON_FLAGS += -nostdinc -I$(SDK_DIR)/include -isystem $(MUSL_DIR)/include -I.
-
-# C flags
-CFLAGS = $(COMMON_FLAGS)
-
-# C++ flags
-CXXFLAGS  = $(COMMON_FLAGS)
-# gnu++11 (not c++11): leaves musl's _BSD_SOURCE/_XOPEN_SOURCE fallback
-# enabled so POSIX functions like usleep() remain declared.
-CXXFLAGS += -std=gnu++11
-CXXFLAGS += -fno-exceptions -fno-rtti -fno-threadsafe-statics
-# Leave -fuse-cxa-atexit (the GCC default) on: the SDK's of_cxxabi.cpp
-# provides __cxa_atexit/__cxa_finalize/__dso_handle. -fno-use-cxa-atexit
-# would emit atexit() calls instead, pulling in musl's atexit.o which
-# also defines __cxa_atexit and triggers a multiple-definition link error.
-CXXFLAGS += -Icompat/cxx_includes
-
-# ScummVM-specific defines
-CXXFLAGS += -DNONSTANDARD_PORT
-CXXFLAGS += -DHAVE_CONFIG_H
-CXXFLAGS += -DDISABLE_COMMAND_LINE
-CXXFLAGS += -Wno-reorder -Wno-unused-parameter -Wno-sign-compare
-CXXFLAGS += -Wno-missing-field-initializers -Wno-unused-variable
-# Upstream ScummVM uses #pragma mark heavily for IDE navigation. GCC
-# warns for each one, which drowns out useful port warnings on full builds.
-CXXFLAGS += -Wno-unknown-pragmas
-# ScummVM also intentionally uses four-character command IDs such as
-# 'SAVE' and 'TEXT'. They are stable tags here, not accidental char typos.
-CXXFLAGS += -Wno-multichar
-
-# Include paths for ScummVM sources
-CXXFLAGS += -I$(SCUMMVM) -I$(SCUMMVM)/engines -I$(SCUMMVM)/backends
-
-# Assembly flags
-ASFLAGS = -march=$(ARCH)_zicsr -mabi=$(ABI)
-
-# Linker flags
-# -nostdlib: don't pull in host libc; we link musl explicitly.
-# -static:   no dynamic linking.
-LDFLAGS  = -march=$(ARCH) -mabi=$(ABI)
-LDFLAGS += -nostdlib -static
-LDFLAGS += -T $(APP_LD) -L$(MUSL_DIR)/lib
-LDFLAGS += -Wl,--gc-sections -Wl,--no-warn-rwx-segments
-
-LIBGCC = $(shell $(CC) -march=$(ARCH) -mabi=$(ABI) -print-libgcc-file-name)
-
-# musl + math + libgcc, in the order the linker wants. We deliberately
-# don't pull in the toolchain's libsupc++ -- it was built against newlib
-# and references newlib-only symbols that musl doesn't ship. C++ apps
-# link the SDK's own minimal C++ ABI shim ($(OF_CXXABI_SRC)) instead.
-LIBS = -Wl,--start-group -lc -lm -lgcc -Wl,--end-group
-
-# ── Source files ────────────────────────────────────────────────────
-
-# C++ runtime (SDK-provided minimal C++ ABI shim)
-CXX_RT_SRCS = $(SDK_DIR)/of_cxxabi.cpp
-
-# Backend.  ISO 9660 reads now go through the kernel mount API
-# (of_iso_mount + POSIX fopen/opendir under /cd) -- no vendored
-# lib9660, no app-side sector cache.
-BACKEND_SRCS = \
-	backend/openfpga_osystem.cpp \
-	backend/openfpga_memory.cpp \
-	backend/openfpga_mixer.cpp \
-	backend/openfpga_midi.cpp \
-	backend/openfpga_save.cpp \
-	backend/openfpga_fs.cpp \
-	backend/openfpga_audiocd.cpp \
-	backend/openfpga_cue_archive.cpp
-
-# Compat stubs
-COMPAT_SRCS = \
-	compat/zlib_stub.cpp
-
-# Main entry
-MAIN_SRCS = main.cpp
-
-# All local sources
-LOCAL_SRCS = $(CXX_RT_SRCS) $(BACKEND_SRCS) $(COMPAT_SRCS) $(MAIN_SRCS)
-
-# SDK init shim runs as a constructor before main (e.g. unbuffered stdout).
-OF_INIT_SRC = $(SDK_DIR)/of_init.c
-OF_INIT_OBJ = $(SDK_DIR)/of_init.o
-
-# SDK MIDI / sample-voice synth: the .ofsf bank loader, voice engine,
-# and Standard MIDI File parser. We use of_midi_init() + the smp_voice_*
-# event API directly from openfpga_midi.cpp; the SMF parser in of_midi.c
-# gets linked too (small enough to not bother stripping).
-OF_SDK_C_SRCS = \
-	$(SDK_DIR)/of_midi.c \
-	$(SDK_DIR)/of_smp_bank.c \
-	$(SDK_DIR)/of_smp_tables.c \
-	$(SDK_DIR)/of_smp_voice.c
-OF_SDK_C_OBJS = $(OF_SDK_C_SRCS:.c=.o)
-
-# ── ScummVM common/ sources (all .cpp files) ───────────────────────
-SCUMMVM_COMMON_SRCS = $(filter-out %/recorderfile.cpp %/updates.cpp, $(wildcard $(SCUMMVM)/common/*.cpp)) \
-	$(wildcard $(SCUMMVM)/common/encodings/*.cpp) \
-	$(wildcard $(SCUMMVM)/common/formats/*.cpp) \
-	$(filter-out %/zlib.cpp, $(wildcard $(SCUMMVM)/common/compression/*.cpp)) \
-	$(wildcard $(SCUMMVM)/common/std/*.cpp)
-
-# ── ScummVM base/ sources ──────────────────────────────────────────
-SCUMMVM_BASE_SRCS = \
-	$(SCUMMVM)/base/main.cpp \
-	$(SCUMMVM)/base/plugins.cpp \
-	$(SCUMMVM)/base/version.cpp \
-	$(SCUMMVM)/base/commandLine.cpp
-
-# ── ScummVM graphics/ sources (all, excluding OpenGL/TinyGL/larry) ──
-SCUMMVM_GRAPHICS_SRCS = $(filter-out %/svg.cpp %/larryScale_generated.cpp, \
-	$(wildcard $(SCUMMVM)/graphics/*.cpp)) \
-	$(filter-out %/blit-atari.cpp %/blit-neon.cpp %/blit-sse2.cpp %/blit-avx2.cpp, \
-	$(wildcard $(SCUMMVM)/graphics/blit/*.cpp)) \
-	$(wildcard $(SCUMMVM)/graphics/fonts/*.cpp) \
-	$(wildcard $(SCUMMVM)/graphics/macgui/*.cpp) \
-	$(wildcard $(SCUMMVM)/graphics/scaler/*.cpp)
-
-# ── ScummVM audio/ sources (all, excluding libmad/vorbis/flac deps) ─
-AUDIO_EXCLUDE = %/mp3.cpp %/vorbis.cpp %/flac.cpp %/aac.cpp %/ac3.cpp %/alsa_opl.cpp %/opl2lpt.cpp %/retrowave_opl3.cpp %/rwopl3.cpp %/fluidsynth.cpp %/mt32.cpp %/eas.cpp
-SCUMMVM_AUDIO_SRCS = $(filter-out $(AUDIO_EXCLUDE), \
-	$(wildcard $(SCUMMVM)/audio/*.cpp) \
-	$(wildcard $(SCUMMVM)/audio/decoders/*.cpp) \
-	$(wildcard $(SCUMMVM)/audio/softsynth/*.cpp) \
-	$(wildcard $(SCUMMVM)/audio/softsynth/opl/*.cpp) \
-	$(wildcard $(SCUMMVM)/audio/softsynth/fmtowns_pc98/*.cpp) \
-	$(wildcard $(SCUMMVM)/audio/mods/*.cpp))
-
-# ── ScummVM SCUMM engine sources (all subdirs, exclude HE/network) ─
-SCUMM_EXCLUDE = %/dialog-createsession.cpp %/dialog-sessionselector.cpp \
-	%/nut_renderer.cpp %/string_v7.cpp %/script_v8.cpp
-SCUMMVM_ENGINE_SRCS = $(filter-out $(SCUMM_EXCLUDE), $(wildcard $(SCUMMVM)/engines/scumm/*.cpp)) \
+# SCUMM needs a curated source set, not a naive glob (engines/scumm/ pulls all of
+# he/ = Humongous, which needs ENABLE_HE). Mirror the classic set: drop the
+# v7/v8 SMUSH bits, take only the few he/ files base SCUMM needs. An engine with
+# SRCS_<id> defined uses it verbatim instead of the wildcard.
+SCUMM_EXCLUDE = %/dialog-createsession.cpp %/dialog-sessionselector.cpp %/nut_renderer.cpp %/string_v7.cpp %/script_v8.cpp
+SRCS_scumm = $(filter-out $(SCUMM_EXCLUDE), $(wildcard $(SCUMMVM)/engines/scumm/*.cpp)) \
 	$(wildcard $(SCUMMVM)/engines/scumm/imuse/*.cpp) \
 	$(wildcard $(SCUMMVM)/engines/scumm/imuse/drivers/*.cpp) \
 	$(wildcard $(SCUMMVM)/engines/scumm/players/*.cpp) \
@@ -198,24 +48,101 @@ SCUMMVM_ENGINE_SRCS = $(filter-out $(SCUMM_EXCLUDE), $(wildcard $(SCUMMVM)/engin
 	$(SCUMMVM)/engines/scumm/he/script_v70he.cpp \
 	$(SCUMMVM)/engines/scumm/he/sound_he.cpp
 
-# ── ScummVM SCI engine (Sierra) intentionally NOT built ────────────
-# This build focuses only on LucasArts SCUMM titles.  The sci/ sources are
-# excluded here, ENABLE_SCI/ENABLE_SCI32 are undefined in config.h, and
-# LINK_PLUGIN(SCI)/LINK_PLUGIN(SCI_DETECTION) are removed from the engine
-# tables (engines/plugins_table.h, engines/detection_table.h).
+# ── Toolchain ───────────────────────────────────────────────────────
+CROSS ?= $(shell which riscv64-unknown-elf-gcc >/dev/null 2>&1 && echo riscv64-unknown-elf- || echo riscv64-elf-)
+CC   = $(CROSS)gcc
+CXX  = $(CROSS)g++
+AR   = $(CROSS)ar
+SIZE = $(CROSS)size
 
-# ── ScummVM engine framework ───────────────────────────────────────
-SCUMMVM_ENGINES_SRCS = $(wildcard $(SCUMMVM)/engines/*.cpp)
+ARCH = rv32imafc
+ABI  = ilp32f
 
-# ── ScummVM math sources (needed by WMA/WMA-Pro audio decoders) ────
-# MDCT pulls in fft, cosinetables, sinetables, sinewindows.  We add
-# the whole math/ tree and let --gc-sections drop the rest.
-SCUMMVM_MATH_SRCS = $(wildcard $(SCUMMVM)/math/*.cpp)
+SDK_DIR  = ../sdk
+MUSL_DIR = $(SDK_DIR)/musl
+SCUMMVM  = scummvm
+APP_LD   = $(SDK_DIR)/app.ld
+CRT_OBJS = $(MUSL_DIR)/lib/crt1.o $(MUSL_DIR)/lib/crti.o $(MUSL_DIR)/lib/crtn.o
 
-# ── ScummVM backends infrastructure ─────────────────────────────────
-SCUMMVM_BACKEND_SRCS = \
-	$(SCUMMVM)/backends/base-backend.cpp \
-	$(SCUMMVM)/backends/modular-backend.cpp \
+BUILD    = build-multi
+GENDIR   = $(BUILD)/gen
+LIBCORE  = $(BUILD)/libcore.a
+
+# ── Release / deploy paths ──────────────────────────────────────────
+APP       = scummvm
+TARGET   ?= pocket
+MISTER_IP ?= mister.local
+ROOT      = $(realpath $(CURDIR)/../..)
+DIST      = $(ROOT)/dist/$(APP)
+OUT       = $(ROOT)/build/$(TARGET)/$(APP)
+COMMON    = $(OUT)/Assets/$(APP)/common
+RUNTIME   = $(ROOT)/runtime
+GAME_ASSETS = $(wildcard *.dat *.bin *.cfg)
+
+# ── Flags ───────────────────────────────────────────────────────────
+COMMON_FLAGS  = -march=$(ARCH) -mabi=$(ABI) -Os -Wall
+COMMON_FLAGS += -ffunction-sections -fdata-sections
+COMMON_FLAGS += -fno-tree-loop-distribute-patterns
+COMMON_FLAGS += -nostdinc -I$(SDK_DIR)/include -isystem $(MUSL_DIR)/include -I.
+
+CFLAGS = $(COMMON_FLAGS)
+
+CXXFLAGS  = $(COMMON_FLAGS)
+CXXFLAGS += -std=gnu++11 -fno-exceptions -fno-rtti -fno-threadsafe-statics
+CXXFLAGS += -Icompat/cxx_includes
+CXXFLAGS += -DNONSTANDARD_PORT -DHAVE_CONFIG_H -DDISABLE_COMMAND_LINE
+CXXFLAGS += -Wno-reorder -Wno-unused-parameter -Wno-sign-compare
+CXXFLAGS += -Wno-missing-field-initializers -Wno-unused-variable
+CXXFLAGS += -Wno-unknown-pragmas -Wno-multichar
+CXXFLAGS += -I$(SCUMMVM) -I$(SCUMMVM)/engines -I$(SCUMMVM)/backends
+
+LDFLAGS  = -march=$(ARCH) -mabi=$(ABI) -nostdlib -static
+LDFLAGS += -T $(APP_LD) -L$(MUSL_DIR)/lib
+LDFLAGS += -Wl,--gc-sections -Wl,--no-warn-rwx-segments
+LIBGCC = $(shell $(CC) -march=$(ARCH) -mabi=$(ABI) -print-libgcc-file-name)
+LIBS   = -Wl,--start-group -lc -lm -lgcc -Wl,--end-group
+
+# Core config = port config.h WITHOUT the hardcoded ENABLE_SCUMM, so the engine
+# is selected per-ELF via -DENABLE_<X>. Found ahead of ./config.h via -I$(GENDIR).
+CONFIG_SHADOW = $(GENDIR)/config.h
+
+# The core sees the UNION of our engines' flags so engine-gated CORE code is
+# built once (e.g. Graphics::FontSJIS, used by SCUMM/SCI). Unused gated code is
+# trimmed per-ELF by --gc-sections.
+CORE_ENGINE_FLAGS = -DENABLE_SCUMM -DENABLE_SCI -DENABLE_AGI
+CORE_CXXFLAGS = -I$(GENDIR) $(CXXFLAGS) $(CORE_ENGINE_FLAGS)
+
+# src path -> object path under $(BUILD)/obj  (../sdk/foo -> up/sdk/foo)
+to_obj = $(foreach s,$(1),$(BUILD)/obj/$(patsubst ../%,up/%,$(basename $(s))).o)
+
+# ── Engine-agnostic CORE sources (compiled once into libcore.a) ─────
+# NB: base/plugins.cpp and the local main.cpp are PER-ENGINE (below): plugins.cpp
+# #includes the per-engine engines/plugins_table.h, and main.cpp takes the
+# per-engine default-engine macro.
+CORE_COMMON = $(filter-out %/recorderfile.cpp %/updates.cpp, $(wildcard $(SCUMMVM)/common/*.cpp)) \
+	$(wildcard $(SCUMMVM)/common/encodings/*.cpp) \
+	$(wildcard $(SCUMMVM)/common/formats/*.cpp) \
+	$(filter-out %/zlib.cpp, $(wildcard $(SCUMMVM)/common/compression/*.cpp)) \
+	$(wildcard $(SCUMMVM)/common/std/*.cpp)
+
+CORE_BASE = $(SCUMMVM)/base/main.cpp $(SCUMMVM)/base/version.cpp $(SCUMMVM)/base/commandLine.cpp
+
+CORE_GRAPHICS = $(filter-out %/svg.cpp %/larryScale_generated.cpp, $(wildcard $(SCUMMVM)/graphics/*.cpp)) \
+	$(filter-out %/blit-atari.cpp %/blit-neon.cpp %/blit-sse2.cpp %/blit-avx2.cpp, $(wildcard $(SCUMMVM)/graphics/blit/*.cpp)) \
+	$(wildcard $(SCUMMVM)/graphics/fonts/*.cpp) \
+	$(wildcard $(SCUMMVM)/graphics/macgui/*.cpp) \
+	$(wildcard $(SCUMMVM)/graphics/scaler/*.cpp)
+
+AUDIO_EXCLUDE = %/mp3.cpp %/vorbis.cpp %/flac.cpp %/aac.cpp %/ac3.cpp %/alsa_opl.cpp %/opl2lpt.cpp %/retrowave_opl3.cpp %/rwopl3.cpp %/fluidsynth.cpp %/mt32.cpp %/eas.cpp
+CORE_AUDIO = $(filter-out $(AUDIO_EXCLUDE), \
+	$(wildcard $(SCUMMVM)/audio/*.cpp) $(wildcard $(SCUMMVM)/audio/decoders/*.cpp) \
+	$(wildcard $(SCUMMVM)/audio/softsynth/*.cpp) $(wildcard $(SCUMMVM)/audio/softsynth/opl/*.cpp) \
+	$(wildcard $(SCUMMVM)/audio/softsynth/fmtowns_pc98/*.cpp) $(wildcard $(SCUMMVM)/audio/mods/*.cpp))
+
+CORE_ENGINES_FW = $(wildcard $(SCUMMVM)/engines/*.cpp)
+
+CORE_BACKENDS = \
+	$(SCUMMVM)/backends/base-backend.cpp $(SCUMMVM)/backends/modular-backend.cpp \
 	$(SCUMMVM)/backends/mixer/null/null-mixer.cpp \
 	$(SCUMMVM)/backends/timer/default/default-timer.cpp \
 	$(SCUMMVM)/backends/events/default/default-events.cpp \
@@ -225,119 +152,116 @@ SCUMMVM_BACKEND_SRCS = \
 	$(wildcard $(SCUMMVM)/backends/keymapper/*.cpp) \
 	$(SCUMMVM)/backends/fs/abstract-fs.cpp
 
-# ── ScummVM GUI ────────────────────────────────────────────────────
-GUI_EXCLUDE = %/onscreendialog.cpp %/recorderdialog.cpp %/updates-dialog.cpp \
-	%/EventRecorder.cpp %/editrecorddialog.cpp %/fluidsynth-dialog.cpp \
-	%/dump-all-dialogs.cpp %/integrity-dialog.cpp
-SCUMMVM_GUI_SRCS = $(filter-out $(GUI_EXCLUDE), \
-	$(wildcard $(SCUMMVM)/gui/*.cpp) \
-	$(wildcard $(SCUMMVM)/gui/widgets/*.cpp))
+GUI_EXCLUDE = %/onscreendialog.cpp %/recorderdialog.cpp %/updates-dialog.cpp %/EventRecorder.cpp %/editrecorddialog.cpp %/fluidsynth-dialog.cpp %/dump-all-dialogs.cpp %/integrity-dialog.cpp
+CORE_GUI = $(filter-out $(GUI_EXCLUDE), $(wildcard $(SCUMMVM)/gui/*.cpp) $(wildcard $(SCUMMVM)/gui/widgets/*.cpp))
 
-# ── ScummVM image decoders (needed by GUI) ─────────────────────────
-SCUMMVM_IMAGE_SRCS = $(filter-out %/gif.cpp %/mpeg.cpp, \
-	$(wildcard $(SCUMMVM)/image/*.cpp) \
-	$(wildcard $(SCUMMVM)/image/codecs/*.cpp))
+CORE_IMAGE = $(filter-out %/gif.cpp %/mpeg.cpp, $(wildcard $(SCUMMVM)/image/*.cpp) $(wildcard $(SCUMMVM)/image/codecs/*.cpp))
 
-# ── ScummVM video/ sources ─────────────────────────────────────────
-VIDEO_EXCLUDE = %/theora_decoder.cpp %/bink_decoder.cpp %/hnm_decoder.cpp \
-	%/mpegps_decoder.cpp %/psx_decoder.cpp %/mkv_decoder.cpp
-SCUMMVM_VIDEO_SRCS = $(filter-out $(VIDEO_EXCLUDE), \
-	$(wildcard $(SCUMMVM)/video/*.cpp))
+VIDEO_EXCLUDE = %/theora_decoder.cpp %/bink_decoder.cpp %/hnm_decoder.cpp %/mpegps_decoder.cpp %/psx_decoder.cpp %/mkv_decoder.cpp
+CORE_VIDEO = $(filter-out $(VIDEO_EXCLUDE), $(wildcard $(SCUMMVM)/video/*.cpp))
 
-# All ScummVM sources
-SCUMMVM_SRCS = $(SCUMMVM_COMMON_SRCS) $(SCUMMVM_BASE_SRCS) \
-               $(SCUMMVM_GRAPHICS_SRCS) $(SCUMMVM_AUDIO_SRCS) \
-               $(SCUMMVM_ENGINE_SRCS) $(SCUMMVM_ENGINES_SRCS) \
-               $(SCUMMVM_BACKEND_SRCS) $(SCUMMVM_GUI_SRCS) \
-               $(SCUMMVM_IMAGE_SRCS) $(SCUMMVM_VIDEO_SRCS) \
-               $(SCUMMVM_MATH_SRCS)
+CORE_MATH = $(wildcard $(SCUMMVM)/math/*.cpp)
 
-# ── Object files ────────────────────────────────────────────────────
+CORE_SRCS = $(CORE_COMMON) $(CORE_BASE) $(CORE_GRAPHICS) $(CORE_AUDIO) $(CORE_ENGINES_FW) \
+	$(CORE_BACKENDS) $(CORE_GUI) $(CORE_IMAGE) $(CORE_VIDEO) $(CORE_MATH)
+CORE_OBJS = $(call to_obj,$(CORE_SRCS))
 
-LOCAL_OBJS    = $(LOCAL_SRCS:.cpp=.o)
-SCUMMVM_OBJS  = $(SCUMMVM_SRCS:.cpp=.o)
-ALL_OBJS      = $(LOCAL_OBJS) $(SCUMMVM_OBJS) $(OF_INIT_OBJ) $(OF_SDK_C_OBJS)
+# Local backend + SDK runtime: engine-agnostic, but linked DIRECTLY into each
+# ELF (not archived) since some are reached only via constructors / the SDK.
+DIRECT_CPP = $(SDK_DIR)/of_cxxabi.cpp \
+	backend/openfpga_osystem.cpp backend/openfpga_memory.cpp backend/openfpga_mixer.cpp \
+	backend/openfpga_midi.cpp backend/openfpga_save.cpp backend/openfpga_fs.cpp \
+	backend/openfpga_audiocd.cpp backend/openfpga_cue_archive.cpp compat/zlib_stub.cpp
+DIRECT_C = $(SDK_DIR)/of_init.c $(SDK_DIR)/of_midi.c $(SDK_DIR)/of_smp_bank.c \
+	$(SDK_DIR)/of_smp_tables.c $(SDK_DIR)/of_smp_voice.c
+DIRECT_OBJS = $(call to_obj,$(DIRECT_CPP)) $(call to_obj,$(DIRECT_C))
 
-# ── Release / deploy paths ──────────────────────────────────────────
-# Match the SDK custom-core template: dist/<app>/ is the source tree,
-# build/<app>/ is the assembled SD-card image consumed by copy.sh /
-# package.sh.
-APP       = scummvm
-TARGET   ?= pocket
-MISTER_IP ?= mister.local
-ROOT      = $(realpath $(CURDIR)/../..)
-OBJ_DIR   = $(CURDIR)
-DIST      = $(ROOT)/dist/$(APP)
-OUT       = $(ROOT)/build/$(TARGET)/$(APP)
-RUNTIME   = $(ROOT)/runtime
-# Game data files shipped into the per-target deliverable, when present
-# alongside the Makefile (game discs/data are usually user-supplied).
-GAME_ASSETS = $(wildcard *.dat *.bin *.cfg)
-
-# ── Targets ─────────────────────────────────────────────────────────
-
-all: app.elf release
-	$(SIZE) $<
-
-app.elf: $(CRT_OBJS) $(ALL_OBJS) $(APP_LD)
-	$(LD) $(LDFLAGS) -o $@ $(CRT_OBJS) $(ALL_OBJS) $(LIBS) $(LIBGCC)
-
-# SDK C sources (of_init.c, of_midi.c, of_smp_*.c)
-$(SDK_DIR)/%.o: $(SDK_DIR)/%.c
+# ── Compile rules (objects under $(BUILD)/obj, paths mirrored) ───────
+$(BUILD)/obj/up/%.o: ../%.cpp | $(CONFIG_SHADOW)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CORE_CXXFLAGS) -c -o $@ $<
+$(BUILD)/obj/up/%.o: ../%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
+$(BUILD)/obj/%.o: %.cpp | $(CONFIG_SHADOW)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CORE_CXXFLAGS) -c -o $@ $<
+$(BUILD)/obj/%.o: %.c
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# SDK C++ sources (of_cxxabi.cpp)
-$(SDK_DIR)/%.o: $(SDK_DIR)/%.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+$(CONFIG_SHADOW): config.h
+	@mkdir -p $(dir $@)
+	@grep -v 'ENABLE_SCUMM' config.h > $@
+	@echo "  [gen] $@  (core config; ENABLE_SCUMM stripped)"
 
-# Local C++ sources
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+$(LIBCORE): $(CORE_OBJS)
+	@mkdir -p $(dir $@)
+	$(AR) rcs $@ $(CORE_OBJS)
+	@echo "  [ar]  $@  ($(words $(CORE_OBJS)) objects)"
 
-# ScummVM C++ sources
-$(SCUMMVM)/%.o: $(SCUMMVM)/%.cpp
-	$(CXX) $(CXXFLAGS) -c -o $@ $<
+# ── Per-engine instantiation ────────────────────────────────────────
+define ENGINE_template
+UC_$(1)    := $(shell echo $(1) | tr a-z A-Z)
+OUT_$(1)   := $$(if $$(LABEL_$(1)),$$(LABEL_$(1)),$(1))
+GEN_$(1)   := $(BUILD)/$(1)/gen/.tables.stamp
+ESRC_$(1)  := $$(filter-out $$(EXCLUDE_$(1)), $(SCUMMVM)/base/plugins.cpp main.cpp \
+	$$(if $$(SRCS_$(1)),$$(SRCS_$(1)),$$(wildcard $(SCUMMVM)/engines/$(1)/*.cpp $(SCUMMVM)/engines/$(1)/*/*.cpp $(SCUMMVM)/engines/$(1)/*/*/*.cpp)))
+EOBJ_$(1)  := $$(foreach s,$$(ESRC_$(1)),$(BUILD)/$(1)/obj/$$(basename $$(s)).o)
+ECXX_$(1)  := -I$(BUILD)/$(1)/gen -I$(GENDIR) $(CXXFLAGS) -DENABLE_$$(UC_$(1)) -DOPENFPGA_DEFAULT_ENGINE='"$(1)"'
 
-# ── SD-card image assembly ──────────────────────────────────────────
-# Copies dist/scummvm/ to build/scummvm/, then layers in the runtime
-# bitstream + loader (per-Core), os.bin + scummvm.elf (per-platform
-# common), so the result is a tree the user can drop straight onto
-# the Pocket SD card.
-release: $(OBJ_DIR)/app.elf
-	@$(SDK_DIR)/platforms/$(TARGET)/image.sh "$(APP)" "$(OBJ_DIR)/app.elf" "$(ROOT)" "$(DIST)" $(GAME_ASSETS)
+# Generate the engine + detection plugin tables (DETECTION_STATIC is on, so
+# plugins.cpp pulls both; each engine's own detection.cpp supplies the symbol).
+# A single stamp gates BOTH headers so no engine object compiles before both
+# exist (avoids a -j race where plugins.o picks up the real SCUMM table).
+$$(GEN_$(1)):
+	@mkdir -p $(BUILD)/$(1)/gen/engines
+	@echo 'LINK_PLUGIN($$(UC_$(1)))' > $(BUILD)/$(1)/gen/engines/plugins_table.h
+	@echo 'LINK_PLUGIN($$(UC_$(1))_DETECTION)' > $(BUILD)/$(1)/gen/engines/detection_table.h
+	@touch $$@
+	@echo "  [gen] $(1): plugins_table.h + detection_table.h"
 
-# ── Deploy / package wrappers ───────────────────────────────────────
+$$(EOBJ_$(1)): $(BUILD)/$(1)/obj/%.o: %.cpp $$(GEN_$(1)) | $(CONFIG_SHADOW)
+	@mkdir -p $$(dir $$@)
+	$(CXX) $$(ECXX_$(1)) -c -o $$@ $$<
+
+$(BUILD)/scummvm_$$(OUT_$(1)).elf: $$(EOBJ_$(1)) $(DIRECT_OBJS) $(LIBCORE) $(CRT_OBJS) $(APP_LD)
+	$(CXX) $(LDFLAGS) -o $$@ $(CRT_OBJS) $$(EOBJ_$(1)) $(DIRECT_OBJS) $(LIBCORE) $(LIBS) $(LIBGCC)
+	@echo "== scummvm_$$(OUT_$(1)).elf (engine: $(1)) =="; $(SIZE) $$@
+endef
+$(foreach E,$(ENGINES),$(eval $(call ENGINE_template,$(E))))
+
+ENGINE_ELFS = $(foreach E,$(ENGINES),$(BUILD)/scummvm_$(OUT_$(E)).elf)
+
+# ── Targets ─────────────────────────────────────────────────────────
+.PHONY: all build release copy package debug clean
+
+# `make` builds every engine ELF, then assembles the SD-card image.
+all: release
+
+build: $(ENGINE_ELFS)
+	@echo; echo "Built per-engine ELFs sharing one libcore.a:"
+	@for f in $(notdir $(ENGINE_ELFS)); do echo "  $(BUILD)/$$f"; done
+
+# Assemble the deployable tree: image.sh wipes+rebuilds $(OUT) from dist/
+# (instance os.ini/JSON already point at the per-engine ELFs), then we drop ALL
+# engine ELFs into common/ and remove the legacy single-ELF seed image.sh makes.
+release: build
+	@$(SDK_DIR)/platforms/$(TARGET)/image.sh "$(APP)" "$(firstword $(ENGINE_ELFS))" "$(ROOT)" "$(DIST)" $(GAME_ASSETS)
+	@cp $(ENGINE_ELFS) "$(COMMON)/"
+	@rm -f "$(COMMON)/$(APP).elf"
+	@echo "   engine ELFs in common/: $(notdir $(ENGINE_ELFS))"
+
 copy: all
-	@MISTER_IP="$(MISTER_IP)" $(SDK_DIR)/platforms/$(TARGET)/copy.sh "$(APP)" "$(OBJ_DIR)/app.elf"
+	@MISTER_IP="$(MISTER_IP)" $(SDK_DIR)/platforms/$(TARGET)/copy.sh "$(APP)" "$(firstword $(ENGINE_ELFS))"
 
-package: release
+package: all
 	@$(ROOT)/scripts/package.sh $(APP)
 
-# ── UART push + console (single-app debug) ──────────────────────────
+# UART push + console: debug the SCUMM (lucasarts) ELF by default.
 debug: all
-	@$(ROOT)/scripts/debug.sh "$$(ls -d $(OUT)/Assets/*/common 2>/dev/null)/$(APP).elf"
+	@$(ROOT)/scripts/debug.sh "$(COMMON)/scummvm_$(OUT_$(firstword $(ENGINES))).elf"
 
 clean:
-	rm -f $(ALL_OBJS) app.elf
+	rm -rf $(BUILD) $(OUT)
 	find . -name '*.o' -delete
-	rm -rf $(OUT)
-
-.PHONY: all release copy package debug clean
-
-.PHONY: all clean
-
-# ── Containerized build (no host RISC-V toolchain needed) ────────────
-# This port Makefile is standalone (it doesn't include sdk.mk), so it
-# carries its own copy of the container passthrough.  Prefix any target
-# with `container-` and the SDK container wrapper runs `make <target>`
-# inside the openfpgaos-firmware image (toolchain + musl pre-installed),
-# so a fresh checkout needs only Docker — no host riscv64 toolchain.
-#
-# Examples:
-#     make container-all      → runs `make all` in the container
-#     make container-app.elf  → runs `make app.elf` in the container
-#     make container-clean    → cleans inside the container
-SDK_CONTAINER ?= $(ROOT)/tools/sdk-container.sh
-container-%:
-	@bash $(SDK_CONTAINER) make -f $(firstword $(MAKEFILE_LIST)) $*
-.PHONY: container-%

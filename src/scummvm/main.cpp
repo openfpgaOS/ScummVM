@@ -117,9 +117,17 @@ struct GameConfig {
                              * speech bank on the disc.  Default off. */
 };
 
+/* Default engine id for this ELF.  Overridable at build time so a per-engine
+ * build (e.g. app-agi.elf) defaults to its own engine; the OS os.ini may still
+ * override it at runtime via getOSConfigString("scummvm","engineid",...).
+ * Undefined (the production single-engine Makefile) -> "scumm", unchanged. */
+#ifndef OPENFPGA_DEFAULT_ENGINE
+#define OPENFPGA_DEFAULT_ENGINE "scumm"
+#endif
+
 static void cfgDefaults(GameConfig &c) {
     memset(&c, 0, sizeof(c));
-    strncpy(c.engineid,  "scumm",    sizeof(c.engineid)  - 1);
+    strncpy(c.engineid,  OPENFPGA_DEFAULT_ENGINE, sizeof(c.engineid)  - 1);
     strncpy(c.platform,  "pc",       sizeof(c.platform)  - 1);
     strncpy(c.language,  "en",       sizeof(c.language)  - 1);
     strncpy(c.music,     "openfpga", sizeof(c.music)     - 1);
@@ -343,10 +351,6 @@ extern "C" int main(int argc, char **argv) {
 
             const long slotId = (long)e->d_ino - 1;
             bool handled = false;
-
-            /* TEMP diag: show every slot file the launcher actually bound, so
-             * a missing data slot (e.g. slot 7 .bin) is visible at boot. */
-            { char sm[180]; snprintf(sm, sizeof(sm), "  slot %ld: %s", slotId, n); status(sm); }
 
             switch (slotId) {
             case 1:

@@ -48,11 +48,11 @@
 #       play.
 #
 # Pure-python only (no ffmpeg/vgmstream/mkisofs/xorriso/pycdlib): files are
-# copied byte-for-byte into a hand-rolled ISO9660 image (scripts/lib_iso9660.py,
+# copied byte-for-byte into a hand-rolled ISO9660 image (scripts/convert/lib_iso9660.py,
 # large-file + untruncated-name aware).
 #
 # Usage:
-#   scripts/build_monkey_iso.sh [monkey1|monkey2|all] [--out DIR]
+#   scripts/convert/build_monkey_iso.sh [monkey1|monkey2|all] [--out DIR]
 #                               [--mi1-dir DIR] [--mi2-dir DIR] [--keep]
 #
 # Idempotent: re-running rebuilds artifacts; intermediates live in a work dir
@@ -61,13 +61,16 @@
 # Nothing is ever written into tracked repo locations.
 
 set -euo pipefail
-export PYTHONDONTWRITEBYTECODE=1   # keep scripts/__pycache__ out of the repo
+export PYTHONDONTWRITEBYTECODE=1   # keep scripts/convert/__pycache__ out of the repo
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---- defaults -------------------------------------------------------------
-MI1_DIR_DEFAULT="/home/alberto/.local/share/Steam/steamapps/common/The Secret of Monkey Island Special Edition"
-MI2_DIR_DEFAULT="/home/alberto/.local/share/Steam/steamapps/common/Monkey2"
+# Default to a standard Linux Steam install; override with --mi1-dir/--mi2-dir
+# for other layouts (macOS, flatpak, a custom dump directory, etc.).
+STEAM_COMMON="${STEAM_COMMON:-$HOME/.local/share/Steam/steamapps/common}"
+MI1_DIR_DEFAULT="$STEAM_COMMON/The Secret of Monkey Island Special Edition"
+MI2_DIR_DEFAULT="$STEAM_COMMON/Monkey2"
 
 TARGET="all"
 OUT_DIR=""
@@ -90,14 +93,15 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-OUT_DIR="${OUT_DIR:-$SCRIPT_DIR/../build/monkey}"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"   # scripts/convert -> repo root
+OUT_DIR="${OUT_DIR:-$REPO_ROOT/build/monkey}"
 if [ -z "$WORK_DIR" ]; then
     # Always nest a private subdir so the cleanup `rm -rf "$WORK_DIR"` can only
     # ever remove a dir this script created -- never a shared exported $SCRATCH.
     if [ -n "${SCRATCH:-}" ]; then
         WORK_DIR="$SCRATCH/monkey-work"
     else
-        WORK_DIR="$SCRIPT_DIR/../build/monkey-work"
+        WORK_DIR="$REPO_ROOT/build/monkey-work"
     fi
 fi
 mkdir -p "$OUT_DIR" "$WORK_DIR"

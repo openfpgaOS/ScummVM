@@ -175,8 +175,6 @@ void SoundCD::playCDTrackInternal(int track, int numLoops, int startFrame, int d
 			// getCDStatus broken so only the first (intro) cue is ever heard.
 			stream = Audio::SeekableAudioStream::openStreamFile(
 				Common::Path(Common::String::format("track%d", track)));
-			warning("[cdmus] track=%d loops=%d start=%d dur=%d openStreamFile=%s",
-					track, numLoops, startFrame, duration, stream ? "OK" : "NULL");
 #endif
 			if (!stream)
 				return;
@@ -205,10 +203,6 @@ void SoundCD::playCDTrackInternal(int track, int numLoops, int startFrame, int d
 
 		_mixer->playStream(Audio::Mixer::kMusicSoundType, _fileBasedCDAudioHandle,
 						   Audio::makeLoopingAudioStream(stream, start, end, (numLoops < 1) ? numLoops + 1 : numLoops));
-#ifdef NONSTANDARD_PORT
-		warning("[cdmus] track=%d playStream issued (handleActive=%d)",
-				track, _mixer->isSoundHandleActive(*_fileBasedCDAudioHandle));
-#endif
 	}
 }
 

@@ -12,13 +12,19 @@
 #define SCUMM_LITTLE_ENDIAN
 #define SCUMM_NEED_ALIGNMENT
 
-/* Enabled engines */
+/* Enabled engines.
+ *
+ * NOTE: the per-engine build (Makefile) selects the engine for each ELF via
+ * -DENABLE_<X> on the command line, AFTER stripping ENABLE_SCUMM from a config
+ * shadow (it greps 'ENABLE_SCUMM' out of this file).  So the ENABLE_SCUMM below
+ * only takes effect for an old-style single-ELF build that compiles config.h
+ * directly; the shipped multi-ELF build (scummvm_lucasarts/agi/sci) ignores it
+ * and generates per-engine plugin/detection tables instead.
+ *
+ * SCUMM_7_8 (v7/v8 SMUSH) and HE (Humongous) stay off in all builds. */
 #define ENABLE_SCUMM 1
 /* Do NOT define ENABLE_SCUMM_7_8 — we only want v0-v6 */
 /* Do NOT define ENABLE_HE — no Humongous Entertainment games */
-/* SCI/SCI32 (Sierra) intentionally NOT enabled — this build focuses only on
- * LucasArts SCUMM titles.  The sci/ sources are also dropped from the Makefile
- * and LINK_PLUGIN(SCI)/LINK_PLUGIN(SCI_DETECTION) from the engine tables. */
 
 /* Feature flags */
 #define SCUMMVM_USE_PRAGMA_PACK

@@ -34,10 +34,17 @@ Validated shape against the engine's parseISO9660 expectations: PVD at sector
 LE32 @ rec+2, size as LE32 @ rec+10, flags @ rec+25, nameLen @ rec+32, 8.3
 uppercase names with a ';1' version suffix.
 
+A matching reader (read_iso / extract_iso) parses the same cooked layout, so the
+toolkit stays pure-python with no mkisofs/bsdtar/pycdlib dependency for either
+direction.
+
 API:
   build_iso(out_path, [(arcname, src_path), ...], volid='SCUMMVM')
+  read_iso(iso_path)          -> [ {name, path, lba, size}, ... ] (recursive)
+  extract_iso(iso_path, dir)  -> [written_paths]  (flat, streamed, collision-safe)
 CLI:
   lib_iso9660.py <out.iso> <volid> <file1> [file2 ...]
+  lib_iso9660.py --extract <in.iso> <out_dir>
 """
 import struct, sys, os, datetime
 
@@ -292,9 +299,110 @@ def build_iso(out_path, files, volid='SCUMMVM'):
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# Reader -- parse a cooked (2048-byte/sector) ISO9660 image.  Mirrors the
+# port's backend/openfpga_cue_archive.cpp parseISO9660/parseDirectory: PVD at
+# LBA 16, root dir record at PVD+156, records {extent LE32 @+2, size LE32 @+10,
+# flags @+25, nameLen @+32, name @+33}, ';version' suffix stripped.
+# ---------------------------------------------------------------------------
+
+def _strip_version(name):
+    i = name.rfind(';')
+    if i > 0:
+        name = name[:i]
+    while name.endswith('.'):
+        name = name[:-1]
+    return name
+
+
+def _walk_dir(f, lba, size, prefix, out):
+    f.seek(lba * SECTOR)
+    buf = f.read(size)
+    subdirs = []
+    off = 0
+    while off < size:
+        rec_len = buf[off]
+        if rec_len == 0:                       # 0 = pad to next sector
+            nxt = ((off // SECTOR) + 1) * SECTOR
+            if nxt >= size:
+                break
+            off = nxt
+            continue
+        if rec_len < 33 or off + rec_len > size:
+            off += rec_len
+            continue
+        r = buf[off:off + rec_len]
+        ent_lba = struct.unpack('<I', r[2:6])[0]
+        ent_size = struct.unpack('<I', r[10:14])[0]
+        flags = r[25]
+        nlen = r[32]
+        name = r[33:33 + nlen]
+        off += rec_len
+        if nlen == 1 and name in (b'\x00', b'\x01'):   # '.' and '..'
+            continue
+        nm = _strip_version(name.decode('latin1'))
+        full = nm if not prefix else prefix + '/' + nm
+        if flags & 0x02:
+            subdirs.append((ent_lba, ent_size, full))
+        else:
+            out.append(dict(name=nm, path=full, lba=ent_lba, size=ent_size))
+    for lba2, size2, pfx in subdirs:
+        _walk_dir(f, lba2, size2, pfx, out)
+
+
+def read_iso(iso_path):
+    """Parse a cooked 2048-byte/sector ISO9660 image. Returns a list of
+    {name, path, lba, size} for every file, recursing subdirectories.
+    `name` is the basename, `path` the full '/'-joined path, both with the
+    ';version' suffix stripped. Does not read file data."""
+    with open(iso_path, 'rb') as f:
+        f.seek(16 * SECTOR)
+        pvd = f.read(SECTOR)
+        if len(pvd) < 190 or pvd[0] != 1 or pvd[1:6] != b'CD001':
+            raise ValueError("no ISO9660 PVD at LBA 16: %s" % iso_path)
+        root = pvd[156:156 + 34]
+        root_lba = struct.unpack('<I', root[2:6])[0]
+        root_size = struct.unpack('<I', root[10:14])[0]
+        out = []
+        _walk_dir(f, root_lba, root_size, '', out)
+        return out
+
+
+def extract_iso(iso_path, out_dir):
+    """Extract every file from a cooked ISO9660 image into out_dir (flat, by
+    basename, streamed in 1 MiB chunks). Raises on a basename collision so a
+    structured source can't silently drop a file. Returns the written paths."""
+    os.makedirs(out_dir, exist_ok=True)
+    entries = read_iso(iso_path)
+    written = {}
+    with open(iso_path, 'rb') as f:
+        for e in entries:
+            if e['name'] in written:
+                raise ValueError("basename collision in %s: '%s' vs '%s'" %
+                                 (iso_path, e['path'], written[e['name']]))
+            dst = os.path.join(out_dir, e['name'])
+            f.seek(e['lba'] * SECTOR)
+            remaining = e['size']
+            with open(dst, 'wb') as o:
+                while remaining > 0:
+                    chunk = f.read(min(1 << 20, remaining))
+                    if not chunk:
+                        break
+                    o.write(chunk)
+                    remaining -= len(chunk)
+            written[e['name']] = e['path']
+    return [os.path.join(out_dir, n) for n in written]
+
+
 def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == '--extract':
+        paths = extract_iso(sys.argv[2], sys.argv[3])
+        print("extracted %d files from %s -> %s" %
+              (len(paths), sys.argv[2], sys.argv[3]))
+        return
     if len(sys.argv) < 4:
-        print("usage: lib_iso9660.py <out.iso> <volid> <file1> [file2 ...]",
+        print("usage: lib_iso9660.py <out.iso> <volid> <file1> [file2 ...]\n"
+              "       lib_iso9660.py --extract <in.iso> <out_dir>",
               file=sys.stderr)
         sys.exit(2)
     out = sys.argv[1]; volid = sys.argv[2]; srcs = sys.argv[3:]

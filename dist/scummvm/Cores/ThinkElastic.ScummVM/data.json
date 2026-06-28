@@ -31,7 +31,7 @@
                 "name": "Application",
                 "required": false,
                 "parameters": 0,
-                "filename": "scummvm.elf",
+                "filename": "scummvm_lucasarts.elf",
                 "extensions": ["elf"],
                 "deferload": true
             },

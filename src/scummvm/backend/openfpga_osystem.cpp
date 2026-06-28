@@ -42,7 +42,8 @@ OpenFPGAGraphicsManager::OpenFPGAGraphicsManager()
       _overlayVisible(false), _paletteDirty(false), _screenDirty(false),
       _cursorX(160), _cursorY(100), _cursorHotX(0), _cursorHotY(0),
       _cursorW(0), _cursorH(0), _cursorKeycolor(0), _cursorVisible(false),
-      _gpuReady(false), _videoBufIdx(-1), _videoFence(0), _gpuCleanMask(0) {
+      _gpuReady(false), _videoBufIdx(-1), _videoFence(0), _gpuCleanMask(0),
+      _splashActive(false) {
     memset(_screenBuf, 0, sizeof(_screenBuf));
     memset(_palette, 0, sizeof(_palette));
     memset(_cursorData, 0, sizeof(_cursorData));
@@ -98,15 +99,19 @@ void OpenFPGAGraphicsManager::initSize(uint width, uint height, const Graphics::
     _screenDirty = true;
 
     /* Game graphics only -- main() will flip to FRAMEBUFFER right
-     * before engine->run().  Re-assert the 8-bit mode here, but do NOT
-     * clear/flip: the engine calls initSize() at the very start of
-     * run(), long before its slow data load finishes and it pushes a
-     * first frame.  Clearing here (and via the legacy of_video_flip path,
-     * which also desyncs the GPU triple-buffer rotation set up by the
-     * splash) would blank the ScummVM logo for the whole load.  Leave the
-     * splash on the framebuffer; the first updateScreen() replaces it
-     * (clearFrameBorders + full-screen copy handle the size change). */
-    configureFramebufferMode();
+     * before engine->run().  Configure the color mode and clear here.
+     *
+     * EXCEPT while the boot splash is up: the engine calls initSize() during
+     * init -- long before it has a real frame -- and an unconditional
+     * clear+flip blanked the logo to black for the whole (slow) data load.
+     * The mode is already configured for the splash (same fixed 8-bit FB), so
+     * skip the blank entirely; the first real updateScreen() replaces the
+     * logo with game content (and clears _splashActive). */
+    if (!_splashActive) {
+        configureFramebufferMode();
+        of_video_clear(0);
+        of_video_flip();
+    }
 }
 
 void OpenFPGAGraphicsManager::setPalette(const byte *colors, uint start, uint num) {
@@ -253,6 +258,10 @@ void OpenFPGAGraphicsManager::presentFrame() {
 }
 
 void OpenFPGAGraphicsManager::updateScreen() {
+    /* The engine is presenting a real frame now -- let initSize() blank
+     * normally again (this frame replaces the splash on screen). */
+    _splashActive = false;
+
     /* Pump audio (mixer only -- no timer/MIDI recursion) before and
      * after presentation; the frame copy/flip can stall long enough to
      * drain the 21 ms audio FIFO. */
@@ -312,7 +321,24 @@ void OpenFPGAGraphicsManager::showSplash() {
      * size + buffer + palette on its first real frame, replacing this. */
     _screenW = SPLASH_W;
     _screenH = SPLASH_H;
-    memcpy(_screenBuf, SPLASH_PIX, SPLASH_W * SPLASH_H);
+
+    /* Draw the logo a little smaller than full-screen: nearest-neighbor
+     * downscale into a centered region and fill the surround with the logo's
+     * background color (top-left corner pixel).  Tweak SPLASH_NUM/DEN to
+     * resize -- 4/5 = 80%. */
+    const int SPLASH_NUM = 4, SPLASH_DEN = 5;
+    const int dstW = SPLASH_W * SPLASH_NUM / SPLASH_DEN;
+    const int dstH = SPLASH_H * SPLASH_NUM / SPLASH_DEN;
+    const int xOff = (SPLASH_W - dstW) / 2;
+    const int yOff = (SPLASH_H - dstH) / 2;
+    memset(_screenBuf, SPLASH_PIX[0], SPLASH_W * SPLASH_H);
+    for (int dy = 0; dy < dstH; ++dy) {
+        const uint8_t *srcRow = SPLASH_PIX + (dy * SPLASH_H / dstH) * SPLASH_W;
+        uint8_t *dstRow = _screenBuf + (yOff + dy) * SPLASH_W + xOff;
+        for (int dx = 0; dx < dstW; ++dx)
+            dstRow[dx] = srcRow[dx * SPLASH_W / dstW];
+    }
+
     for (int i = 0; i < 256; i++) {
         _palette[i * 3]     = (uint8_t)(SPLASH_PAL[i] >> 16);
         _palette[i * 3 + 1] = (uint8_t)(SPLASH_PAL[i] >> 8);
@@ -322,6 +348,9 @@ void OpenFPGAGraphicsManager::showSplash() {
         _paletteDirty = true;
         updateScreen();
     }
+    /* Armed only after our own updateScreen() calls above, so the next
+     * updateScreen() (the engine's first real frame) is what disarms it. */
+    _splashActive = true;
 }
 
 Graphics::PixelFormat OpenFPGAGraphicsManager::getOverlayFormat() const {

@@ -114,6 +114,11 @@ private:
     uint32 _videoFence;
     uint32 _gpuCleanMask;
 
+    /* True from showSplash() until the engine pushes its first real frame.
+     * While set, initSize() must NOT blank the display so the logo stays up
+     * through the engine's slow data load. */
+    bool _splashActive;
+
     void ensureGpuReady();
     uint8_t *acquireFrameBuffer();
     void clearFrameBorders(uint8_t *fb, uint fbW, uint fbH, uint fbStride,

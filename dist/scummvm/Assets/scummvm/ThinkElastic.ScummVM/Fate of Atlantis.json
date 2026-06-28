@@ -5,7 +5,7 @@
         "data_slots": [
             { "id": 1, "filename": "os.bin" },
             { "id": 2, "filename": "atlantis_os.ini" },
-            { "id": 3, "filename": "scummvm.elf" },
+            { "id": 3, "filename": "scummvm_lucasarts.elf" },
             { "id": 4, "filename": "atlantis.iso" },
             { "id": 5, "filename": "bank.ofsf" },
             { "id": 9, "filename": "atlantis.ini" },
