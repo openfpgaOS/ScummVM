@@ -2222,7 +2222,14 @@ Resource *ResourceManager::updateResource(ResourceId resId, ResourceSource *src,
 		}
 	}
 
-	AudioVolumeResourceSource *avSrc = dynamic_cast<AudioVolumeResourceSource *>(src);
+	// NOTE: this port maps dynamic_cast -> reinterpret_cast (portdefs.h, built
+	// with -fno-rtti), so a real dynamic_cast type-check is unavailable -- it
+	// would never return null.  Use the ResourceSource type tag instead;
+	// otherwise relocateMapOffset() runs on non-audio sources (e.g. patches),
+	// reading a bogus _compressedOffsets HashMap and crashing (misaligned load,
+	// seen booting LSL5/LSL6 via readResourcePatches -> processPatch).
+	AudioVolumeResourceSource *avSrc = (src->getSourceType() == kSourceAudioVolume)
+		? static_cast<AudioVolumeResourceSource *>(src) : nullptr;
 	if (avSrc != nullptr && !avSrc->relocateMapOffset(offset, size)) {
 		warning("Compressed volume %s does not contain a valid entry for %s (map offset %u)", src->getLocationName().toString().c_str(), resId.toString().c_str(), offset);
 		_hasBadResources = true;

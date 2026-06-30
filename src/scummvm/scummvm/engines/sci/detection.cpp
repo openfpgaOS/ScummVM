@@ -324,6 +324,57 @@ void SciMetaEngineDetection::dumpDetectionEntries() const {
 #endif
 }
 
+// openfpgaOS skip-detection support.  The port's launcher bypasses the MD5
+// file scan and instantiates the engine straight from the per-game os.ini,
+// so SciMetaEngine::createInstance is reached with a null descriptor.  This
+// recovers the matching real ADGameDescription row from SciGameDescriptions
+// (which lives in this translation unit) by scoring the rows against the
+// ConfMan target fields the launcher copied from the ini.  Authentic table
+// rows are used so flags such as ADGF_DEMO / ADGF_CD are correct (e.g. the
+// Freddy Pharkas speech demo).  The detector itself is untouched.
+const ADGameDescription *openFPGAFindGameDesc(const Common::String &gameid,
+		const Common::String &extra, Common::Platform platform,
+		Common::Language language) {
+	const bool wantDemo = extra.contains("Demo") || extra.contains("demo");
+	const bool wantCD = extra.contains("CD");
+
+	const ADGameDescription *best = nullptr;
+	int bestScore = -1000000;
+	for (const ADGameDescription *d = SciGameDescriptions; d->gameId != nullptr; ++d) {
+		if (gameid != d->gameId)
+			continue;
+
+		int score = 0;
+		if (platform != Common::kPlatformUnknown) {
+			if (d->platform == platform)
+				score += 8;
+			else if (d->platform == Common::kPlatformUnknown)
+				score += 1;
+		}
+		if (language != Common::UNK_LANG) {
+			if (d->language == language)
+				score += 4;
+			else if (d->language == Common::UNK_LANG)
+				score += 1;
+		}
+		// Demo and full versions must agree so we never silently launch a demo.
+		if (((d->flags & ADGF_DEMO) != 0) != wantDemo)
+			score -= 1000;
+		// Avoid a CD row unless the variant asked for CD (floppy is the default).
+		if ((d->flags & ADGF_CD) != 0 && !wantCD)
+			score -= 100;
+		// Exact "extra"/variant string is the finest tiebreak.
+		if (!extra.empty() && d->extra && extra == d->extra)
+			score += 2;
+
+		if (score > bestScore) {
+			bestScore = score;
+			best = d;
+		}
+	}
+	return best;
+}
+
 } // End of namespace Sci
 
 REGISTER_PLUGIN_STATIC(SCI_DETECTION, PLUGIN_TYPE_ENGINE_DETECTION, Sci::SciMetaEngineDetection);

@@ -48,13 +48,19 @@ bool writeExact(FILE *f, const void *data, uint32 bytes) {
     return true;
 }
 
-/* Trailing-'*' wildcard match.  Matches the simple patterns ScummVM
- * uses for listSavefiles ("monkey.s##" gets translated by the engine
- * to specific names, "scummvm-*" style patterns also occur). */
+/* Wildcard match for the patterns ScummVM passes to listSavefiles, matching
+ * Common::matchString's convention: '*' = 0+ chars, '?' = any one char, and
+ * '#' = one DIGIT.  The '#' case is essential: SCI's native save/load lists
+ * with getSavegamePattern() = "<target>.###" (three digit wildcards), so
+ * without it "lsl3.001" never matches "lsl3.###" and the load list is empty. */
 bool patternMatch(const char *name, const char *pat) {
     while (*pat && *name) {
         if (*pat == '*') return true;
         if (*pat == '?') { pat++; name++; continue; }
+        if (*pat == '#') {
+            if (*name < '0' || *name > '9') return false;
+            pat++; name++; continue;
+        }
         if (*pat != *name) return false;
         pat++; name++;
     }

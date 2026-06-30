@@ -21,7 +21,9 @@
 
 #include "common/config-manager.h"
 #include "common/file.h"
+#include "common/language.h"
 #include "common/md5.h"
+#include "common/platform.h"
 #include "common/savefile.h"
 #include "common/textconsole.h"
 #include "common/translation.h"
@@ -243,6 +245,9 @@ public:
 	}
 
 	Common::Error createInstance(OSystem *syst, Engine **engine, const Agi::AGIGameDescription *gd) const override;
+	// openfpgaOS skip-detection: recover a real descriptor from the ini when
+	// the launcher passes none (see openFPGAFindGameDesc in detection.cpp).
+	Common::Error createInstance(OSystem *syst, Engine **engine, const DetectedGame &gameDescriptor, const void *meDescriptor) override;
 
 	SaveStateList listSaves(const char *target) const override;
 	int getMaximumSaveSlot() const override;
@@ -262,6 +267,32 @@ bool AgiMetaEngine::hasFeature(MetaEngineFeature f) const {
 	    (f == kSavesSupportCreationDate) ||
 	    (f == kSavesSupportPlayTime) ||
 		(f == kSimpleSavesNames);
+}
+
+// Defined in detection.cpp (same translation-unit family as gameDescriptions).
+namespace Agi {
+extern const AGIGameDescription *openFPGAFindGameDesc(const Common::String &gameid,
+		const Common::String &extra, Common::Platform platform, Common::Language language);
+}
+
+Common::Error AgiMetaEngine::createInstance(OSystem *syst, Engine **engine, const DetectedGame &gameDescriptor, const void *meDescriptor) {
+	// openfpgaOS launches the engine without running detection, so meDescriptor
+	// is null.  Recover the real AGIGameDescription row from the ini's target
+	// fields before handing off to the normal AdvancedDetector path.
+	if (!meDescriptor && ConfMan.hasKey("openfpga_skip_detection") &&
+	    ConfMan.getBool("openfpga_skip_detection")) {
+		const Common::String gameid = ConfMan.get("gameid");
+		const Common::String extra = ConfMan.hasKey("extra") ? ConfMan.get("extra") : Common::String();
+		const Common::Platform platform = ConfMan.hasKey("platform")
+		    ? Common::parsePlatform(ConfMan.get("platform")) : Common::kPlatformUnknown;
+		const Common::Language language = ConfMan.hasKey("language")
+		    ? Common::parseLanguage(ConfMan.get("language")) : Common::UNK_LANG;
+		meDescriptor = Agi::openFPGAFindGameDesc(gameid, extra, platform, language);
+		if (!meDescriptor)
+			return Common::Error(Common::kUnsupportedGameidError,
+			    Common::String::format("openfpga_skip_detection: no AGI detection entry for '%s'", gameid.c_str()));
+	}
+	return AdvancedMetaEngineBase::createInstance(syst, engine, gameDescriptor, meDescriptor);
 }
 
 Common::Error AgiMetaEngine::createInstance(OSystem *syst, Engine **engine, const Agi::AGIGameDescription *gd) const {

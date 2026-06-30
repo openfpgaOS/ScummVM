@@ -1,0 +1,23 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": { "id": 666, "select": false },
+        "data_slots": [
+            { "id": 1, "filename": "os.bin" },
+            { "id": 2, "filename": "lsl3_os.ini" },
+            { "id": 3, "filename": "scummvm_sci.elf" },
+            { "id": 4, "filename": "lsl-gham.iso" },
+            { "id": 5, "filename": "bank.ofsf" },
+            { "id": 9, "filename": "lsl3.ini" },
+            { "id": 10, "filename": "lsl3_0.sav" },
+            { "id": 11, "filename": "lsl3_1.sav" },
+            { "id": 12, "filename": "lsl3_2.sav" },
+            { "id": 13, "filename": "lsl3_3.sav" },
+            { "id": 14, "filename": "lsl3_4.sav" },
+            { "id": 15, "filename": "lsl3_5.sav" },
+            { "id": 16, "filename": "lsl3_6.sav" },
+            { "id": 17, "filename": "lsl3_7.sav" },
+            { "id": 18, "filename": "lsl3_8.sav" }
+        ]
+    }
+}

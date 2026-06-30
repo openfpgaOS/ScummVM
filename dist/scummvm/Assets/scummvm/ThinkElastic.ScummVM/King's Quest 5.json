@@ -1,0 +1,71 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": {
+            "id": 666,
+            "select": false
+        },
+        "data_slots": [
+            {
+                "id": 1,
+                "filename": "os.bin"
+            },
+            {
+                "id": 2,
+                "filename": "kq5_os.ini"
+            },
+            {
+                "id": 3,
+                "filename": "scummvm_sci.elf"
+            },
+            {
+                "id": 4,
+                "filename": "kq-coll.iso"
+            },
+            {
+                "id": 5,
+                "filename": "bank.ofsf"
+            },
+            {
+                "id": 9,
+                "filename": "kq5.ini"
+            },
+            {
+                "id": 10,
+                "filename": "kq5_0.sav"
+            },
+            {
+                "id": 11,
+                "filename": "kq5_1.sav"
+            },
+            {
+                "id": 12,
+                "filename": "kq5_2.sav"
+            },
+            {
+                "id": 13,
+                "filename": "kq5_3.sav"
+            },
+            {
+                "id": 14,
+                "filename": "kq5_4.sav"
+            },
+            {
+                "id": 15,
+                "filename": "kq5_5.sav"
+            },
+            {
+                "id": 16,
+                "filename": "kq5_6.sav"
+            },
+            {
+                "id": 17,
+                "filename": "kq5_7.sav"
+            },
+            {
+                "id": 18,
+                "filename": "kq5_8.sav"
+            }
+        ]
+    }
+}

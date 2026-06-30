@@ -5963,8 +5963,45 @@ static const uint16 kq4PatchLolotteDoor[] = {
 	PATCH_END
 };
 
+// KQ4 starts with a manual-lookup copy protection. After Game:init sets up the
+//  initial globals it tests GameIsRestarting: when restarting it goes to the
+//  speed-test room (99), but on a fresh boot it instead does "self newRoom: 701",
+//  the copy-protection room. Room 701 picks a random word from the manual, asks
+//  the player to type it, and only on a correct answer runs "game newRoom: 700"
+//  (its sole success exit). Room 700 is the first room of the intro sequence
+//  (it shows its caption and then changes to room 699), so room 700 is exactly
+//  where the gate hands off to the intro.
+//
+// We skip the gate the same way as LSL2: redirect the fresh-boot transition from
+//  the copy-protection room (701) straight to the room that a correct answer
+//  would have gone to (700). This reproduces the gate's own passed exit and
+//  preserves the intro - room 700 is the gate's success destination, not the
+//  game proper. No required state is lost: room 701's success path only sets
+//  global[16] = global[17], and room 700:init does the identical assignment
+//  itself, so bypassing 701 changes nothing downstream. The restart path
+//  (newRoom 99) is left untouched, and room 701 is reachable from only this site.
+//
+// Applies to: All versions (signature byte-verified against PC SCI0)
+// Responsible method: KQ4:init (fresh-boot branch, after the GameIsRestarting check)
+static const uint16 kq4SignatureSkipCopyProtection[] = {
+	0x38, SIG_UINT16(0x00f7),           // pushi newRoom (0xf7)
+	0x78,                               // push1
+	SIG_MAGICDWORD,
+	0x38, SIG_UINT16(0x02bd),           // pushi 02bd [ room 701 = manual copy protection ]
+	0x54, 0x06,                         // self 06    [ self newRoom: 701 ]
+	0x48,                               // ret
+	SIG_END
+};
+
+static const uint16 kq4PatchSkipCopyProtection[] = {
+	PATCH_ADDTOOFFSET(+4),              // keep: pushi newRoom; push1
+	0x38, PATCH_UINT16(0x02bc),         // pushi 02bc [ room 700 = the gate's correct-answer exit (intro start) ]
+	PATCH_END
+};
+
 //          script, description,                                      signature                                 patch
 static const SciScriptPatcherEntry kq4Signatures[] = {
+	{  true,     0, "skip copy protection",                        1, kq4SignatureSkipCopyProtection,           kq4PatchSkipCopyProtection },
 	{ false,    24, "missing waterfall view",                      1, kq4SignatureMissingWaterfallView,         kq4PatchMissingWaterfallView },
 	{  true,    82, "lolotte door",                                1, kq4SignatureLolotteDoor,                  kq4PatchLolotteDoor },
 	{  true,    90, "fall down stairs",                            1, kq4SignatureFallDownStairs,               kq4PatchFallDownStairs },
@@ -9499,11 +9536,49 @@ static const uint16 larry1PatchCasinoDoors[] = {
 	PATCH_END
 };
 
+// LSL1 (VGA/SCI1) opens in room 720: a combined copy-protection gate -- a six-
+//  button age dialog ("So, how old are you, anyway?") followed by a typed/Tab
+//  trivia + documentation-lookup quiz. rm720:init does room setup then
+//  self setScript: RoomScript; RoomScript:changeState(0) puts up the dialog and
+//  drives the quiz across states 1-8. A correct/adult run reaches state 9, whose
+//  whole body is (global2 newRoom: 100) -> the real game start (outside Lefty's
+//  bar). The success path writes no globals (only the FAIL/quit branches set
+//  global4), so room 100 cannot depend on anything the gate skipped. We rewrite
+//  changeState's state-0 body in place to the exact 12 bytes of state 9's body:
+//  (global2 newRoom: 100); toss; ret -- byte-for-byte the legitimate pass exit,
+//  with the trailing toss preserving stack discipline (drops the changeState
+//  dispatch value, exactly as state 9 does).
+//
+// Applies to: English PC floppy (SCI1/VGA)
+// Responsible method: RoomScript:changeState(0)  (script 720)
+static const uint16 larry1SignatureSkipAgeGate[] = {
+	0x39, 0x04,                         // pushi 04
+	0x38, SIG_UINT16(0x02d0),           // pushi 02d0 (720)
+	0x7a,                               // push2
+	0x39, 0x50,                         // pushi 50
+	SIG_MAGICDWORD,
+	0x72, SIG_UINT16(0x0c4a),           // lofsa (age-dialog setup arg)
+	0x36,                               // push
+	SIG_END
+};
+
+static const uint16 larry1PatchSkipAgeGate[] = {
+	0x38, PATCH_UINT16(0x0173),         // pushi 0173 (newRoom)
+	0x78,                               // push1
+	0x39, 0x64,                         // pushi 64 (100)
+	0x81, 0x02,                         // lag 02   [ global2 = the game object ]
+	0x4a, 0x06,                         // send 06  [ global2 newRoom: 100 ]
+	0x3a,                               // toss     [ drop changeState dispatch value ]
+	0x48,                               // ret
+	PATCH_END
+};
+
 //          script, description,                                signature                       patch
 static const SciScriptPatcherEntry larry1Signatures[] = {
 	{  true,   300, "Spanish: buy apple from barrel man",    1, larry1SignatureBuyApple,        larry1PatchBuyApple },
 	{  true,   300, "casino doors",                          1, larry1SignatureCasinoDoors,     larry1PatchCasinoDoors },
 	{  true,   350, "elevator polygon size",                 1, larry1SignatureElevatorPolygon, larry1PatchElevatorPolygon },
+	{  true,   720, "skip age/document copy protection",     1, larry1SignatureSkipAgeGate,     larry1PatchSkipAgeGate },
 	{  true,   803, "disable speed test",                    1, sci01SpeedTestLocalSignature,   sci01SpeedTestLocalPatch },
 	SCI_SIGNATUREENTRY_TERMINATOR
 };
@@ -9596,8 +9671,38 @@ static const uint16 larry2PatchLotteryTicketMessages2[] = {
 	PATCH_END
 };
 
+// LSL2 boots straight into the "little black book" phone-number copy protection
+//  (room 10 / script.010). LSL2:init (script.000) only branches to the restart
+//  room (99) when GameIsRestarting is true; on a fresh boot it falls through to
+//  "self newRoom: 10", a hard gate whose only success exit is newRoom(90)
+//  (entered on the correct girl's phone number). We redirect the fresh-boot
+//  transition from room 10 to room 90, reproducing the game's own passed exit:
+//  script.010's correct-number branch does the identical "game newRoom: 90" with
+//  no prerequisite state (global100 stays 0; only the separate master-code branch
+//  sets global100 and goes to room 23). Room 10 is reachable from exactly this one
+//  site, so the gate is fully removed. The restart path (newRoom 99) is untouched.
+//
+// Applies to: All versions
+// Responsible method: LSL2:init (fresh-boot branch, after the GameIsRestarting check)
+static const uint16 larry2SignatureSkipCopyProtection[] = {
+	0x38, SIG_UINT16(0x00e4),           // pushi newRoom (0xe4)
+	0x78,                               // push1
+	SIG_MAGICDWORD,
+	0x39, 0x0a,                         // pushi 0a   [ room 10 = "little black book" copy protection ]
+	0x54, 0x06,                         // self 06    [ self newRoom: 10 ]
+	0x48,                               // ret
+	SIG_END
+};
+
+static const uint16 larry2PatchSkipCopyProtection[] = {
+	PATCH_ADDTOOFFSET(+4),              // keep: pushi newRoom; push1
+	0x39, 0x5a,                         // pushi 5a   [ room 90 = game start (the correct-number exit) ]
+	PATCH_END
+};
+
 //          script, description,                                      signature                              patch
 static const SciScriptPatcherEntry larry2Signatures[] = {
+	{  true,     0, "skip copy protection",                        1, larry2SignatureSkipCopyProtection,     larry2PatchSkipCopyProtection },
 	{  true,    63, "plane: no points for wearing parachute",      1, larry2SignatureWearParachutePoints,    larry2PatchWearParachutePoints },
 	{  true,    99, "disable speed test",                          1, sci0EarlySpeedTestSignature,           sci0EarlySpeedTestPatch },
 	{  true,    99, "disable speed test",                          1, sci01SpeedTestGlobalSignature,         sci01SpeedTestGlobalPatch },
@@ -9659,8 +9764,78 @@ static const uint16 larry3PatchVolumeSlider[] = {
 	PATCH_END
 };
 
+// LSL3 opens in room 140 with the age check. Its age dialog is four buttons
+//  ("Under 12" / "13 to 17" / "18 to 25" / "over 25"); picking an adult range
+//  (18-25 / over 25) is what STARTS RoomScript's 5-question trivia quiz. The
+//  quiz advances between questions on Script:seconds (=3) and Script:cycles
+//  (=11) timer cues pumped by Script:doit (via kGetTime + the per-cycle game
+//  loop); it is not advanced by a keypress. On a handheld where number/letter
+//  entry and those timer cues are awkward, the player answers question 1, sees
+//  "Correct"/"Wrong", and is then stranded before question 2.
+//
+// We skip the quiz by reproducing the game's own developer cheat: on the adult
+//  branch, set the number-correct counter (local2) to 6 and jump straight to
+//  changeState 5, which records the maximum filth level (global124 = local2-1
+//  = 5, the full uncensored game), writes RESOURCE.LL3, and goes to room 290.
+//  This mirrors RoomScript:handleEvent's hidden cheat key and the "13 to 17"
+//  clean-version branch, so control flow and stack discipline are known-good.
+//  The hard gate ("Under 12" -> "Come back with your legal guardian!") and the
+//  "13 to 17" clean path are left intact; only the adult path is short-circuited.
+//
+// Applies to: English PC floppy
+// Responsible method: RoomScript:changeState(0)
+static const uint16 larry3SignatureSkipAgeQuiz[] = {
+	0x38, SIG_UINT16(0x010d),           // pushi 010dh [ "To prove you are at least %d..." setup ]
+	0x7a,                               // push2
+	SIG_MAGICDWORD,
+	0x89, 0x0b,                         // lsg 0bh
+	0x39, 0x07,                         // pushi 07
+	0x81, 0x02,                         // lag 02
+	0x4a, 0x08,                         // send 08
+	0x39, 0x57,                         // pushi 57h
+	SIG_END
+};
+
+static const uint16 larry3PatchSkipAgeQuiz[] = {
+	0x35, 0x06,                         // ldi 06
+	0xa3, 0x02,                         // sal 02     [ local2 (#correct) = 6 -> filth level 5 ]
+	0x39, 0x78,                         // pushi 78h  [ changeState ]
+	0x78,                               // push1
+	0x39, 0x05,                         // pushi 05
+	0x54, 0x06,                         // self 06    [ self changeState: 5 -> set filth, newRoom 290 ]
+	0x32, PATCH_UINT16(0x003a),         // jmp 0419h  [ shared inner/outer toss + ret ]
+	PATCH_END
+};
+
+// LSL3 room 120 plays a four-line animated title card via RoomScript:changeState
+//  states 10-13 ("Leisure Suit Larry 3:" / "Passionate Patti" / "in Pursuit of
+//  the" / "Pulsating Pectorals!"). Each line is drawn with a drop-shadow text
+//  proc (two kDisplay calls) and then the state arms Script:cycles = 10 before
+//  the next line. The lines accumulate (y = 30/90/110/130) and persist until
+//  changeState(15) runs newRoom(130), but 10 cycles is far too short: the title
+//  builds and the room changes before it can be read, so it looks like it never
+//  draws. Raise each of the four "ldi 10 / aTop cycles" dwells. The pair
+//  35 0a 65 10 occurs only at these four sites (verified); rewriting the ldi
+//  operand removes the magic match, so one entry with count 4 patches all four.
+//
+// Applies to: English PC floppy
+// Responsible method: RoomScript:changeState(10..13)  (script 120)
+static const uint16 larry3SignatureTitleCardTiming[] = {
+	SIG_MAGICDWORD,
+	0x35, 0x0a,                         // ldi 0ah    [ title-card dwell = 10 cycles ]
+	0x65, 0x10,                         // aTop 10h   [ Script:cycles ]
+	SIG_END
+};
+
+static const uint16 larry3PatchTitleCardTiming[] = {
+	0x35, 0x50,                         // ldi 50h    [ = 80 cycles, ~2.4s/line ]
+	PATCH_END
+};
+
 //          script, description,                                      signature                      patch
 static const SciScriptPatcherEntry larry3Signatures[] = {
+	{  true,   120, "slow down intro title cards",                 4, larry3SignatureTitleCardTiming,larry3PatchTitleCardTiming },
+	{  true,   140, "skip age-verification trivia quiz",           1, larry3SignatureSkipAgeQuiz,    larry3PatchSkipAgeQuiz },
 	{  true,   290, "disable speed test",                          1, sci01SpeedTestGlobalSignature, larry3PatchSpeedTest },
 	{  true,   290, "fix speed test overflow",                     1, sci0SpeedTestOverflowSignature,sci0SpeedTestOverflowPatch },
 	{  true,   997, "fix volume slider",                           1, larry3SignatureVolumeSlider,   larry3PatchVolumeSlider },
@@ -9895,6 +10070,38 @@ static const uint16 larry5PatchPokerJackpotInit[] = {
 	PATCH_END
 };
 
+// LSL5 room 258 is the AeroDork airport ticket machine. Its "five-character
+//  Destination Code" lookup is a mid-game manual/brochure copy protection: the
+//  player must read the code for the chosen city + time of day out of the printed
+//  AeroDork booklet and key it in. rm258:notify validates the typed value against
+//  local[4 + local16] (the per-city/time code table; local16 = the menu-selected
+//  destination, not set by the code) and on a mismatch refuses to dispense a
+//  boarding pass, blocking the exit from the airport. We neutralise it by turning
+//  the failure branch into a no-op: the "bnt 000bh" to the incorrect-destination
+//  path becomes "bnt 0000h", so a matching OR non-matching entry both fall through
+//  to the existing dispense-pass success path. The actual destination is governed
+//  by local16 (the menu pick), not the typed code, so the bypass cannot send the
+//  player to a wrong room; stack discipline is unchanged (the shared toss still
+//  removes the switch value).
+//
+// Applies to: English PC floppy (where another version differs the patch is skipped)
+// Responsible method: rm258:notify  (script 258)
+static const uint16 larry5SignatureSkipDestinationCode[] = {
+	0x3c,                               // dup            [ switch value = entered destination code ]
+	0x83, 0x10,                         // lal 10h        [ local16 = selected city/time index ]
+	SIG_MAGICDWORD,
+	0x93, 0x04,                         // lali 04h       [ acc = local[4 + local16] = correct code ]
+	0x1a,                               // eq?
+	0x30, SIG_UINT16(0x000b),           // bnt 000bh      [ -> "incorrect destination" failure path ]
+	SIG_END
+};
+
+static const uint16 larry5PatchSkipDestinationCode[] = {
+	PATCH_ADDTOOFFSET(+6),              // dup / lal 10h / lali 04h / eq?  (left intact)
+	0x30, PATCH_UINT16(0x0000),         // bnt 0000h      [ never branch: any/empty code is accepted ]
+	PATCH_END
+};
+
 //          script, description,                                      signature                               patch
 static const SciScriptPatcherEntry larry5Signatures[] = {
 	{  true,     0, "update stopGroop client",                     1, larry5SignatureUpdateStopGroopClient,   larry5PatchUpdateStopGroopClient },
@@ -9902,6 +10109,7 @@ static const SciScriptPatcherEntry larry5Signatures[] = {
 	{  true,     0, "poker jackpot init",                          1, larry5SignaturePokerJackpotInit,        larry5PatchPokerJackpotInit },
 	{  true,   130, "speed up palette animation",                  1, larry5SignatureMrBiggPaletteAnimation,  larry5PatchMrBiggPaletteAnimation },
 	{  true,   190, "hollywood sign",                              1, larry5SignatureHollywoodSign,           larry5PatchHollywoodSign },
+	{  true,   258, "skip destination-code copy protection",       1, larry5SignatureSkipDestinationCode,     larry5PatchSkipDestinationCode },
 	{  true,   280, "English-only: fix green card limo bug",       1, larry5SignatureGreenCardLimoBug,        larry5PatchGreenCardLimoBug },
 	{  true,   380, "German-only: Enlarge Patti Textbox",          1, larry5SignatureGermanEndingPattiTalker, larry5PatchGermanEndingPattiTalker },
 	{  true,   500, "speed up palette animation",                  1, larry5SignatureRoom500PaletteAnimation, larry5PatchRoom500PaletteAnimation },
@@ -11192,6 +11400,49 @@ static const uint16 laurabow1PatchCopyProtectionRandomFix[] = {
 	PATCH_END
 };
 
+// LB1 boots into the fingerprint copy protection (room 414). myCopy:init draws
+//  the two fingerprints and "self setScript: rmScript" (the sequence object in
+//  this same script, exported at the CLASS/OBJECT after the main code). That
+//  sequence's changeState drives states 0-6: states 0-5 show the comparison and
+//  wait for the player to click the matching fingerprint; the correct click cues
+//  changeState(6), which is the sole success exit. State 6 cleans up, prints the
+//  pass message and runs "self setScript: ScriptID(409)" -- the post-protection
+//  continuation that the boot room (script 99) also jumps to when the printed
+//  document check passes. The whole intro plays from script 409 onward, i.e.
+//  AFTER the gate, so landing on state 6 preserves it untouched.
+//
+// We auto-pass in place: the changeState(0) entry (which myCopy:init triggers
+//  first) is rewritten to immediately "self changeState: 6". init has already
+//  run, so the views and globals state 6 cleans up exist; state 6 is otherwise
+//  self-contained (it reads nothing that states 1-5 set), so this reproduces the
+//  exact legitimate success path -- the same re-entrant "changeState(6) called
+//  from within changeState" that a correct answer performs -- and lands on the
+//  gate's own setScript: ScriptID(409) success exit. The existing room-414
+//  "copy protection random fix" (on myCopy:init) is untouched and coexists.
+//
+// Applies to: DOS, Amiga, Atari ST
+// Responsible method: rmScript:changeState(0)  (the copy-protection sequence)
+static const uint16 laurabow1SignatureCopyProtectionSkip[] = {
+	SIG_MAGICDWORD,
+	0x35, 0x00,                         // ldi 00
+	0x1a,                               // eq?       [ state == 0 ? ]
+	0x30, SIG_UINT16(0x002a),           // bnt 002a  [ -> state 1 check ]
+	0x39, 0x0e,                         // pushi 0e  [ state 0 body: Display arg count ]
+	0x38, SIG_UINT16(0x019e),           // pushi 019e (414)
+	0x78,                               // push1
+	SIG_END
+};
+
+static const uint16 laurabow1PatchCopyProtectionSkip[] = {
+	PATCH_ADDTOOFFSET(+6),              // keep: ldi 00; eq?; bnt 002a (the state-0 test)
+	0x39, 0x78,                         // pushi 78 (changeState)
+	0x78,                               // push1
+	0x39, 0x06,                         // pushi 06
+	0x54, 0x06,                         // self 06   [ self changeState: 6 -> success exit (setScript ScriptID(409)) ]
+	0x32, PATCH_UINT16(0x0223),         // jmp 07ef  [ shared toss; ret ]
+	PATCH_END
+};
+
 // At the end of the game a dialog asks if you'd like to review your notes.
 //  Pressing the escape key dismisses the dialog and locks up the game with the
 //  menu and input disabled. The script is missing a handler for this result.
@@ -11237,6 +11488,7 @@ static const SciScriptPatcherEntry laurabow1Signatures[] = {
 	{  true,   236, "tell Lilly about Gertie blocking fix 1/2", 1, laurabow1SignatureTellLillyAboutGerieBlockingFix1, laurabow1PatchTellLillyAboutGertieBlockingFix1 },
 	{  true,   236, "tell Lilly about Gertie blocking fix 2/2", 1, laurabow1SignatureTellLillyAboutGerieBlockingFix2, laurabow1PatchTellLillyAboutGertieBlockingFix2 },
 	{  true,   414, "copy protection random fix",               1, laurabow1SignatureCopyProtectionRandomFix,         laurabow1PatchCopyProtectionRandomFix },
+	{  true,   414, "copy protection skip",                     1, laurabow1SignatureCopyProtectionSkip,              laurabow1PatchCopyProtectionSkip },
 	{  true,   786, "review notes dialog fix",                  1, laurabow1SignatureReviewNotesDialog,               laurabow1PatchReviewNotesDialog },
 	{  true,   998, "obstacle collision lockups fix",           1, laurabow1SignatureObstacleCollisionLockupsFix,     laurabow1PatchObstacleCollisionLockupsFix },
 	SCI_SIGNATUREENTRY_TERMINATOR
@@ -12704,8 +12956,79 @@ static const uint16 laurabow2CDPatchAudioTextMenuSupport2[] = {
 	PATCH_END
 };
 
+// Laura Bow 2's copy protection is the Egyptian-hieroglyph quiz in room 18.
+//  rm18:init shuffles the hieroglyph props and (self setScript: sInitEm), which
+//  runs the sInitEm -> sFlipIt -> sAskIt script chain. sAskIt:changeState drives
+//  the gate: state 1 rolls a random question (1..25, avoiding the two previously
+//  asked ones tracked in global[146]/global[147]) and, keyed by the checkpoint
+//  selector global[123] (1/3/5), stores the post-quiz destination room into
+//  local[2] (room 230, 355 or 420). It then advances to state 2 (display the
+//  question) and waits for the player to click the matching hieroglyph
+//  (egyptProp:doVerb). State 3 finally does (global2 newRoom: local[2]) - the
+//  genuine success exit to the next story room - after scoring the answer with two
+//  script 0 procedures (callb export 3 = correct, callb export 4 = wrong;
+//  accumulated wrong answers are what eject the player).
+//
+// SCI's heuristic copy-protection auto-skip does not cover this because it is an
+//  interactive hieroglyph-click puzzle, not a text-entry code dialog, so an explicit
+//  script patch is required. We auto-pass in place with two changes to state 1:
+//
+//  1/2: force the random picker to always fall through to the destination switch.
+//   The "avoid a repeat question" check would otherwise re-roll (re-pick path) when
+//   the random question equals a previously asked one; that re-pick path joins the
+//   state-1 tail without having set local[2]. Turning its branch into an
+//   unconditional jump means every roll proceeds to the global[123] switch and sets
+//   local[2]. A "repeat" question is harmless since the player never sees it.
+//
+//  2/2: at the tail of state 1, once local[2] (the destination) has been set, jump
+//   straight to the existing (global2 newRoom: local[2]) at the end of state 3,
+//   bypassing the question display, the click, and the scoring. Because local[2] is
+//   keyed off global[123], every checkpoint still lands on its own correct
+//   destination room, and no wrong-answer penalty is ever recorded - byte-for-byte
+//   the legitimate pass exit. The intro (room 110) plays earlier and is untouched.
+//   Stack discipline is preserved: at the jump the only stack value is the
+//   changeState switch value, which the shared trailing toss removes, exactly as the
+//   original state-3 path does.
+//
+// Applies to: All versions (script 18 + message 18 are shared by Floppy and CD)
+// Responsible method: sAskIt:changeState(1)  (script 18)
+static const uint16 laurabow2SignatureSkipCopyProtection1[] = {
+	0x81, 0x93,                         // lag global[147]
+	0x1a,                               // eq?        [ rolled question == previously asked one? ]
+	SIG_MAGICDWORD,
+	0x31, 0x0a,                         // bnt 0a     [ no repeat -> global[123] destination switch ]
+	0x6d, 0x14,                         // dpToa 14h  [ repeat -> re-pick (re-roll) path ]
+	0x38, SIG_UINT16(0x0091),           // pushi 0091 (cue)
+	SIG_END
+};
+
+static const uint16 laurabow2PatchSkipCopyProtection1[] = {
+	PATCH_ADDTOOFFSET(+3),              // keep: lag global[147]; eq?
+	0x33,                               // jmp 0a     [ always proceed to set the destination ]
+	PATCH_END
+};
+
+static const uint16 laurabow2SignatureSkipCopyProtection2[] = {
+	0x34, SIG_UINT16(0x01a4),           // ldi 01a4   [ global[123]==5 branch: local[2] = room 420 ]
+	0xa3, 0x02,                         // sal local[2]
+	SIG_MAGICDWORD,
+	0x3a,                               // toss       [ drop the global[123] switch value ]
+	0x35, 0x02,                         // ldi 02
+	0x65, 0x1c,                         // aTop 1c    [ self.state = 2 -> show the question and wait ]
+	0x32, SIG_UINT16(0x0077),           // jmp 0077   [ -> changeState end (final toss + ret) ]
+	SIG_END
+};
+
+static const uint16 laurabow2PatchSkipCopyProtection2[] = {
+	PATCH_ADDTOOFFSET(+6),              // keep: ldi 420; sal local[2]; toss
+	0x32, PATCH_UINT16(0x0071),         // jmp 0071   [ -> existing (global2 newRoom: local[2]) success exit ]
+	PATCH_END
+};
+
 //          script, description,                                      signature                                      patch
 static const SciScriptPatcherEntry laurabow2Signatures[] = {
+	{  true,    18, "CD/Floppy: skip copy protection 1/2",            1, laurabow2SignatureSkipCopyProtection1,          laurabow2PatchSkipCopyProtection1 },
+	{  true,    18, "CD/Floppy: skip copy protection 2/2",            1, laurabow2SignatureSkipCopyProtection2,          laurabow2PatchSkipCopyProtection2 },
 	{  true,   560, "CD: painting closing immediately",               1, laurabow2CDSignaturePaintingClosing,            laurabow2CDPatchPaintingClosing },
 	{  true,     0, "CD: fix hands-off cursor",                       1, laurabow2CDSignatureFixHandsOffCursor,          laurabow2CDPatchFixHandsOffCursor },
 	{  true,     0, "CD/Floppy: museum music volume",                 1, laurabow2SignatureMuseumMusicVolume,            laurabow2PatchMuseumMusicVolume },
@@ -14709,8 +15032,44 @@ static const uint16 pq2PatchSpeedTest[] = {
 	PATCH_END
 };
 
+// PQ2 boots through its title/intro (room 200) which then hands off to the
+//  manual-lookup copy protection in room 701 (rm701:doit). The gate shows a
+//  random mug shot and demands the suspect's LAST name (read from the printed
+//  manual): on a wrong answer it prints "Sorry Bonds..." and re-prompts; only a
+//  correct answer falls through to its success branch, which runs
+//  "gGame:restart()" (selector 249) - the game then re-inits, sets the intro-seen
+//  flag and lands in room 1 (the real game start). Room 701 is reachable only
+//  from room 200, after the intro, so the intro is upstream of the gate.
+//
+// We skip the gate by redirecting rm701:doit straight to its own correct-answer
+//  success branch (offset 0x01ce). This reproduces the gate's exact passed exit
+//  (class:draw/enable + gGame:restart -> room 1) and removes the blocking prompt
+//  without typing. The intro (room 200) is untouched and still plays.
+//
+// Applies to: All versions
+// Responsible method: rm701:doit (the copy-protection room)
+static const uint16 pq2SignatureSkipCopyProtection[] = {
+	0x3f, 0x02,                         // link 02   [ rm701:doit ]
+	0x78,                               // push1
+	0x78,                               // push1
+	SIG_MAGICDWORD,
+	0x43, 0x46, 0x02,                   // callk GetTime 02 [ pick random suspect ]
+	0x36,                               // push
+	0x35, 0x07,                         // ldi 07
+	0x12,                               // and
+	0xa5, 0x00,                         // sat 00
+	SIG_END
+};
+
+static const uint16 pq2PatchSkipCopyProtection[] = {
+	PATCH_ADDTOOFFSET(+2),              // keep: link 02
+	0x32, PATCH_UINT16(0x012e),         // jmp 012e [ -> 0x01ce: success branch = gGame:restart() ]
+	PATCH_END
+};
+
 //          script, description,                                 signature                     patch
 static const SciScriptPatcherEntry pq2Signatures[] = {
+	{  true,   701, "skip copy protection",                   1, pq2SignatureSkipCopyProtection, pq2PatchSkipCopyProtection },
 	{  true,    99, "disable speed test, fix intro speed",    1, pq2SignatureSpeedTest,        pq2PatchSpeedTest },
 	SCI_SIGNATUREENTRY_TERMINATOR
 };

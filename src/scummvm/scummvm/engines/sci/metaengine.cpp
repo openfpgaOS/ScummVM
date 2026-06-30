@@ -23,6 +23,8 @@
 #include "base/plugins.h"
 #include "common/config-manager.h"
 #include "common/file.h"
+#include "common/language.h"
+#include "common/platform.h"
 #include "common/ptr.h"
 #include "common/savefile.h"
 #include "common/system.h"
@@ -186,6 +188,9 @@ public:
 	}
 
 	Common::Error createInstance(OSystem *syst, Engine **engine, const ADGameDescription *desc) const override;
+	// openfpgaOS skip-detection: recover a real descriptor from the ini when
+	// the launcher passes none (see openFPGAFindGameDesc in detection.cpp).
+	Common::Error createInstance(OSystem *syst, Engine **engine, const DetectedGame &gameDescriptor, const void *meDescriptor) override;
 	bool hasFeature(MetaEngineFeature f) const override;
 
 	SaveStateList listSaves(const char *target) const override;
@@ -202,6 +207,30 @@ public:
 	void registerDefaultSettings(const Common::String &target) const override;
 	GUI::OptionsContainerWidget *buildEngineOptionsWidget(GUI::GuiObject *boss, const Common::String &name, const Common::String &target) const override;
 };
+
+// Defined in detection.cpp (same translation-unit family as SciGameDescriptions).
+extern const ADGameDescription *openFPGAFindGameDesc(const Common::String &gameid,
+		const Common::String &extra, Common::Platform platform, Common::Language language);
+
+Common::Error SciMetaEngine::createInstance(OSystem *syst, Engine **engine, const DetectedGame &gameDescriptor, const void *meDescriptor) {
+	// openfpgaOS launches the engine without running detection, so meDescriptor
+	// is null.  Recover the real ADGameDescription row from the ini's target
+	// fields before handing off to the normal AdvancedDetector path.
+	if (!meDescriptor && ConfMan.hasKey("openfpga_skip_detection") &&
+	    ConfMan.getBool("openfpga_skip_detection")) {
+		const Common::String gameid = ConfMan.get("gameid");
+		const Common::String extra = ConfMan.hasKey("extra") ? ConfMan.get("extra") : Common::String();
+		const Common::Platform platform = ConfMan.hasKey("platform")
+		    ? Common::parsePlatform(ConfMan.get("platform")) : Common::kPlatformUnknown;
+		const Common::Language language = ConfMan.hasKey("language")
+		    ? Common::parseLanguage(ConfMan.get("language")) : Common::UNK_LANG;
+		meDescriptor = openFPGAFindGameDesc(gameid, extra, platform, language);
+		if (!meDescriptor)
+			return Common::Error(Common::kUnsupportedGameidError,
+			    Common::String::format("openfpga_skip_detection: no SCI detection entry for '%s'", gameid.c_str()));
+	}
+	return AdvancedMetaEngineBase::createInstance(syst, engine, gameDescriptor, meDescriptor);
+}
 
 Common::Error SciMetaEngine::createInstance(OSystem *syst, Engine **engine, const ADGameDescription *desc) const {
 	const GameIdStrToEnum *g = gameIdStrToEnum;

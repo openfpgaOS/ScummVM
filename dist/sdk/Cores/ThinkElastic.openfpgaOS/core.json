@@ -31,12 +31,6 @@
                 "id": 0,
                 "filename": "os25.rbf_r",
                 "chip32_vm": "loader.bin"
-            },
-            {
-                "name": "os30",
-                "id": 1,
-                "filename": "os30.rbf_r",
-                "chip32_vm": "loader.bin"
             }
         ]
     }

@@ -641,6 +641,53 @@ Common::String AgiMetaEngineDetection::getGalDirHashFromA2DiskImage(Common::Seek
 	return Common::computeStreamMD5AsString(stream, GAL_A2_LOGDIR_SIZE);
 }
 
+// openfpgaOS skip-detection support.  The port's launcher bypasses the MD5
+// file scan and instantiates the engine straight from the per-game os.ini,
+// so AgiMetaEngine::createInstance is reached with a null descriptor.  This
+// recovers the matching real AGIGameDescription row from gameDescriptions
+// (which lives in this translation unit) by scoring its rows against the
+// ConfMan target the launcher copied from the ini.  A real row is required:
+// the engine reads gameType / gameID / features / version (interpreter and
+// opcode selection) straight from it.  The detector itself is untouched.
+const AGIGameDescription *openFPGAFindGameDesc(const Common::String &gameid,
+		const Common::String &extra, Common::Platform platform,
+		Common::Language language) {
+	const bool wantDemo = extra.contains("Demo") || extra.contains("demo");
+
+	const AGIGameDescription *best = nullptr;
+	int bestScore = -1000000;
+	for (const AGIGameDescription *g = gameDescriptions; g->desc.gameId != nullptr; ++g) {
+		if (gameid != g->desc.gameId)
+			continue;
+
+		int score = 0;
+		if (platform != Common::kPlatformUnknown) {
+			if (g->desc.platform == platform)
+				score += 8;
+			else if (g->desc.platform == Common::kPlatformUnknown)
+				score += 1;
+		}
+		if (language != Common::UNK_LANG) {
+			if (g->desc.language == language)
+				score += 4;
+			else if (g->desc.language == Common::UNK_LANG)
+				score += 1;
+		}
+		// Demo and full versions must agree so we never silently launch a demo.
+		if (((g->desc.flags & ADGF_DEMO) != 0) != wantDemo)
+			score -= 1000;
+		// Exact "extra"/variant string is the finest tiebreak.
+		if (!extra.empty() && g->desc.extra && extra == g->desc.extra)
+			score += 2;
+
+		if (score > bestScore) {
+			bestScore = score;
+			best = g;
+		}
+	}
+	return best;
+}
+
 } // end of namespace Agi
 
 REGISTER_PLUGIN_STATIC(AGI_DETECTION, PLUGIN_TYPE_ENGINE_DETECTION, Agi::AgiMetaEngineDetection);

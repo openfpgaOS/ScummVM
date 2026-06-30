@@ -27,6 +27,8 @@ SDK API, see the [openfpgaOS SDK](https://github.com/openfpgaOS/openfpgaOS).)
   - [Data-slot map](#data-slot-map)
   - [SD-card layout](#sd-card-layout)
 - [Add a new game (the whole workflow)](#add-a-new-game-the-whole-workflow)
+- [Packaging a compilation disc](#packaging-a-compilation-disc-many-games-one-image)
+- [Copy protection & startup gates](#copy-protection--startup-gates-sci)
 - [`os.ini` reference](#osini-reference)
 - [Instance JSON reference](#instance-json-reference)
 - [Game data: formats & conversion](#game-data-formats--conversion)
@@ -47,30 +49,64 @@ The build ships **one ELF per engine**, all sharing a single compiled-once core:
 
 | Engine | ELF | Covers | Status |
 |--------|-----|--------|--------|
-| SCUMM (v0–v6) | `scummvm_lucasarts.elf` | LucasArts: Maniac Mansion → *The Dig*-era v6 | the bundled games |
-| AGI | `scummvm_agi.elf` | Sierra AGI (King's Quest I–III, Space Quest I–II, …) | builds clean; runtime-untested on the port |
-| SCI | `scummvm_sci.elf` | Sierra SCI (SCI0/1/1.1; **not** SCI32) | builds clean; runtime-untested on the port |
+| SCUMM (v0–v6) | `scummvm_lucasarts.elf` | LucasArts: Maniac Mansion → *The Dig*-era v6 | working |
+| SCI (SCI0/1/1.1; **not** SCI32) | `scummvm_sci.elf` | Sierra SCI: Leisure Suit Larry, Space Quest, Freddy Pharkas, … | working — extensively exercised by the LSL & Space Quest sets (LSL3 verified end-to-end: quiz, music, intro, save) |
+| AGI | `scummvm_agi.elf` | Sierra AGI: King's Quest I–III, Space Quest I–II, … | builds clean; first packaged instance (SQ2) not yet runtime-verified |
 
 SCUMM v7/v8 and Humongous Entertainment stay off; SCI32 (needs 16-bit RGB) is
-excluded. Each game's `os.ini` points `[os] ELF=` at the ELF for its engine, so
-adding an AGI or SCI game is just config — no rebuild (see
-[Add a new game](#add-a-new-game-the-whole-workflow)). All five bundled games
-are SCUMM, so they use `scummvm_lucasarts.elf`.
+excluded — so e.g. the Space Quest 6 disc will not run. Each game's `os.ini`
+points `[os] ELF=` at the ELF for its engine, so adding an AGI or SCI game is
+**config only — no rebuild**. The one exception is a game that needs a new
+copy-protection skip patch (those live in the SCI ELF — see
+[Copy protection & startup gates](#copy-protection--startup-gates-sci)). The
+backend glue (video, audio, MIDI synth, CD audio, saves, input) lives in
+`src/scummvm/backend/`; the engine is vendored under `src/scummvm/scummvm/`;
+the per-engine build is `src/scummvm/Makefile` (`ENGINES = scumm agi sci`).
 
-The backend glue (video, audio, MIDI synth, CD audio, save files, input) lives in
-`src/scummvm/backend/`; the ScummVM engine is vendored under
-`src/scummvm/scummvm/`. The per-engine build is driven by `src/scummvm/Makefile`
-(`ENGINES = scumm agi sci`).
+### Packaged games
 
-Bundled instances (see `dist/scummvm/Assets/scummvm/ThinkElastic.ScummVM/`):
+Instances live in `dist/scummvm/Assets/scummvm/` (`common/<base>_os.ini` +
+`ThinkElastic.ScummVM/<Name>.json`). Games on a compilation disc share **one**
+slot-4 image and are disambiguated by `subdir=` (see
+[Packaging a compilation disc](#packaging-a-compilation-disc-many-games-one-image)).
 
-| Game | gameid | variant | Music source |
-|------|--------|---------|--------------|
+**LucasArts (SCUMM, `scummvm_lucasarts.elf`)** — one image per game:
+
+| Game | gameid | variant | Music |
+|------|--------|---------|-------|
 | The Secret of Monkey Island | `monkey` | `SE` | CD audio (WAV-in-ISO) + SE voices |
-| Monkey Island 2: LeChuck's Revenge | `monkey2` | `SE` | iMUSE MIDI (synth) + SE voices |
-| Indiana Jones and the Fate of Atlantis | `atlantis` | — | iMUSE MIDI (synth) |
+| Monkey Island 2: LeChuck's Revenge | `monkey2` | `SE` | iMUSE MIDI + SE voices |
+| Indiana Jones and the Fate of Atlantis | `atlantis` | — | iMUSE MIDI |
 | Loom | `loom` | `VGA` | CD audio (CDDA.SOU) |
-| Day of the Tentacle | `tentacle` | — | iMUSE MIDI (synth) |
+| Day of the Tentacle | `tentacle` | — | iMUSE MIDI |
+| Sam & Max Hit the Road | `samnmax` | — | iMUSE MIDI |
+
+**Leisure Suit Larry "Greatest Hits" (SCI, `scummvm_sci.elf`)** — shared
+`lsl-gham.iso`, one `subdir` per game. Startup copy-protection / age gates are
+patched out where present (✱):
+
+| Game | gameid | subdir | variant | Gate removed |
+|------|--------|--------|---------|--------------|
+| LSL1 (VGA remake) | `lsl1sci` | `LSL1VGA` | `SCI` | ✱ age quiz + manual lookup |
+| LSL2 | `lsl2` | `LSL2` | — | ✱ "little black book" phone number |
+| LSL3 | `lsl3` | `LSL3` | — | ✱ age trivia quiz |
+| LSL5 | `lsl5` | `LSL5` | — | ✱ mid-game ticket code |
+| LSL6 | `lsl6` | `LSL6` | — | none |
+| Crazy Nick's: Larry's Casino | `cnick-lsl` | `ARCADES` | — | none |
+| Freddy Pharkas (demo) | `freddypharkas` | `FPFPDEMO` | `CD Demo` | none |
+
+**Space Quest Collection (SCI + AGI)** — shared `sq-coll.iso`, one `subdir` per
+game. None of them have copy protection (Sierra dropped it by this era):
+
+| Game | gameid | engine | subdir | variant |
+|------|--------|--------|--------|---------|
+| Space Quest 1 (VGA) | `sq1sci` | sci | `SQ1VGA` | `SCI` |
+| Space Quest 2 | `sq2` | **agi** | `SQ2` | — |
+| Space Quest 3 | `sq3` | sci | `SQ3` | — |
+| Space Quest 4 (CD) | `sq4` | sci | `SQ4` | — |
+| Space Quest 5 | `sq5` | sci | `SQ5` | — |
+
+You supply the game data — the port ships configs, not copyrighted assets.
 
 You supply the game data — the port ships configs, not copyrighted assets.
 
@@ -268,7 +304,127 @@ games need extra steps — see [Music](#music-three-paths)).
 cd src/scummvm && make copy        # rebuilds the tree and copies to the card
 ```
 
+`make copy` writes to the **mounted SD card** and prints `Deployed!` on success.
+If no card is mounted it fails at the copy step (`copy.sh` → `Error 1`) while the
+build still succeeds — so if a rebuilt game behaves identically on the device,
+**check the card was mounted and that `Deployed!` printed** before re-debugging.
+
 Boot → ScummVM core → **Sam & Max Hit the Road** appears in the list.
+
+---
+
+## Packaging a compilation disc (many games, one image)
+
+Multi-game discs (the LSL "Greatest Hits", the Space Quest Collection, …) hold
+every game in one ISO, each in its own top-level folder. Rather than carve out an
+image per game, **all the instances share that one slot-4 image and set `subdir=`
+to the game's folder** inside it — the card carries the ISO once.
+
+**1. Inspect the disc** — list the game folders and identify each:
+
+```bash
+7z l My_Collection.iso | grep -i RESOURCE.MAP   # SCI/SCUMM game folders
+7z l My_Collection.iso | grep -i LOGDIR         # AGI game folders
+```
+
+A folder with `RESOURCE.MAP` (+ `RESOURCE.000/001…`) is SCI; one with `LOGDIR` +
+`VOL.*` is AGI. Match each to its ScummVM `gameid`/`variant`/engine in the
+vendored `detection_tables.h` (`engines/sci/…`, `engines/agi/…`,
+`engines/scumm/…`). Note the per-game **engine** — a single disc can mix engines
+(the Space Quest Collection has SQ2 on AGI and the rest on SCI).
+
+**2. Give the image a short name** and reuse it as `data_file` for every game:
+
+```bash
+mv My_Collection.iso mycoll.iso        # data_file=mycoll.iso
+```
+
+**3. Write one `os.ini` + one JSON per game** — same `data_file=mycoll.iso`,
+different `subdir=`, and the right `[os] ELF=` (and slot-3 ELF in the JSON) for
+that game's engine:
+
+```ini
+# game1_os.ini  — an SCI game in folder GAME1 on the shared disc
+[os]
+ELF=scummvm_sci.elf
+ARGS=game1id
+
+[scummvm]
+gameid=game1id
+engineid=sci
+description=Game One
+platform=pc
+language=en
+music=openfpga
+variant=VGA
+data_file=mycoll.iso
+subdir=GAME1
+```
+
+For a whole set, a tiny generator beats hand-editing — loop over
+`(base, gameid, engine, description, subdir, variant)` and emit the `_os.ini` +
+`.json` pair for each (the LSL/SQ sets were produced this way). `subdir` is
+honored by the port's ISO/zip mount (`backend/openfpga_cue_archive.cpp` /
+`openfpga_fs.cpp`): the engine sees only that folder's files.
+
+**4. Deploy once** — copy `mycoll.iso` into the card's `Assets/scummvm/common/`
+and `make copy`. Every game in the collection then appears in the list, all
+reading the one image.
+
+> **Skip-detection (read this for `variant`).** The launcher forces
+> `openfpga_skip_detection=true`, so the engine does **not** MD5-scan the disc; it
+> builds the game descriptor from your `gameid` + `platform` + `language` +
+> `variant`. Get those right — especially `variant`/"extra" to pick **EGA vs VGA**
+> or **floppy vs CD** — or the engine selects the wrong descriptor. The recovery
+> path is the per-engine `openFPGAFindGameDesc()` + the 4-arg `createInstance`
+> override in `engines/<engine>/metaengine.cpp`.
+
+---
+
+## Copy protection & startup gates (SCI)
+
+Many Sierra SCI games open with a copy-protection or age gate — type a word from
+the manual, a code wheel, the LSL "prove you're an adult" quiz. The launcher sets
+`copy_protection=false`, which auto-passes the *anti-piracy* checks the engine
+recognises (and removes most SCUMM ones outright). But two cases still block:
+some SCI screens render even though the check is bypassed, and the LSL **age
+quizzes** aren't classed as copy protection at all, so they hard-gate until
+patched.
+
+These skips are real **SCI script patches** compiled into `scummvm_sci.elf`
+(`engines/sci/engine/script_patches.cpp`) — the same mechanism ScummVM uses
+upstream. Already shipped:
+
+| Game | gameid | Patch (in `script_patches.cpp`) |
+|------|--------|---------------------------------|
+| LSL1 VGA | `lsl1sci` | `larry1…SkipAgeGate` — room 720 |
+| LSL2 | `lsl2` | `larry2…SkipCopyProtection` — room 10 |
+| LSL3 | `lsl3` | `larry3…SkipAgeQuiz` — room 140 |
+| LSL5 | `lsl5` | `larry5…SkipDestinationCode` — room 258 |
+
+The Space Quest games need none.
+
+**Adding a skip for a new game:**
+
+1. **Decompile to find the gate.** Decode the game's `RESOURCE.*` (port the
+   decompressor from `engines/sci/resource/decompressor.cpp` — it covers
+   SCI0/1/1.1 LZW/Huffman/DCL) and scan the TEXT/MESSAGE resources for the gate
+   prompt; locate the room/script that implements it.
+2. **Write the patch.** Add a `SciScriptPatcherEntry` to that game's
+   `larryN…`/`sqN…` table: a `SIG_MAGICDWORD` signature that occurs **exactly
+   once** in the script + a `PATCH_…` replacement that redirects the gate to its
+   own "passed" exit or rewrites the check to always pass. Mirror an existing one
+   — `larry2SignatureSkipCopyProtection` redirects a startup `newRoom`;
+   `larry1SignatureSkipAgeGate` rewrites `changeState(0)` to the success state.
+3. **Keep the intro.** Land on the gate's *success* destination, never past a
+   logo/title/story sequence. If the intro plays inside or right after the gate
+   room, auto-pass the gate **in place** instead of jumping to gameplay (verify
+   where the intro sits relative to the gate, as the LSL1/LSL2 patches do).
+4. **Rebuild** `scummvm_sci.elf` (`make build`) — script patches are baked into
+   the ELF, so this is the one game-add that *does* require a rebuild.
+
+This code step is the only non-config part of packaging; games with no gate (or
+SCUMM, where `copy_protection=false` strips it) never need it.
 
 ---
 

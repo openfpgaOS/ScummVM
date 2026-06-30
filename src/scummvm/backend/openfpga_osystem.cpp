@@ -17,6 +17,9 @@
 #include "openfpga_save.h"
 #include "splash_logo.h"
 #include "audio/mixer.h"
+#include "graphics/font.h"
+#include "graphics/fontman.h"
+#include "graphics/surface.h"
 
 extern "C" {
 #include <of_cache.h>
@@ -44,7 +47,7 @@ OpenFPGAGraphicsManager::OpenFPGAGraphicsManager()
       _cursorW(0), _cursorH(0), _cursorKeycolor(0), _cursorVisible(false),
       _gpuReady(false), _videoBufIdx(-1), _videoFence(0), _gpuCleanMask(0),
       _gpuStalled(false), _gpuStallToken(0),
-      _splashActive(false) {
+      _splashActive(false), _keypadMode(false) {
     memset(_screenBuf, 0, sizeof(_screenBuf));
     memset(_palette, 0, sizeof(_palette));
     memset(_cursorData, 0, sizeof(_cursorData));
@@ -306,10 +309,16 @@ void OpenFPGAGraphicsManager::updateScreen() {
      * normally again (this frame replaces the splash on screen). */
     _splashActive = false;
 
-    /* Pump audio (mixer only -- no timer/MIDI recursion) before and
-     * after presentation; the frame copy/flip can stall long enough to
-     * drain the 21 ms audio FIFO. */
+    /* Pump audio before and after presentation; the frame copy/flip can stall
+     * long enough to drain the 21 ms audio FIFO.  Advance the MIDI PARSER too,
+     * not just the mixer: during a screen transition the engine spins
+     * updateScreen() per frame without reaching delayMillis/pollEvent, so
+     * without this the held notes keep sounding but the MELODY freezes -- the
+     * residual "hiccup" between screens.  The parser is s_inProc-guarded; the
+     * old "no MIDI recursion" caveat predates that guard. */
+    extern void openfpga_midi_pump_pending(void);
     extern void openfpga_mixer_pump_only(void);
+    openfpga_midi_pump_pending();
     openfpga_mixer_pump_only();
 
     if (_paletteDirty) {
@@ -319,6 +328,8 @@ void OpenFPGAGraphicsManager::updateScreen() {
                        ((uint32_t)_palette[i*3 + 1] <<  8) |
                         (uint32_t)_palette[i*3 + 2];
         }
+        if (_keypadMode)
+            pal32[255] = 0x00FFFFFF; /* reserve white ink for the keypad legend */
         of_video_palette_bulk(pal32, 256);
         _paletteDirty = false;
     }
@@ -347,12 +358,58 @@ void OpenFPGAGraphicsManager::updateScreen() {
     if (_cursorVisible)
         drawCursor(fb, fbW, fbH, fbStride, xOff, yOff);
 
+    if (_keypadMode && !_splashActive)
+        drawKeypadLegend(fb, fbW, fbH, fbStride);
+
     of_cache_flush_range(fb, fbStride * fbH);
     presentFrame();
     _screenDirty = false;
 
+    extern void openfpga_midi_pump_pending(void);
     extern void openfpga_mixer_pump_only(void);
+    openfpga_midi_pump_pending();
     openfpga_mixer_pump_only();
+}
+
+void OpenFPGAGraphicsManager::setKeypadMode(bool on) {
+    if (on != _keypadMode) {
+        _keypadMode = on;
+        /* Re-upload the palette so the reserved white ink (index 255) is
+         * asserted on entry and the game's real index 255 restored on exit. */
+        _paletteDirty = true;
+    }
+}
+
+void OpenFPGAGraphicsManager::drawKeypadLegend(uint8_t *fb, uint fbW, uint fbH,
+                                               uint fbStride) const {
+    const Graphics::Font *font =
+        Graphics::FontManager::instance().getFontByUsage(Graphics::FontManager::kConsoleFont);
+    if (!font)
+        return;
+
+    const int fh = font->getFontHeight();          /* 8 px for the console font */
+    const int line2Y = (int)fbH - fh - 1;
+    const int line1Y = line2Y - fh;
+    if (line1Y < 1)
+        return;
+
+    /* Black background strip behind the two rows for legibility. */
+    int top = line1Y - 1;
+    if (top < 0) top = 0;
+    for (int y = top; y < (int)fbH; ++y)
+        memset(fb + (uint)y * fbStride, 0, fbW);
+
+    Graphics::Surface surf;
+    surf.init((int16)fbW, (int16)fbH, (int16)fbStride, fb,
+              Graphics::PixelFormat::createFormatCLUT8());
+
+    static const char *kLine1 =
+        "ANSWER: A=a B=b X=c Y=d    digits 1-4=up/dn/lt/rt";
+    static const char *kLine2 = "START=Enter   SELECT=exit keypad";
+
+    /* Index 255 is forced to white in updateScreen()'s palette upload. */
+    font->drawString(&surf, kLine1, 2, line1Y, (int)fbW, 255, Graphics::kTextAlignLeft);
+    font->drawString(&surf, kLine2, 2, line2Y, (int)fbW, 255, Graphics::kTextAlignLeft);
 }
 
 void OpenFPGAGraphicsManager::showSplash() {
@@ -490,7 +547,7 @@ int pixelsFromRate(int rate, uint32 elapsedMs, int32 &accum) {
 OSystem_OpenFPGA::OSystem_OpenFPGA()
     : _startTime(0), _ofGfx(nullptr),
       _mouseButtonL(false), _mouseButtonR(false), _autoDismissCounter(60),
-      _ignoreInitialButtons(true), _keypadMode(false),
+      _ignoreInitialButtons(true), _keypadMode(false), _dockKbArmed(false),
       _copyProtectActive(false), _copyProtectKeys(0),
       _masterVolume(255), _musicVolume(192),
       _selectHeld(false), _selectConsumed(false),
@@ -530,6 +587,78 @@ void OSystem_OpenFPGA::initBackend() {
     BaseBackend::initBackend();
 }
 
+// Map a USB-HID Keyboard/Keypad page (0x07) usage code to a ScummVM keycode +
+// ASCII, honoring Shift for printable keys.  Returns false for usages we don't
+// map (modifier keys, etc.).  Drives the dock keyboard in pollEvent().
+static bool hidUsageToScummVM(uint8_t usage, bool shift,
+                              Common::KeyCode &kc, uint16 &ascii) {
+    char un = 0, sh = 0; // printable unshifted / shifted char (0 = not printable)
+
+    if (usage >= 0x04 && usage <= 0x1D) {            // a..z
+        un = (char)('a' + (usage - 0x04));
+        sh = (char)('A' + (usage - 0x04));
+    } else if (usage >= 0x1E && usage <= 0x27) {     // 1..0 number row
+        static const char row[] = "1234567890";
+        static const char sym[] = "!@#$%^&*()";
+        un = row[usage - 0x1E];
+        sh = sym[usage - 0x1E];
+    } else if (usage >= 0x59 && usage <= 0x61) {     // keypad 1..9 -> plain digits
+        un = sh = (char)('1' + (usage - 0x59));
+    } else {
+        switch (usage) {
+        case 0x2D: un = '-';  sh = '_';  break;
+        case 0x2E: un = '=';  sh = '+';  break;
+        case 0x2F: un = '[';  sh = '{';  break;
+        case 0x30: un = ']';  sh = '}';  break;
+        case 0x31: un = '\\'; sh = '|';  break;
+        case 0x33: un = ';';  sh = ':';  break;
+        case 0x34: un = '\''; sh = '"';  break;
+        case 0x35: un = '`';  sh = '~';  break;
+        case 0x36: un = ',';  sh = '<';  break;
+        case 0x37: un = '.';  sh = '>';  break;
+        case 0x38: un = '/';  sh = '?';  break;
+        case 0x2C: un = sh = ' '; break;             // Space
+        case 0x62: un = sh = '0'; break;             // keypad 0
+        case 0x54: un = sh = '/'; break;             // keypad / * - + .
+        case 0x55: un = sh = '*'; break;
+        case 0x56: un = sh = '-'; break;
+        case 0x57: un = sh = '+'; break;
+        case 0x63: un = sh = '.'; break;
+        default: break;
+        }
+    }
+
+    if (un) {
+        ascii = (uint16)(uint8_t)(shift ? sh : un);
+        kc = (Common::KeyCode)(uint8_t)un;           // keycode = the physical (unshifted) key
+        return true;
+    }
+
+    switch (usage) {                                 // non-printable keys
+    case 0x28: case 0x58: kc = Common::KEYCODE_RETURN;    ascii = Common::ASCII_RETURN; return true;
+    case 0x29:            kc = Common::KEYCODE_ESCAPE;    ascii = 27;  return true;
+    case 0x2A:            kc = Common::KEYCODE_BACKSPACE; ascii = 8;   return true;
+    case 0x2B:            kc = Common::KEYCODE_TAB;       ascii = 9;   return true;
+    case 0x4F:            kc = Common::KEYCODE_RIGHT;     ascii = 0;   return true;
+    case 0x50:            kc = Common::KEYCODE_LEFT;      ascii = 0;   return true;
+    case 0x51:            kc = Common::KEYCODE_DOWN;      ascii = 0;   return true;
+    case 0x52:            kc = Common::KEYCODE_UP;        ascii = 0;   return true;
+    case 0x49:            kc = Common::KEYCODE_INSERT;    ascii = 0;   return true;
+    case 0x4A:            kc = Common::KEYCODE_HOME;      ascii = 0;   return true;
+    case 0x4B:            kc = Common::KEYCODE_PAGEUP;    ascii = 0;   return true;
+    case 0x4C:            kc = Common::KEYCODE_DELETE;    ascii = 127; return true;
+    case 0x4D:            kc = Common::KEYCODE_END;       ascii = 0;   return true;
+    case 0x4E:            kc = Common::KEYCODE_PAGEDOWN;  ascii = 0;   return true;
+    default: break;
+    }
+    if (usage >= 0x3A && usage <= 0x45) {            // F1..F12
+        kc = (Common::KeyCode)(Common::KEYCODE_F1 + (usage - 0x3A));
+        ascii = 0;
+        return true;
+    }
+    return false;
+}
+
 bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
     openfpga_drive_audio_and_timers();
 
@@ -538,13 +667,102 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
 
     of_input_poll();
 
-    /* Auto-dismiss GUI dialogs: send Return keypress once after startup.
-     * This handles the "unknown game version" dialog that blocks. */
-    if (_autoDismissCounter > 0) {
-        _autoDismissCounter--;
-        if (_autoDismissCounter == 0) {
-            queueKey(Common::KEYCODE_RETURN, Common::ASCII_RETURN);
-            return popQueuedEvent(event);
+    /* Auto-dismiss REMOVED: this fired a single blind Return ~60 polls (~2s)
+     * after startup to clear ScummVM's "unknown game version" dialog.  But this
+     * port forces openfpga_skip_detection, so that dialog never appears -- and
+     * the stray Return instead landed mid-intro (~2.6s, during room 120/130)
+     * and SKIPPED it, since SCI/AGI/SCUMM intros abort on any keypress.  (The
+     * diagnostic "[ofev] chr=d" was 0x0d = Return, NOT the letter 'd'.)  If a
+     * future game needs a startup dialog dismissed, gate a Return on the GUI
+     * actually being active rather than firing it blindly on a timer. */
+
+    /* ===== Dock USB keyboard =====
+     * A real keyboard plugged into the Pocket dock types directly into the
+     * engine -- no keypad mode needed (so e.g. the LSL age quiz, which reads a
+     * typed number via kReadNumber, is answerable normally).  Checked before
+     * the controller so typed input is never swallowed by keypad/mouse logic. */
+    {
+        of_keyboard_state_t kb;
+        of_input_keyboard_state(&kb);
+        if (kb.present) {
+            byte flags = 0;
+            if (kb.modifiers & (OF_KEYMOD_LCTRL | OF_KEYMOD_RCTRL)) flags |= Common::KBD_CTRL;
+            if (kb.modifiers & (OF_KEYMOD_LALT  | OF_KEYMOD_RALT))  flags |= Common::KBD_ALT;
+            const bool shift = (kb.modifiers & (OF_KEYMOD_LSHIFT | OF_KEYMOD_RSHIFT)) != 0;
+            if (shift)
+                flags |= Common::KBD_SHIFT;
+            /* Only trust the dock keyboard once it has reported an all-keys-
+             * released frame at least once -- a safety net against a stuck or
+             * garbage key present from boot (or a held launch key) before we
+             * accept input, while still letting a real, idle-at-boot keyboard
+             * work normally.  Usages 0x00-0x03 are no-event/error codes, never
+             * real keys, so we skip them. */
+            bool anyPressed = false;
+            for (uint u = 0x04; u < OF_KEYBOARD_MAX_USAGE; ++u) {
+                if (of_keyboard_key_pressed(&kb, (uint8_t)u)) {
+                    anyPressed = true;
+                    if (_dockKbArmed) {
+                        Common::KeyCode kc;
+                        uint16 ascii;
+                        if (hidUsageToScummVM((uint8_t)u, shift, kc, ascii)) {
+                            queueKey(kc, ascii, flags);
+                            return popQueuedEvent(event);
+                        }
+                    }
+                }
+            }
+            if (!anyPressed)
+                _dockKbArmed = true;
+        }
+    }
+
+    /* ===== Dock USB mouse =====
+     * Relative motion -> cursor, buttons -> left/right click.  Uses the SDK's
+     * pressed/released edges, so it composes with the controller cursor. */
+    {
+        of_mouse_state_t m;
+        of_input_mouse_state(&m);
+        if (m.present) {
+            struct { uint16 mask; Common::EventType down, up; } mb[] = {
+                { 0x1u, Common::EVENT_LBUTTONDOWN, Common::EVENT_LBUTTONUP },
+                { 0x2u, Common::EVENT_RBUTTONDOWN, Common::EVENT_RBUTTONUP },
+            };
+            for (uint i = 0; i < 2; ++i) {
+                if (m.buttons_pressed & mb[i].mask || m.buttons_released & mb[i].mask) {
+                    event.type = (m.buttons_pressed & mb[i].mask) ? mb[i].down : mb[i].up;
+                    event.mouse.x = _ofGfx->getMouseX();
+                    event.mouse.y = _ofGfx->getMouseY();
+                    return true;
+                }
+            }
+            if (m.dx || m.dy) {
+                /* The dock reports very large, bursty deltas (observed up to
+                 * ~5000/poll), and moveMouse moves in game pixels -- so cap the
+                 * per-poll input (limits a single jump to CAP/DIV px) and scale
+                 * down by DOCK_MOUSE_DIV, accumulating the remainder so slow
+                 * movements still track.  Raise DOCK_MOUSE_DIV to slow it. */
+                static const int DOCK_MOUSE_DIV = 128;
+                static const int DOCK_MOUSE_CAP = 4096;   /* => max ~32 px/poll */
+                static int accX = 0, accY = 0;
+                int rx = (int)m.dx, ry = (int)m.dy;
+                if (rx >  DOCK_MOUSE_CAP) rx =  DOCK_MOUSE_CAP;
+                if (rx < -DOCK_MOUSE_CAP) rx = -DOCK_MOUSE_CAP;
+                if (ry >  DOCK_MOUSE_CAP) ry =  DOCK_MOUSE_CAP;
+                if (ry < -DOCK_MOUSE_CAP) ry = -DOCK_MOUSE_CAP;
+                accX += rx;
+                accY += ry;
+                int mdx = accX / DOCK_MOUSE_DIV;
+                int mdy = accY / DOCK_MOUSE_DIV;
+                accX -= mdx * DOCK_MOUSE_DIV;
+                accY -= mdy * DOCK_MOUSE_DIV;
+                if (mdx || mdy) {
+                    _ofGfx->moveMouse(mdx, mdy);
+                    event.type = Common::EVENT_MOUSEMOVE;
+                    event.mouse.x = _ofGfx->getMouseX();
+                    event.mouse.y = _ofGfx->getMouseY();
+                    return true;
+                }
+            }
         }
     }
 
@@ -612,14 +830,36 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
                 getMixer()->setVolumeForSoundType(Audio::Mixer::kMusicSoundType, _musicVolume);
             of_mixer_set_group_volume(OF_MIXER_GROUP_MUSIC, _musicVolume);
             _selectConsumed = true;
+        } else if (state.buttons_pressed & OF_BTN_B) {
+            /* SELECT+B = Escape.  SCI menus and many message/dialog windows
+             * dismiss/continue on Esc, and we otherwise have no Escape binding
+             * (plain Esc is avoided because SCUMM uses it to skip cutscenes).
+             * Mark SELECT consumed so the release doesn't toggle the keypad. */
+            _selectConsumed = true;
+            _selectHeld = true;
+            queueKey(Common::KEYCODE_ESCAPE, 27);
+            return popQueuedEvent(event);
+        } else if (state.buttons_pressed & OF_BTN_START) {
+            /* SELECT+START = toggle the numeric keypad, deliberately.  Keypad
+             * mode disables the mouse and turns every button into a digit with
+             * no on-screen indicator, so a bare SELECT tap must NOT enter it
+             * (that looked exactly like a hang -- frozen cursor, buttons typing
+             * numbers).  Entering is now an explicit two-button gesture. */
+            _keypadMode = !_keypadMode;
+            _ofGfx->setKeypadMode(_keypadMode);
+            _selectConsumed = true;
         }
         _selectHeld = true;
         return false;
     }
     if (_selectHeld) {                  /* SELECT just released */
         _selectHeld = false;
-        if (!_selectConsumed)
-            _keypadMode = !_keypadMode; /* tap = toggle keypad */
+        /* A bare SELECT tap only EXITS the keypad (easy escape if it was ever
+         * entered); it never enters it.  Entry is SELECT+START (above). */
+        if (!_selectConsumed && _keypadMode) {
+            _keypadMode = false;
+            _ofGfx->setKeypadMode(_keypadMode);
+        }
         _selectConsumed = false;
         return false;
     }
@@ -627,8 +867,10 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
         static const struct { uint32 btn; Common::KeyCode kc; uint16 ch; } kp[] = {
             { OF_BTN_UP,    Common::KEYCODE_1, '1' }, { OF_BTN_DOWN,  Common::KEYCODE_2, '2' },
             { OF_BTN_LEFT,  Common::KEYCODE_3, '3' }, { OF_BTN_RIGHT, Common::KEYCODE_4, '4' },
-            { OF_BTN_A,     Common::KEYCODE_5, '5' }, { OF_BTN_B,     Common::KEYCODE_6, '6' },
-            { OF_BTN_X,     Common::KEYCODE_7, '7' }, { OF_BTN_Y,     Common::KEYCODE_8, '8' },
+            /* Face buttons are letters a-d: SCI multiple-choice quizzes (the
+             * LSL age questions) read a letter keypress, not a digit/click. */
+            { OF_BTN_A,     Common::KEYCODE_a, 'a' }, { OF_BTN_B,     Common::KEYCODE_b, 'b' },
+            { OF_BTN_X,     Common::KEYCODE_c, 'c' }, { OF_BTN_Y,     Common::KEYCODE_d, 'd' },
             { OF_BTN_L1,    Common::KEYCODE_9, '9' }, { OF_BTN_R1,    Common::KEYCODE_0, '0' },
         };
         for (uint i = 0; i < sizeof(kp) / sizeof(kp[0]); ++i) {
@@ -638,7 +880,11 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
             }
         }
         if (state.buttons_pressed & OF_BTN_START) {
-            _keypadMode = false;   /* submit + auto-exit so the mouse returns */
+            /* Enter, but STAY in keypad mode so a sequence of typed values can
+             * be entered (e.g. the LSL age quiz reads a typed number per
+             * question via kReadNumber: type digit -> Enter -> read result ->
+             * Enter -> next question).  Tap SELECT to leave the keypad when done
+             * (that restores the mouse). */
             queueKey(Common::KEYCODE_RETURN, Common::ASCII_RETURN);
             return popQueuedEvent(event);
         }
@@ -797,6 +1043,11 @@ void openfpga_show_splash(void) {
 }
 
 Common::MutexInternal *OSystem_OpenFPGA::createMutex() {
+    /* Single-threaded port: a real mutex is unnecessary.  Timer-callback
+     * re-entrancy (the only concurrency hazard, since the SCI MIDI timer is
+     * pumped on the main thread) is handled by the s_inProc guard in
+     * openfpga_midi_pump_pending(), not here -- gating the pump on a held
+     * mutex starved sound/cue completion and hung SCI games. */
     return new NullMutexInternal();
 }
 
@@ -868,13 +1119,53 @@ void openfpga_mixer_pump_only(void) {
     g_pumpBusy = false;
 }
 
+/* Drive audio + MIDI + timers during long, non-yielding engine work -- chiefly
+ * SCI1/1.1 room/screen transitions that read+decompress large resource volumes
+ * from the streamed ISO without ever returning to delayMillis / pollEvent /
+ * updateScreen.  Without this the MIDI parser pump never fires (held notes
+ * freeze) and the mixer's ~120 ms HW-ring cushion underruns, so the music stops
+ * until the new screen is up.  Called from the FS read path -- the single choke
+ * point all load traffic flows through.  Time-gated to ~8 ms (one mixer block is
+ * ~5.3 ms) so a burst of block reads can't over-pump.  Reentrancy-safe: funnels
+ * into openfpga_drive_audio_and_timers, whose g_pumpBusy guard turns a nested
+ * speech/CDDA read (pulled by mgr->update()) into a no-op, and the MIDI parser's
+ * s_inProc guard blocks parser re-entry. */
+void openfpga_pump_during_load(void) {
+    static uint32 s_lastPumpMs = 0;
+    uint32 now = of_time_ms();
+
+    /* A load is clearly in flight.  Arm a DEEP audio cushion for the next
+     * ~600 ms: the engine often follows a burst of reads with >120 ms of pure
+     * in-memory work (resource decompress, room kAnimate setup, the transition
+     * effect) during which NO read and NO updateScreen fires -- so neither pump
+     * site runs and the normal 120 ms ring cushion underruns (the "hiccup
+     * between loads").  Pre-filling a deep buffer here rides through that gap;
+     * latency is invisible mid-transition and the target snaps back to 120 ms
+     * the moment loading stops.  Cheap (one store) -- do it on every read, even
+     * when the pump itself is throttled below. */
+    extern void openfpga_mixer_extend_cushion(uint32 untilMs);
+    openfpga_mixer_extend_cushion(now + 600u);
+
+    if ((uint32)(now - s_lastPumpMs) < 8u)
+        return;
+    s_lastPumpMs = now;
+    openfpga_drive_audio_and_timers();
+}
+
 void OSystem_OpenFPGA::getTimeAndDate(TimeDate &td, bool skipRecord) const {
-    /* No RTC on Pocket — return a fixed date */
-    td.tm_sec = 0;
-    td.tm_min = 0;
-    td.tm_hour = 12;
+    /* The Pocket has no RTC, but SCI's kGetTime(12h/24h) MUST advance: timed
+     * Print/Dialog boxes (the "#time" auto-dismiss message/narration windows,
+     * e.g. the LSL3 room-130 story recap) count their seconds down by watching
+     * the packed h:m:s change once per wall-clock second.  A fixed time froze
+     * that countdown, so every such box across ALL SCI games failed to resolve
+     * (never dismissed / never shown).  Synthesize an advancing clock from
+     * uptime so the seconds tick. */
+    uint32 secs = (of_time_ms() - _startTime) / 1000;
+    td.tm_sec  = (int)(secs % 60);
+    td.tm_min  = (int)((secs / 60) % 60);
+    td.tm_hour = (int)((secs / 3600) % 24);
     td.tm_mday = 1;
-    td.tm_mon = 0;
+    td.tm_mon  = 0;
     td.tm_year = 125; /* 2025 - 1900 */
     td.tm_wday = 3;
 }

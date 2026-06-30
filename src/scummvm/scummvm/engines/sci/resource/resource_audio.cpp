@@ -1224,14 +1224,19 @@ void ResourceManager::changeAudioDirectory(const Common::Path &path) {
 	}
 
 	for (SourcesList::iterator it = _sources.begin(); it != _sources.end(); ) {
-		IntMapResourceSource *mapSource = dynamic_cast<IntMapResourceSource *>(*it);
+		// dynamic_cast is reinterpret_cast on this port (portdefs.h, -fno-rtti),
+		// so guard each downcast with the ResourceSource type tag -- otherwise
+		// the "cast" never returns null and we read fields off the wrong type.
+		IntMapResourceSource *mapSource = ((*it)->getSourceType() == kSourceIntMap)
+			? static_cast<IntMapResourceSource *>(*it) : nullptr;
 		if (mapSource && mapSource->_mapNumber != 65535) {
 			delete *it;
 			it = _sources.erase(it);
 			continue;
 		}
 
-		AudioVolumeResourceSource *volSource = dynamic_cast<AudioVolumeResourceSource *>(*it);
+		AudioVolumeResourceSource *volSource = ((*it)->getSourceType() == kSourceAudioVolume)
+			? static_cast<AudioVolumeResourceSource *>(*it) : nullptr;
 		if (volSource && volSource->getLocationName().baseName() == "RESOURCE.AUD") {
 			delete volSource;
 			it = _sources.erase(it);

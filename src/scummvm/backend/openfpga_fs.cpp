@@ -22,6 +22,10 @@ extern "C" {
  * for the current dir via "."  We treat them as the same root. */
 #define OPENFPGA_FS_ROOT  "/cd"
 
+/* Defined in openfpga_osystem.cpp -- keeps audio/MIDI alive across heavy,
+ * non-yielding SCI resource loads (room/screen transitions). */
+extern void openfpga_pump_during_load(void);
+
 namespace {
 
 bool pathIsRoot(const Common::String &p) {
@@ -46,7 +50,16 @@ public:
         uint32 total = 0;
 
         while (cnt) {
-            ssize_t got = ::read(_fd, out + total, cnt);
+            /* Heavy SCI room/screen transitions read+decompress megabytes here
+             * without the engine returning to its event loop; pump audio/MIDI
+             * (throttled + g_pumpBusy-guarded) so the music doesn't drop out. */
+            openfpga_pump_during_load();
+
+            /* Bound one syscall so the pump still fires between chunks on a
+             * single large unbuffered read (e.g. Resource::loadPatch). */
+            uint32 want = (cnt > 64u * 1024u) ? 64u * 1024u : cnt;
+
+            ssize_t got = ::read(_fd, out + total, want);
             if (got < 0) {
                 if (errno == EINTR)
                     continue;

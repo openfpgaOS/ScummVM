@@ -595,6 +595,14 @@ extern "C" int main(int argc, char **argv) {
     if (!strcmp(cfg.engineid, "scumm"))
         ConfMan.setBool("original_gui", true, gid);
 
+    /* Same broken path bites SAVING: with originalsaveload=false the SCI (and
+     * other) engines swap the game's own save/restore for ScummVM's themed
+     * SaveLoadChooser, which faults in GUI::ThemeEval::getVar on this backend
+     * (==TRAP== mcause=4 in addChooserButtons->ThemeEval->HashMap::lookup).
+     * Force the engine's ORIGINAL save/load screen, which renders through the
+     * engine's own graphics and works. */
+    ConfMan.setBool("originalsaveload", true, gid);
+
     ConfMan.setActiveDomain(gid);
 
     status("Plugins...");

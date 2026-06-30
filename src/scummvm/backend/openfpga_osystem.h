@@ -84,6 +84,10 @@ public:
     int16 getMouseY() const { return _cursorY; }
     void moveMouse(int dx, int dy);
 
+    /* On-screen keypad legend: pollEvent pushes the controller keypad-mode
+     * state here so updateScreen() can draw a visible legend over the game. */
+    void setKeypadMode(bool on);
+
     /* Draw the ScummVM logo splash directly to the framebuffer (shown while
      * the engine loads, before it produces its first frame). */
     void showSplash();
@@ -131,6 +135,10 @@ private:
      * through the engine's slow data load. */
     bool _splashActive;
 
+    /* True while the controller numeric keypad is active (pushed from
+     * OSystem_OpenFPGA::pollEvent); draws the on-screen keypad legend. */
+    bool _keypadMode;
+
     void ensureGpuReady();
     uint8_t *acquireFrameBuffer();
     /* Bounded, non-fatal replacement for of_gpu_wait(): returns true when the
@@ -141,6 +149,7 @@ private:
     void presentFrame();
     void drawCursor(uint8_t *dst, uint fbW, uint fbH, uint fbStride,
                     int xOff, int yOff) const;
+    void drawKeypadLegend(uint8_t *fb, uint fbW, uint fbH, uint fbStride) const;
 };
 
 /* Per-instance scummvm.ini filename, set by main() after it discovers
@@ -210,6 +219,8 @@ private:
     bool _mouseButtonL, _mouseButtonR;
     int  _autoDismissCounter;
     bool _ignoreInitialButtons;
+    bool _dockKbArmed;  /* dock keyboard trusted only after a clean (no-key)
+                         * HID frame -- filters a stuck/phantom boot key */
     bool _keypadMode;   /* SELECT toggles a controller numeric keypad so a
                          * keyboard-less user can type codes (e.g. MI2's
                          * copy-protection numbers). */

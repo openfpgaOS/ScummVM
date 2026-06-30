@@ -1621,6 +1621,11 @@ typedef struct {
      * clamp(texel*C + D) — C = per-vertex RGB565 (signed 5b/ch) in the normal
      * rgb[] words, D = the rgb_d[] triple on the 22-word 0x4E.  0 = legacy. */
     uint8_t  cd_combine;
+    /* Vert-tri vertex Y is Q12.4 subpixel instead of an integer scanline
+     * (control bit 31, INCLUDE_DIRECT_COLOR-gated; decoded as data[31] in
+     * gpu_core.v -> spanprod_subpix_y, consumed by gpu_edge_walker.v).
+     * 0 = legacy integer Y. */
+    uint8_t  subpix_y;
 } of_gpu_tri_state_t;
 
 /* 0x4A serves BOTH sticky-state consumers — 0x4B (HW plane derivation)
@@ -1652,7 +1657,8 @@ static inline void of_gpu_set_tri_state(const of_gpu_tri_state_t *st) {
                      | (((uint32_t)st->z_mode & 0x0Fu) << 24)
                      | ((uint32_t)(st->mirror_s & 1u) << 28)   /* G_TX_MIRROR S (ctl[28]) */
                      | ((uint32_t)(st->mirror_t & 1u) << 29)   /* G_TX_MIRROR T (ctl[29]) */
-                     | ((uint32_t)(st->cd_combine & 1u) << 30);/* texel*C+D combine (ctl[30]) */
+                     | ((uint32_t)(st->cd_combine & 1u) << 30) /* texel*C+D combine (ctl[30]) */
+                     | ((uint32_t)(st->subpix_y & 1u) << 31);  /* Q12.4 subpixel Y (ctl[31]) */
 
     /* 17-word 0x4A: word 16 carries the OF_GPU_SPAN_BLEND src alpha (RTL accepts
      * 16- or 17-word; const_alpha is ignored unless OF_GPU_SPAN_BLEND is set). */
@@ -1783,7 +1789,8 @@ static inline void of_gpu_draw_vert_tri_rgb(const int16_t x[3], const int16_t y[
     if (!of_has_feature(OF_HW_GPU_VERT_TRI) || !of_has_feature(OF_HW_GPU_VCOLOR))
         return;
 #endif
-    uint32_t n = rgb_d ? 22u : 19u;
+    uint32_t n = rgb_d ? 19u : 17u;  /* shrunk: dead q29 word dropped, 3 RGB565 packed -> 2 words */
+    (void)q29;                        /* q29 kept in the signature for ABI, no longer emitted */
     _gpu_cmd_header(GPU_CMD_DRAW_VERT_TRI_RGB, n);
     uint32_t *w = _gpu_ring_claim();
     *w++ = ((uint32_t)(uint16_t)y[0] << 16) | (uint16_t)x[0];
@@ -1792,11 +1799,11 @@ static inline void of_gpu_draw_vert_tri_rgb(const int16_t x[3], const int16_t y[
     *w++ = (uint32_t)s[0]; *w++ = (uint32_t)s[1]; *w++ = (uint32_t)s[2];
     *w++ = (uint32_t)t[0]; *w++ = (uint32_t)t[1]; *w++ = (uint32_t)t[2];
     *w++ = (uint32_t)zi[0]; *w++ = (uint32_t)zi[1]; *w++ = (uint32_t)zi[2];
-    *w++ = (uint32_t)rgb[0]; *w++ = (uint32_t)rgb[1]; *w++ = (uint32_t)rgb[2];
-    *w++ = q29;
+    /* w12-13: three RGB565 colours packed into 2 words (rgb1<<16|rgb0, then rgb2). */
+    *w++ = ((uint32_t)rgb[1] << 16) | (uint32_t)rgb[0]; *w++ = (uint32_t)rgb[2];
     *w++ = (uint32_t)depth[0]; *w++ = (uint32_t)depth[1]; *w++ = (uint32_t)depth[2];
-    /* w19-21: per-vertex additive D (RGB565) — only on the 22-word combine path. */
-    if (rgb_d) { *w++ = (uint32_t)rgb_d[0]; *w++ = (uint32_t)rgb_d[1]; *w++ = (uint32_t)rgb_d[2]; }
+    /* w17-18: per-vertex additive D (RGB565) packed 3->2 — only on the 19-word combine path. */
+    if (rgb_d) { *w++ = ((uint32_t)rgb_d[1] << 16) | (uint32_t)rgb_d[0]; *w++ = (uint32_t)rgb_d[2]; }
     _gpu_ring_commit(n);
 }
 
@@ -2017,6 +2024,7 @@ typedef struct {
     uint8_t  mirror_s, mirror_t;
     uint8_t  const_alpha;
     uint8_t  cd_combine;
+    uint8_t  subpix_y;       /* Q12.4 subpixel vert-tri Y — see the non-PC definition above */
 } of_gpu_tri_state_t;
 
 static inline void     of_gpu_init(void)                                  {}

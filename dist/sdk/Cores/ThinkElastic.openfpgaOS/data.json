@@ -24,8 +24,7 @@
                 "name": "OS Config",
                 "required": false,
                 "parameters": 0,
-                "extensions": ["ini"],
-                "address": "0x203C0000"
+                "extensions": ["ini"]
             },
             {
                 "id": 3,

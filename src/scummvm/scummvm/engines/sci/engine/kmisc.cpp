@@ -138,6 +138,17 @@ reg_t kGameIsRestarting(EngineState *s, int argc, reg_t *argv) {
 			neededSleep = 60;
 		}
 		break;
+	case GID_LSL3:
+		// The LSL3 opening - room 120 (story recap) then room 130 (title) -
+		// runs before the age gate and is paced only by the Script class's
+		// per-cycle `cycles` countdowns. Those scenes animate little, so they
+		// do not reliably set _throttleTrigger via kAnimate; without throttling
+		// the cycle counters drain in milliseconds and the whole intro is gone
+		// before it can be seen. Force throttling there at the normal cycle
+		// pace, the same fix the Iceman/SQ5 intros above use.
+		if (s->currentRoomNumber() == 120 || s->currentRoomNumber() == 130)
+			s->_throttleTrigger = true;
+		break;
 	case GID_SQ5:
 		switch (s->currentRoomNumber()) {
 		case 104:

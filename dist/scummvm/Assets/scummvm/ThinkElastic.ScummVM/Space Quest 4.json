@@ -1,0 +1,71 @@
+{
+    "instance": {
+        "magic": "APF_VER_1",
+        "variant_select": {
+            "id": 666,
+            "select": false
+        },
+        "data_slots": [
+            {
+                "id": 1,
+                "filename": "os.bin"
+            },
+            {
+                "id": 2,
+                "filename": "sq4_os.ini"
+            },
+            {
+                "id": 3,
+                "filename": "scummvm_sci.elf"
+            },
+            {
+                "id": 4,
+                "filename": "sq-coll.iso"
+            },
+            {
+                "id": 5,
+                "filename": "bank.ofsf"
+            },
+            {
+                "id": 9,
+                "filename": "sq4.ini"
+            },
+            {
+                "id": 10,
+                "filename": "sq4_0.sav"
+            },
+            {
+                "id": 11,
+                "filename": "sq4_1.sav"
+            },
+            {
+                "id": 12,
+                "filename": "sq4_2.sav"
+            },
+            {
+                "id": 13,
+                "filename": "sq4_3.sav"
+            },
+            {
+                "id": 14,
+                "filename": "sq4_4.sav"
+            },
+            {
+                "id": 15,
+                "filename": "sq4_5.sav"
+            },
+            {
+                "id": 16,
+                "filename": "sq4_6.sav"
+            },
+            {
+                "id": 17,
+                "filename": "sq4_7.sav"
+            },
+            {
+                "id": 18,
+                "filename": "sq4_8.sav"
+            }
+        ]
+    }
+}

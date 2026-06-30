@@ -37,6 +37,7 @@ extern "C" {
 #include <stdlib.h>
 #include <string.h>
 #include <of_mixer.h>
+#include <of_timer.h>
 }
 
 OpenFPGAMixerManager::OpenFPGAMixerManager()
@@ -51,7 +52,25 @@ OpenFPGAMixerManager::OpenFPGAMixerManager()
  * we keep it full, a sound ScummVM mixes "now" lands at the FIFO tail and is
  * heard ~2.7 s later.  Hold only a small low-latency cushion instead so
  * SFX/speech are prompt.  48 stereo pairs = 1 ms @ 48 kHz. */
-static const int kTargetBufferedPairs = 48 * 120;  /* ~120 ms */
+static const int kTargetBufferedPairs  = 48 * 120;  /* ~120 ms (interactive) */
+
+/* Deep cushion used only while a load is in flight.  Heavy SCI room/screen
+ * transitions spend stretches >120 ms in pure in-memory work (resource
+ * decompress, room kAnimate setup, the transition effect) with NO file read
+ * and NO updateScreen(), so neither audio-pump site fires and the 120 ms
+ * cushion above underruns -- the "hiccup between loads".  openfpga_pump_during_
+ * load() (FS read path) arms this deeper target for a short window, so the ring
+ * is pre-filled enough to ride through the compute gap.  Latency is invisible
+ * mid-transition (no interactive SFX), and the instant loading stops the target
+ * drops back to 120 ms and the ring drains down to low latency on its own. */
+static const int kLoadCushionPairs     = 48 * 600;  /* ~600 ms (during loads) */
+static uint32     g_loadCushionUntilMs = 0;
+
+/* Called from openfpga_pump_during_load() on every resource read: hold the deep
+ * cushion until `untilMs` (of_time_ms() clock). */
+void openfpga_mixer_extend_cushion(uint32 untilMs) {
+    g_loadCushionUntilMs = untilMs;
+}
 
 OpenFPGAMixerManager::~OpenFPGAMixerManager() {
     /* of_audio has no explicit close; just stop pushing. */
@@ -96,7 +115,11 @@ void OpenFPGAMixerManager::update() {
     /* Refill only up to a small cushion (kTargetBufferedPairs), never topping
      * the ~2.7 s ring -- otherwise newly-triggered SFX/speech queue behind
      * seconds of already-buffered audio.  of_audio_write copies into the
-     * OS-owned uncached SDRAM ring, so no cache flush is required here. */
+     * OS-owned uncached SDRAM ring, so no cache flush is required here.
+     * While a load is in flight, fill the deeper kLoadCushionPairs instead so a
+     * non-yielding compute gap can't drain the ring to silence (see above). */
+    const int targetPairs = (of_time_ms() < g_loadCushionUntilMs)
+                                ? kLoadCushionPairs : kTargetBufferedPairs;
     for (;;) {
         int freePairs = of_audio_free();
         if (freePairs < (int)_framesPerBlock)
@@ -104,7 +127,7 @@ void OpenFPGAMixerManager::update() {
         int buffered = (_ringCapacity > 0) ? (_ringCapacity - freePairs) : 0;
         if (buffered < 0)
             buffered = 0;
-        if (kTargetBufferedPairs - buffered < (int)_framesPerBlock)
+        if (targetPairs - buffered < (int)_framesPerBlock)
             break;                                      /* cushion reached */
         _mixer->mixCallback((uint8 *)_buffer, _framesPerBlock * 4);
         int wrote = of_audio_write(_buffer, (int)_framesPerBlock);

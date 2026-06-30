@@ -129,7 +129,7 @@ bool midiSuppressed(uint32_t now) {
            (int32_t)(now - g_midiSuppressUntilUs) < 0;
 }
 
-void panicVoicesUnlocked(bool suppressParser) {
+void panicVoicesUnlocked(bool suppressParser, bool resetParser = true) {
     for (int ch = 0; ch < 16; ++ch) {
         smp_voice_update_sustain(ch, false);
         g_sustainSinceUs[ch] = 0;
@@ -138,10 +138,18 @@ void panicVoicesUnlocked(bool suppressParser) {
     stopMusicMixerVoices();
     clearActiveNotes();
     g_midiLastEventUs = 0;
-    g_midiPendingTicks = 0;
-    g_midiLastDispatchUs = OF_SVC ? OF_SVC->timer_get_us() : 0;
-    g_midiSuppressUntilUs = (suppressParser && g_midiLastDispatchUs)
-        ? g_midiLastDispatchUs + MIDI_PANIC_QUIET_US : 0;
+    /* resetParser=false (the stuck-note watchdog in midi_tick_irq): silence a
+     * hung note but DO NOT discard the parser's pending ticks or suppress it.
+     * Otherwise a long/sustained note re-arms the watchdog every IRQ, which
+     * keeps zeroing g_midiPendingTicks so the SCI MIDI parser can never advance
+     * to send the note-off -- deadlocking any "play sound, wait for it to
+     * finish" script (the LSL age quizzes, and SCI cue-waits generally). */
+    if (resetParser) {
+        g_midiPendingTicks = 0;
+        g_midiLastDispatchUs = OF_SVC ? OF_SVC->timer_get_us() : 0;
+        g_midiSuppressUntilUs = (suppressParser && g_midiLastDispatchUs)
+            ? g_midiLastDispatchUs + MIDI_PANIC_QUIET_US : 0;
+    }
 }
 
 void panicVoices(bool suppressParser) {
@@ -223,7 +231,9 @@ extern "C" void midi_tick_irq(void) {
 
         if (g_midiActiveNoteCount && g_midiLastEventUs &&
             (uint32_t)(now - g_midiLastEventUs) > MIDI_STUCK_NOTE_TIMEOUT_US) {
-            panicVoicesUnlocked(true);
+            /* Silence the hung note but keep the parser running (don't zero
+             * pending ticks / suppress) -- see panicVoicesUnlocked. */
+            panicVoicesUnlocked(false, false);
         }
 
         /* Sustain-hang watchdog: if a channel held the sustain pedal longer
@@ -273,6 +283,23 @@ void openfpga_midi_pump_pending(void) {
     if (g_midiSuppressUntilUs)
         g_midiSuppressUntilUs = 0;
 
+    /* Re-entrancy guard.  The original crash was the timer proc (SciMusic::
+     * onTimer) running nested -- pumped again from inside its own MIDI send /
+     * a screen update -- which mutated _playList mid-iteration and asserted
+     * (Common::Array OOB).  Block ONLY true nesting.
+     *
+     * NB: do NOT additionally defer on g_openfpgaLockDepth (any mutex held).
+     * The background score keeps the mixer/SCI mutex busy, so that broad guard
+     * starved the pump -> SciMusic::onTimer never ran -> sound/cue completion
+     * signals (MusicEntry::onTimer: signalQueue -> signal, and the parser's
+     * end-of-track) never propagated -> SCI games that "play a sound, wait for
+     * it to finish, then continue" hung forever (e.g. the LSL3 quiz would not
+     * advance to the next question).  s_inProc alone is the correct, narrow
+     * fix; the engine never re-enters onTimer except through this pump. */
+    static bool s_inProc = false;
+    if (s_inProc)
+        return;
+
     uint16_t ticks = g_midiPendingTicks;
     if (!ticks)
         return;
@@ -282,8 +309,10 @@ void openfpga_midi_pump_pending(void) {
     g_midiPendingTicks = (g_midiPendingTicks > ticks)
         ? (uint16_t)(g_midiPendingTicks - ticks) : 0;
 
+    s_inProc = true;
     for (uint16_t i = 0; i < ticks; ++i)
         proc(param);
+    s_inProc = false;
 }
 
 OpenFPGAMidiDriver::OpenFPGAMidiDriver() : _open(false) {
