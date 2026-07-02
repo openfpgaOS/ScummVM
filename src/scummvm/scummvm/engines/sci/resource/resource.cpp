@@ -360,7 +360,12 @@ Common::SeekableReadStream *ResourceManager::getVolumeFile(ResourceSource *sourc
 	Common::File *file;
 
 #ifdef ENABLE_SCI32
-	ChunkResourceSource *chunkSource = dynamic_cast<ChunkResourceSource *>(source);
+	// dynamic_cast is reinterpret_cast under this port's -fno-rtti (portdefs.h),
+	// so it never returns null: a plain dynamic_cast here would mis-treat EVERY
+	// volume source as a chunk source and break resource loading for all SCI
+	// games.  Tag-check with getSourceType() instead.
+	ChunkResourceSource *chunkSource = (source->getSourceType() == kSourceChunk)
+		? static_cast<ChunkResourceSource *>(source) : nullptr;
 	if (chunkSource != nullptr) {
 		Resource *res = findResource(ResourceId(kResourceTypeChunk, chunkSource->getNumber()), false);
 		return res ? res->makeStream() : nullptr;
@@ -404,7 +409,10 @@ Common::SeekableReadStream *ResourceManager::getVolumeFile(ResourceSource *sourc
 
 void ResourceManager::disposeVolumeFileStream(Common::SeekableReadStream *fileStream, Sci::ResourceSource *source) {
 #ifdef ENABLE_SCI32
-	ChunkResourceSource *chunkSource = dynamic_cast<ChunkResourceSource *>(source);
+	// -fno-rtti: dynamic_cast is reinterpret_cast (portdefs.h) and never null;
+	// tag-check with getSourceType() so non-chunk sources aren't mis-handled.
+	ChunkResourceSource *chunkSource = (source->getSourceType() == kSourceChunk)
+		? static_cast<ChunkResourceSource *>(source) : nullptr;
 	if (chunkSource != nullptr) {
 		delete fileStream;
 		return;
@@ -1078,8 +1086,18 @@ void ResourceManager::init() {
 	// games and can cause immediate exhaustion of the LRU resource
 	// cache, leading to constant decompression of picture resources
 	// and making the renderer very slow.
+	//
+	// openfpga: on this port the game data lives on a STREAMED ISO on the SD
+	// card, so an LRU miss = a slow SD read (not a fast disk seek). ScummVM's
+	// 4 MiB is far too small for a 640x480 SCI2.1 game like LSL7 -- its inventory
+	// working set (background pic + many large character/item views) blows past
+	// 4 MiB, so views get evicted and RE-READ FROM SD every frame (measured:
+	// kernelFrameOut ~150 ms/frame, ~1-4 fps). The Pocket has 56 MB SDRAM with
+	// only ~5 MB used by the ELF, so give the cache 32 MiB -- easily holds the
+	// working set, keeps everything resident, and eliminates the per-frame SD
+	// re-reads. (~18 MB still free for the rest of the engine.)
 	if (getSciVersion() >= SCI_VERSION_2) {
-		_maxMemoryLRU = 4096 * 1024; // 4MiB
+		_maxMemoryLRU = 32 * 1024 * 1024; // 32MiB (openfpga: streamed-SD, see above)
 	}
 
 	switch (_viewType) {

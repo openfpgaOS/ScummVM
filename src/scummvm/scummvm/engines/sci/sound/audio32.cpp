@@ -124,8 +124,9 @@ bool detectMacSndAudio(Common::SeekableReadStream &stream) {
 
 class MutableLoopAudioStream : public Audio::AudioStream {
 public:
-	MutableLoopAudioStream(Audio::RewindableAudioStream *stream, const bool loop_, const DisposeAfterUse::Flag dispose = DisposeAfterUse::YES) :
+	MutableLoopAudioStream(Audio::RewindableAudioStream *stream, Audio::SeekableAudioStream *seekableStream, const bool loop_, const DisposeAfterUse::Flag dispose = DisposeAfterUse::YES) :
 		_stream(stream, dispose),
+		_seekableStream(seekableStream),
 		_loop(loop_) {}
 
 	int readBuffer(int16 *buffer, int numSamples) override {
@@ -169,15 +170,19 @@ public:
 	}
 
 	virtual Audio::Timestamp getLength() const {
-		Audio::SeekableAudioStream *stream = dynamic_cast<Audio::SeekableAudioStream *>(_stream.get());
-		if (stream == nullptr) {
+		// _seekableStream is the seekable alias captured at construction; -fno-rtti
+		// means we cannot dynamic_cast _stream across SeekableAudioStream's virtual
+		// base to recover it here.
+		if (_seekableStream == nullptr) {
 			error("Cannot get length from a non-seekable stream");
 		}
-		return stream->getLength();
+		return _seekableStream->getLength();
 	}
 
 private:
 	Common::DisposablePtr<Audio::RewindableAudioStream> _stream;
+	// Non-owning seekable view of _stream (null only for AIFF, unused by SCI).
+	Audio::SeekableAudioStream *_seekableStream;
 	bool _loop;
 };
 
@@ -757,7 +762,7 @@ uint16 Audio32::play(int16 channelIndex, const ResourceId resourceId, const bool
 
 	if (channelIndex != kNoExistingChannel) {
 		AudioChannel &channel = getChannel(channelIndex);
-		MutableLoopAudioStream *stream = dynamic_cast<MutableLoopAudioStream *>(channel.stream.get());
+		MutableLoopAudioStream *stream = channel.robot ? nullptr : static_cast<MutableLoopAudioStream *>(channel.stream.get());
 		if (stream == nullptr) {
 			error("[Audio32::play]: Unable to cast stream for resource %s", resourceId.toString().c_str());
 		}
@@ -836,15 +841,19 @@ uint16 Audio32::play(int16 channelIndex, const ResourceId resourceId, const bool
 	Common::SeekableReadStream *dataStream = resource->makeStream();
 
 	Audio::RewindableAudioStream *audioStream;
+	// Capture the seekable view where the factory's static return type provides it
+	// (everything SCI uses except AIFF); -fno-rtti means MutableLoopAudioStream
+	// cannot recover it later (SeekableAudioStream has a virtual base).
+	Audio::SeekableAudioStream *seekableStream = nullptr;
 
 	if (detectSolAudio(*dataStream)) {
-		audioStream = makeSOLStream(dataStream, DisposeAfterUse::YES);
+		audioStream = seekableStream = makeSOLStream(dataStream, DisposeAfterUse::YES);
 	} else if (detectWaveAudio(*dataStream)) {
-		audioStream = Audio::makeWAVStream(dataStream, DisposeAfterUse::YES);
+		audioStream = seekableStream = Audio::makeWAVStream(dataStream, DisposeAfterUse::YES);
 	} else if (detectAIFFAudio(*dataStream)) {
 		audioStream = Audio::makeAIFFStream(dataStream, DisposeAfterUse::YES);
 	} else if (detectMacSndAudio(*dataStream)) {
-		audioStream = Audio::makeMacSndStream(dataStream, DisposeAfterUse::YES);
+		audioStream = seekableStream = Audio::makeMacSndStream(dataStream, DisposeAfterUse::YES);
 	} else {
 		byte flags = Audio::FLAG_LITTLE_ENDIAN;
 		if (_globalBitDepth == 16) {
@@ -857,10 +866,10 @@ uint16 Audio32::play(int16 channelIndex, const ResourceId resourceId, const bool
 			flags |= Audio::FLAG_STEREO;
 		}
 
-		audioStream = Audio::makeRawStream(dataStream, _globalSampleRate, flags, DisposeAfterUse::YES);
+		audioStream = seekableStream = Audio::makeRawStream(dataStream, _globalSampleRate, flags, DisposeAfterUse::YES);
 	}
 
-	channel.stream.reset(new MutableLoopAudioStream(audioStream, loop));
+	channel.stream.reset(new MutableLoopAudioStream(audioStream, seekableStream, loop));
 	// TODO: Avoid unnecessary channel conversion
 	channel.converter.reset(Audio::makeRateConverter(channel.stream->getRate(), getRate(), channel.stream->isStereo(), true, false));
 
@@ -871,7 +880,7 @@ uint16 Audio32::play(int16 channelIndex, const ResourceId resourceId, const bool
 	// need to do any of these things since we use audio streams, and allocate
 	// and fill the monitoring buffer when reading audio data from the stream.
 
-	MutableLoopAudioStream *stream = dynamic_cast<MutableLoopAudioStream *>(channel.stream.get());
+	MutableLoopAudioStream *stream = static_cast<MutableLoopAudioStream *>(channel.stream.get());
 	if (stream == nullptr) {
 		error("[Audio32::play]: Unable to cast stream for resource %s", resourceId.toString().c_str());
 	}
@@ -1072,7 +1081,7 @@ void Audio32::setLoop(const int16 channelIndex, const bool loop) {
 
 	AudioChannel &channel = getChannel(channelIndex);
 
-	MutableLoopAudioStream *stream = dynamic_cast<MutableLoopAudioStream *>(channel.stream.get());
+	MutableLoopAudioStream *stream = channel.robot ? nullptr : static_cast<MutableLoopAudioStream *>(channel.stream.get());
 	assert(stream);
 	stream->loop() = loop;
 }
@@ -1418,7 +1427,7 @@ void Audio32::printAudioList(Console *con) const {
 	Common::StackLock lock(_mutex);
 	for (int i = 0; i < _numActiveChannels; ++i) {
 		const AudioChannel &channel = _channels[i];
-		const MutableLoopAudioStream *stream = dynamic_cast<MutableLoopAudioStream *>(channel.stream.get());
+		const MutableLoopAudioStream *stream = channel.robot ? nullptr : static_cast<MutableLoopAudioStream *>(channel.stream.get());
 		con->debugPrintf("  %d[%04x:%04x]: %s, started at %d, pos %d/%d, vol %d, pan %d%s%s\n",
 						 i,
 						 PRINT_REG(channel.soundNode),

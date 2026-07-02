@@ -24,9 +24,12 @@ extern "C" {
 }
 #endif
 
-/* Screen dimensions */
-#define OPENFPGA_SCREEN_W  320
-#define OPENFPGA_SCREEN_H  240
+/* Max supported surface -- a clamp, NOT a forced size.  Raised to 640x480 for
+ * the SCI32 set, which renders CLUT8 at up to 640x480.  Smaller games drive
+ * their own dimensions via initSize() and keep a 320x240 framebuffer (see
+ * configureFramebufferMode()).  640x480x8 = 300 KiB, fits one 1 MiB OS FB slot. */
+#define OPENFPGA_SCREEN_W  640
+#define OPENFPGA_SCREEN_H  480
 
 /* ── OpenFPGAGraphicsManager ─────────────────────────────────────── */
 
@@ -97,8 +100,11 @@ private:
     int _screenChangeID;
     bool _overlayVisible;
 
-    /* Framebuffer */
-    uint8_t _screenBuf[OPENFPGA_SCREEN_W * OPENFPGA_SCREEN_H];
+    /* Framebuffer. 16-byte aligned so the SCI->_screenBuf (copyRectToScreen) and
+     * _screenBuf->fb (updateScreen) copies stay co-aligned with the word-aligned
+     * SCI _currentBuffer and hardware framebuffer -- musl memcpy then takes its
+     * fast 16B-unrolled path instead of the shifted-word/byte path. */
+    alignas(16) uint8_t _screenBuf[OPENFPGA_SCREEN_W * OPENFPGA_SCREEN_H];
     uint8_t _palette[256 * 3];
     bool _paletteDirty;
     bool _screenDirty;
@@ -148,7 +154,7 @@ private:
                            int xOff, int yOff, uint copyW, uint copyH);
     void presentFrame();
     void drawCursor(uint8_t *dst, uint fbW, uint fbH, uint fbStride,
-                    int xOff, int yOff) const;
+                    int xOff, int yOff, uint clipW, uint clipH) const;
     void drawKeypadLegend(uint8_t *fb, uint fbW, uint fbH, uint fbStride) const;
 };
 

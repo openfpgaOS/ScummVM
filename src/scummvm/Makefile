@@ -23,14 +23,18 @@ ENGINES ?= scumm agi sci
 
 # ── Per-engine source curation ──────────────────────────────────────
 # Feature-gated files whose feature is OFF in this port (mirrors each engine's
-# module.mk ifdef blocks). SCI drops the SCI32 set (needs 16-bit RGB / Tier-2).
-EXCLUDE_sci = %/sol.cpp %/hoyle5poker.cpp %/kgraphics32.cpp %/celobj32.cpp %/controls32.cpp \
-	%/cursor32.cpp %/frameout.cpp %/maccursor32.cpp %/paint32.cpp %/palette32.cpp %/plane32.cpp \
-	%/remap32.cpp %/screen_item32.cpp %/text32.cpp %/transitions32.cpp %/video32.cpp \
-	%/audio32.cpp %/robot_decoder.cpp
+# module.mk ifdef blocks). SCI32 is now ENABLED and renders in CLUT8 (8-bit, no
+# RGB): the SCI32 TUs are compiled in (EXCLUDE_sci empty) and -DENABLE_SCI32 is
+# added to the sci ELF (EXTRA_DEFS_sci) and to CORE_ENGINE_FLAGS.
+EXCLUDE_sci =
 
 # Output label per engine (default = engine id). SCUMM ships as "lucasarts".
 LABEL_scumm = lucasarts
+
+# Extra per-engine compile defines, appended to ECXX_<id> below. SCI adds
+# -DENABLE_SCI32 (the CLUT8 SCI32 set) on top of the generic -DENABLE_SCI;
+# scoped to the sci ELF only -- UC_sci=SCI yields -DENABLE_SCI, never SCI32.
+EXTRA_DEFS_sci = -DENABLE_SCI32
 
 # SCUMM needs a curated source set, not a naive glob (engines/scumm/ pulls all of
 # he/ = Humongous, which needs ENABLE_HE). Mirror the classic set: drop the
@@ -80,10 +84,16 @@ RUNTIME   = $(ROOT)/runtime
 GAME_ASSETS = $(wildcard *.dat *.bin *.cfg)
 
 # ── Flags ───────────────────────────────────────────────────────────
-COMMON_FLAGS  = -march=$(ARCH) -mabi=$(ABI) -Os -Wall
+COMMON_FLAGS  = -march=$(ARCH) -mabi=$(ABI) -O2 -Wall
 COMMON_FLAGS += -ffunction-sections -fdata-sections
 COMMON_FLAGS += -fno-tree-loop-distribute-patterns
 COMMON_FLAGS += -nostdinc -I$(SDK_DIR)/include -isystem $(MUSL_DIR)/include -I.
+# 24 soft MIDI voices (SDK default 12).  Dense SCI scores + per-note stereo
+# zone layers + release tails saturate 12 immediately, forcing audible voice
+# steals on every rapid note.  HW has 31 usable mixer voices and ScummVM's
+# digital audio uses the stream API (not HW voices), so MUSIC can own 24.
+# Costs ~1.5 KB extra BRAM (.app_fastdata) and ~2x worst-case 1 kHz tick.
+COMMON_FLAGS += -DSMP_MAX_VOICES=24
 
 CFLAGS = $(COMMON_FLAGS)
 
@@ -109,7 +119,9 @@ CONFIG_SHADOW = $(GENDIR)/config.h
 # The core sees the UNION of our engines' flags so engine-gated CORE code is
 # built once (e.g. Graphics::FontSJIS, used by SCUMM/SCI). Unused gated code is
 # trimmed per-ELF by --gc-sections.
-CORE_ENGINE_FLAGS = -DENABLE_SCUMM -DENABLE_SCI -DENABLE_AGI
+# ENABLE_SCI32 must be in the CORE union too: video/coktel_decoder.cpp (libcore)
+# is gated on it, and sci's video32.o needs its VMD/IMD decoders at link time.
+CORE_ENGINE_FLAGS = -DENABLE_SCUMM -DENABLE_SCI -DENABLE_SCI32 -DENABLE_AGI
 CORE_CXXFLAGS = -I$(GENDIR) $(CXXFLAGS) $(CORE_ENGINE_FLAGS)
 
 # src path -> object path under $(BUILD)/obj  (../sdk/foo -> up/sdk/foo)
@@ -208,7 +220,7 @@ GEN_$(1)   := $(BUILD)/$(1)/gen/.tables.stamp
 ESRC_$(1)  := $$(filter-out $$(EXCLUDE_$(1)), $(SCUMMVM)/base/plugins.cpp main.cpp \
 	$$(if $$(SRCS_$(1)),$$(SRCS_$(1)),$$(wildcard $(SCUMMVM)/engines/$(1)/*.cpp $(SCUMMVM)/engines/$(1)/*/*.cpp $(SCUMMVM)/engines/$(1)/*/*/*.cpp)))
 EOBJ_$(1)  := $$(foreach s,$$(ESRC_$(1)),$(BUILD)/$(1)/obj/$$(basename $$(s)).o)
-ECXX_$(1)  := -I$(BUILD)/$(1)/gen -I$(GENDIR) $(CXXFLAGS) -DENABLE_$$(UC_$(1)) -DOPENFPGA_DEFAULT_ENGINE='"$(1)"'
+ECXX_$(1)  := -I$(BUILD)/$(1)/gen -I$(GENDIR) $(CXXFLAGS) -DENABLE_$$(UC_$(1)) $$(EXTRA_DEFS_$(1)) -DOPENFPGA_DEFAULT_ENGINE='"$(1)"'
 
 # Generate the engine + detection plugin tables (DETECTION_STATIC is on, so
 # plugins.cpp pulls both; each engine's own detection.cpp supplies the symbol).

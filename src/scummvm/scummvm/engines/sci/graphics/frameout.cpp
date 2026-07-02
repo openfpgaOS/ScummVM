@@ -59,6 +59,10 @@
 
 namespace Sci {
 
+// openfpga: tops the audio ring + advances MIDI mid-frame (drawScreenItemList);
+// time-throttled internally so per-cel invocation is cheap.  See backend.
+extern "C" void openfpga_pump_during_render(void);
+
 GfxFrameout::GfxFrameout(SegManager *segMan, GfxPalette32 *palette, GfxTransitions32 *transitions, GfxCursor32 *cursor) :
 	_isHiRes(detectHiRes()),
 	_palette(palette),
@@ -1007,6 +1011,11 @@ void GfxFrameout::drawEraseList(const RectList &eraseList, const Plane &plane) {
 }
 
 void GfxFrameout::drawScreenItemList(const DrawList &screenItemList) {
+	// openfpga: a 640x480 frame can draw dozens of cels here before updateScreen()
+	// returns control, and SCI's frame throttle only runs AFTER the frame -- so
+	// the audio ring drains mid-frame and underruns (LSL7 talkie animation). Top
+	// the ring + advance MIDI between cels; the call is time-throttled (~6 ms)
+	// internally, so per-item invocation is cheap. (decl at file scope above)
 	const DrawList::size_type drawListSize = screenItemList.size();
 	for (DrawList::size_type i = 0; i < drawListSize; ++i) {
 		const DrawItem &drawItem = *screenItemList[i];
@@ -1014,6 +1023,7 @@ void GfxFrameout::drawScreenItemList(const DrawList &screenItemList) {
 		const ScreenItem &screenItem = *drawItem.screenItem;
 		CelObj &celObj = *screenItem._celObj;
 		celObj.draw(_currentBuffer, screenItem, drawItem.rect, screenItem._mirrorX ^ celObj._mirrorX);
+		openfpga_pump_during_render();
 	}
 }
 

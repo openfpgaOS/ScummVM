@@ -63,9 +63,12 @@ static void getFramebufferMode(uint &fbW, uint &fbH, uint &fbStride) {
 
     if (mode.width == 0 || mode.height == 0 ||
         mode.color_mode != OF_VIDEO_MODE_8BIT) {
-        fbW = OPENFPGA_SCREEN_W;
-        fbH = OPENFPGA_SCREEN_H;
-        fbStride = OPENFPGA_SCREEN_W;
+        /* Fall back to the physical 320x240 panel default, NOT the
+         * OPENFPGA_SCREEN_W/H max (now 640x480): if this branch is ever hit
+         * while a small game is live, a 640x480 guess would mis-size the blit. */
+        fbW = 320;
+        fbH = 240;
+        fbStride = 320;
         return;
     }
 
@@ -80,16 +83,43 @@ static uint32_t getFramebufferBytes() {
     return fbStride * fbH;
 }
 
-static void configureFramebufferMode() {
+/* Program the source framebuffer to the smallest hardware preset that fits the
+ * game's surface.  This MUST be size-driven, not fixed to OPENFPGA_SCREEN_W/H:
+ * the macros are now a 640x480 MAX, but programming 640x480 for EVERY game would
+ * downscale the <=320x240 titles (SCUMM/AGI/SCI0-1.1) to a quarter of the panel.
+ * Small games stay on the 320x240 full-screen scaler slot; only the larger
+ * SCI32 surfaces switch to 640x480 (scaler slot 7).  Always 8-bit CLUT8. */
+static void configureFramebufferMode(uint gameW, uint gameH) {
+    const uint wantW = (gameW > 320 || gameH > 240) ? 640 : 320;
+    const uint wantH = (gameW > 320 || gameH > 240) ? 480 : 240;
+
+    /* Idempotent: skip the set_mode if the framebuffer is already in the target
+     * mode.  This runs on every game's first frame (the splash->game handoff in
+     * updateScreen), and re-latching the SAME mode would add a needless flash to
+     * the existing <=320x240 8-bit games, which never had one before. */
+    of_video_mode_t cur;
+    of_video_get_mode(&cur);
+    if (cur.width == wantW && cur.height == wantH &&
+        cur.color_mode == OF_VIDEO_MODE_8BIT)
+        return;
+
     of_video_mode_t mode;
     memset(&mode, 0, sizeof(mode));
-    mode.width = OPENFPGA_SCREEN_W;
-    mode.height = OPENFPGA_SCREEN_H;
+    mode.width = wantW;
+    mode.height = wantH;
     mode.color_mode = OF_VIDEO_MODE_8BIT;
 
-    if (of_video_set_mode(&mode) != 0)
+    if (of_video_set_mode(&mode) != 0) {
+        /* No 640x480 support on this firmware: the FB stays at its prior size
+         * and a larger surface gets cropped to the top-left.  Log it so a
+         * cropped SCI32 game is diagnosable over UART, not a silent mystery. */
+        warning("[gfx] of_video_set_mode(%ux%u 8bit) failed; framebuffer stays "
+                "at prior size, a larger surface will be cropped", wantW, wantH);
         of_video_set_color_mode(OF_VIDEO_MODE_8BIT);
+    }
 }
+
+static void fbReset();   /* dirty-rect present state; defined below near copyRectToScreen */
 
 void OpenFPGAGraphicsManager::initSize(uint width, uint height, const Graphics::PixelFormat *format) {
     if (width > OPENFPGA_SCREEN_W)
@@ -99,6 +129,7 @@ void OpenFPGAGraphicsManager::initSize(uint width, uint height, const Graphics::
     _screenW = width;
     _screenH = height;
     memset(_screenBuf, 0, sizeof(_screenBuf));
+    fbReset();   /* surface size changed: every video buffer is now stale */
     _screenChangeID++;
     _screenDirty = true;
 
@@ -112,7 +143,7 @@ void OpenFPGAGraphicsManager::initSize(uint width, uint height, const Graphics::
      * skip the blank entirely; the first real updateScreen() replaces the
      * logo with game content (and clears _splashActive). */
     if (!_splashActive) {
-        configureFramebufferMode();
+        configureFramebufferMode(_screenW, _screenH);
         of_video_clear(0);
         of_video_flip();
     }
@@ -135,6 +166,45 @@ void OpenFPGAGraphicsManager::grabPalette(byte *colors, uint start, uint num) co
     memcpy(colors, _palette + start * 3, num * 3);
 }
 
+/* ===== dirty-rect (bounding-box) present optimization ======================
+ * SCI/engines redraw only what changed and hand us exact rects via
+ * copyRectToScreen(), but updateScreen() used to blit AND cache-flush the full
+ * 640x480 every frame.  In a point-and-click like LSL7 a typical frame changes
+ * only a talking head / walking actor, so copying+flushing the union bounding
+ * box of recent changes instead of the whole surface cuts the per-frame work
+ * ~5-10x.  Video is triple-buffered (indices 0..2, strict round-robin), so a
+ * buffer is reused every 3rd frame and must receive every change since IT was
+ * last drawn -- we union the per-frame dirty boxes back to that buffer's last
+ * render (tracked per index) and fall back to a full blit whenever the gap
+ * exceeds our short history, a frame dirtied the whole surface, the keypad
+ * overlay is up, or the surface was reconfigured.  Over-blitting is always
+ * correct; only UNDER-blitting corrupts, so every _screenBuf writer marks dirty
+ * and any uncertainty forces a full blit. */
+static const int kFbHist  = 6;   /* dirty-box ring depth (>= the 3 video buffers) */
+static const int kFbSlots = 4;   /* video buffer indices are 0..2 */
+static Common::Rect s_fbBox[kFbHist];     /* union dirty box for each recent frame */
+static bool         s_fbFull[kFbHist];    /* that frame dirtied the whole surface */
+static uint32       s_fbFrame = 0;        /* monotonic frame counter */
+static int32        s_fbDrawn[kFbSlots];  /* frame# each video buffer last received (-1 = stale) */
+static Common::Rect s_fbCursor[kFbSlots]; /* cursor box last drawn into each video buffer */
+static bool         s_fbReady = false;
+
+static void fbReset() {            /* force a full blit into every buffer */
+    for (int i = 0; i < kFbSlots; ++i) { s_fbDrawn[i] = -1; s_fbCursor[i] = Common::Rect(); }
+    for (int i = 0; i < kFbHist; ++i)  { s_fbBox[i] = Common::Rect(); s_fbFull[i] = false; }
+    s_fbReady = true;
+}
+static inline void fbMarkBox(const Common::Rect &r) {
+    if (!s_fbReady) fbReset();
+    if (r.isEmpty()) return;
+    int s = (int)(s_fbFrame % kFbHist);
+    if (s_fbBox[s].isEmpty()) s_fbBox[s] = r; else s_fbBox[s].extend(r);
+}
+static inline void fbMarkFull() {
+    if (!s_fbReady) fbReset();
+    s_fbFull[(int)(s_fbFrame % kFbHist)] = true;
+}
+
 void OpenFPGAGraphicsManager::copyRectToScreen(const void *buf, int pitch,
                                                 int x, int y, int w, int h) {
     const byte *src = (const byte *)buf;
@@ -147,11 +217,19 @@ void OpenFPGAGraphicsManager::copyRectToScreen(const void *buf, int pitch,
     if (w <= 0 || h <= 0) return;
 
     byte *dst = _screenBuf + y * _screenW + x;
-    for (int row = 0; row < h; row++) {
-        memcpy(dst, src, w);
-        dst += _screenW;
-        src += pitch;
+    if (x == 0 && (uint)w == _screenW && pitch == (int)_screenW) {
+        /* Full-width, source rows contiguous at our stride: one memcpy for the
+         * whole span (room loads / palMorph / transitions / full-frame VMD go
+         * from _screenH memcpy calls to one). */
+        memcpy(dst, src, (size_t)h * _screenW);
+    } else {
+        for (int row = 0; row < h; row++) {
+            memcpy(dst, src, w);
+            dst += _screenW;
+            src += pitch;
+        }
     }
+    fbMarkBox(Common::Rect(x, y, x + w, y + h));
     _screenDirty = true;
 }
 
@@ -162,11 +240,13 @@ Graphics::Surface *OpenFPGAGraphicsManager::lockScreen() {
 }
 
 void OpenFPGAGraphicsManager::unlockScreen() {
+    fbMarkFull();   /* engine wrote the locked surface directly -- extent unknown */
     _screenDirty = true;
 }
 
 void OpenFPGAGraphicsManager::fillScreen(uint32 col) {
     memset(_screenBuf, col & 0xFF, _screenW * _screenH);
+    fbMarkFull();
     _screenDirty = true;
 }
 
@@ -180,6 +260,7 @@ void OpenFPGAGraphicsManager::fillScreen(const Common::Rect &r, uint32 col) {
             _screenBuf[y * _screenW + x] = col & 0xFF;
         }
     }
+    fbMarkBox(Common::Rect(left, top, right, bottom));
     _screenDirty = true;
 }
 
@@ -306,8 +387,17 @@ void OpenFPGAGraphicsManager::presentFrame() {
 
 void OpenFPGAGraphicsManager::updateScreen() {
     /* The engine is presenting a real frame now -- let initSize() blank
-     * normally again (this frame replaces the splash on screen). */
-    _splashActive = false;
+     * normally again (this frame replaces the splash on screen).  initSize()
+     * deliberately SKIPS the framebuffer-mode switch while the splash is up (to
+     * keep the boot logo intact during the slow load), so the game's real
+     * surface mode is programmed HERE, exactly once, at the splash->game
+     * handoff -- this is what lets a 640x480 SCI32 game step the framebuffer up
+     * from the 320x240 splash.  The blit just below fills the new surface. */
+    if (_splashActive) {
+        _splashActive = false;
+        configureFramebufferMode(_screenW, _screenH);
+        fbReset();   /* mode just changed under us: every buffer is stale -> full blit */
+    }
 
     /* Pump audio before and after presentation; the frame copy/flip can stall
      * long enough to drain the 21 ms audio FIFO.  Advance the MIDI PARSER too,
@@ -334,11 +424,10 @@ void OpenFPGAGraphicsManager::updateScreen() {
         _paletteDirty = false;
     }
 
-    /* Always blit -- engines expect updateScreen() to push every frame
-     * regardless of dirty tracking. */
     uint8_t *fb = acquireFrameBuffer();
     uint fbW, fbH, fbStride;
     getFramebufferMode(fbW, fbH, fbStride);
+
     int xOff = ((int)fbW - (int)_screenW) / 2;
     int yOff = ((int)fbH - (int)_screenH) / 2;
     if (xOff < 0) xOff = 0;
@@ -348,22 +437,97 @@ void OpenFPGAGraphicsManager::updateScreen() {
     if (copyW > fbW) copyW = fbW;
     if (copyH > fbH) copyH = fbH;
 
-    clearFrameBorders(fb, fbW, fbH, fbStride, xOff, yOff, copyW, copyH);
-    for (uint y = 0; y < copyH; ++y) {
-        memcpy(fb + (y + yOff) * fbStride + xOff,
-               _screenBuf + y * _screenW,
-               copyW);
+    if (!s_fbReady) fbReset();
+    const int idx = _videoBufIdx;
+
+    /* Current cursor box (surface coords). The cursor is composited onto the
+     * framebuffer (not into _screenBuf), so on a partial blit we must refresh
+     * the bg under BOTH this buffer's previously-drawn cursor (to erase it) and
+     * the new position, and flush those rows. */
+    Common::Rect curCursor;
+    if (_cursorVisible && _cursorW > 0 && _cursorH > 0) {
+        int cx = _cursorX - _cursorHotX;
+        int cy = _cursorY - _cursorHotY;
+        curCursor = Common::Rect(cx, cy, cx + (int)_cursorW, cy + (int)_cursorH);
+        curCursor.clip(Common::Rect(0, 0, (int)copyW, (int)copyH));
     }
 
+    /* Decide full-surface vs bounding-box blit for THIS buffer. */
+    bool full = false;
+    Common::Rect box;   /* empty == nothing changed since this buffer was drawn */
+    if (idx < 0 || idx >= kFbSlots || (_keypadMode && !_splashActive)) {
+        full = true;                       /* no GPU buffer / keypad overlay -> whole frame */
+    } else {
+        const int32 last = s_fbDrawn[idx];
+        if (last < 0 || ((int32)s_fbFrame - last) >= kFbHist) {
+            full = true;                   /* first use / history too shallow */
+        } else {
+            for (uint32 f = (uint32)last + 1; f <= s_fbFrame; ++f) {
+                const int s = (int)(f % kFbHist);
+                if (s_fbFull[s]) { full = true; break; }
+                if (!s_fbBox[s].isEmpty()) {
+                    if (box.isEmpty()) box = s_fbBox[s]; else box.extend(s_fbBox[s]);
+                }
+            }
+        }
+    }
+
+    if (!full) {
+        if (idx >= 0 && idx < kFbSlots && !s_fbCursor[idx].isEmpty()) {
+            if (box.isEmpty()) box = s_fbCursor[idx]; else box.extend(s_fbCursor[idx]);
+        }
+        if (!curCursor.isEmpty()) {
+            if (box.isEmpty()) box = curCursor; else box.extend(curCursor);
+        }
+        box.clip(Common::Rect(0, 0, (int)copyW, (int)copyH));
+    }
+
+    if (full) {
+        clearFrameBorders(fb, fbW, fbH, fbStride, xOff, yOff, copyW, copyH);
+        for (uint y = 0; y < copyH; ++y) {
+            memcpy(fb + (y + yOff) * fbStride + xOff,
+                   _screenBuf + y * _screenW,
+                   copyW);
+        }
+    } else if (!box.isEmpty()) {
+        for (int y = box.top; y < box.bottom; ++y) {
+            memcpy(fb + (uint)(y + yOff) * fbStride + xOff + box.left,
+                   _screenBuf + (uint)y * _screenW + box.left,
+                   (uint)box.width());
+        }
+    }
+    /* else: this buffer already holds the current frame -- nothing to copy. */
+
     if (_cursorVisible)
-        drawCursor(fb, fbW, fbH, fbStride, xOff, yOff);
+        drawCursor(fb, fbW, fbH, fbStride, xOff, yOff, copyW, copyH);
 
     if (_keypadMode && !_splashActive)
         drawKeypadLegend(fb, fbW, fbH, fbStride);
 
-    of_cache_flush_range(fb, fbStride * fbH);
+    /* Flush only the rows we touched (full rows of the dirty box; the cursor was
+     * folded into the box above).  GPU reads cached SDRAM, so unflushed writes
+     * would not be presented. */
+    if (full) {
+        of_cache_flush_range(fb, fbStride * fbH);
+    } else if (!box.isEmpty()) {
+        of_cache_flush_range(fb + (uint)(box.top + yOff) * fbStride,
+                             (uint)box.height() * fbStride);
+    }
+
+    if (idx >= 0 && idx < kFbSlots) {
+        s_fbDrawn[idx]  = (int32)s_fbFrame;
+        s_fbCursor[idx] = curCursor;
+    }
+
     presentFrame();
     _screenDirty = false;
+
+    /* Advance the frame counter and clear the slot that becomes the new current
+     * frame's accumulator (it last held a frame kFbHist ago, now safe to reuse). */
+    s_fbFrame++;
+    const int ns = (int)(s_fbFrame % kFbHist);
+    s_fbBox[ns] = Common::Rect();
+    s_fbFull[ns] = false;
 
     extern void openfpga_midi_pump_pending(void);
     extern void openfpga_mixer_pump_only(void);
@@ -500,20 +664,32 @@ void OpenFPGAGraphicsManager::moveMouse(int dx, int dy) {
 }
 
 void OpenFPGAGraphicsManager::drawCursor(uint8_t *dst, uint fbW, uint fbH,
-                                         uint fbStride, int xOff,
-                                         int yOff) const {
+                                         uint fbStride, int xOff, int yOff,
+                                         uint clipW, uint clipH) const {
     if (!_cursorVisible || _cursorW == 0 || _cursorH == 0)
         return;
 
     int cx = _cursorX - _cursorHotX + xOff;
     int cy = _cursorY - _cursorHotY + yOff;
 
+    /* Clip to the game-surface region [xOff, xOff+clipW) x [yOff, yOff+clipH),
+     * NOT the full framebuffer: the erase logic in updateScreen restores
+     * background from _screenBuf, which only covers the surface.  Pixels
+     * painted into the letterbox borders (e.g. a 320x200 game centered in a
+     * 320x240 mode) could never be erased -- the "cursor trail at the bottom
+     * of the screen" in KQ6.  Also keeps s_fbCursor (surface-clipped) an
+     * exact record of what was drawn. */
+    int minX = xOff, maxX = xOff + (int)clipW;
+    int minY = yOff, maxY = yOff + (int)clipH;
+    if (maxX > (int)fbW) maxX = (int)fbW;
+    if (maxY > (int)fbH) maxY = (int)fbH;
+
     for (uint row = 0; row < _cursorH; row++) {
         int sy = cy + (int)row;
-        if (sy < 0 || sy >= (int)fbH) continue;
+        if (sy < minY || sy >= maxY) continue;
         for (uint col = 0; col < _cursorW; col++) {
             int sx = cx + (int)col;
-            if (sx < 0 || sx >= (int)fbW) continue;
+            if (sx < minX || sx >= maxX) continue;
             uint8_t px = _cursorData[row * 64 + col];
             if (px != (_cursorKeycolor & 0xFF))
                 dst[sy * fbStride + sx] = px;
@@ -900,8 +1076,19 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
     const int deadzone = 4000;
     const bool slowMouse = (state.buttons & (OF_BTN_L1 | OF_BTN_L2)) != 0;
     const bool fastMouse = (state.buttons & (OF_BTN_R1 | OF_BTN_R2)) != 0;
-    const int analogMaxRate = slowMouse ? 120 : (fastMouse ? 420 : 260);
-    const int dpadBaseRate = slowMouse ? 60 : (fastMouse ? 240 : 120);
+    int analogMaxRate = slowMouse ? 120 : (fastMouse ? 420 : 260);
+    int dpadBaseRate = slowMouse ? 60 : (fastMouse ? 240 : 120);
+    /* Cursor rates are in GAME pixels/sec.  A hi-res SCI32 surface (640x480) is
+     * twice as wide as the 320-px baseline, so a fixed rate crosses it only half
+     * as fast -- the cursor feels sluggish.  Scale the rate up with the surface
+     * width so it traverses the screen in the same wall-clock time at any
+     * resolution (no change at 320; ~2x at 640).  The L/R slow/fast modifiers
+     * above still apply on top. */
+    const int surfaceW = _ofGfx ? (int)_ofGfx->getWidth() : 320;
+    if (surfaceW > 320) {
+        analogMaxRate = analogMaxRate * surfaceW / 320;
+        dpadBaseRate  = dpadBaseRate  * surfaceW / 320;
+    }
     int lx = state.joy_lx;
     int ly = state.joy_ly;
     if (lx > -deadzone && lx < deadzone) lx = 0;
@@ -1117,6 +1304,35 @@ void openfpga_mixer_pump_only(void) {
     g_pumpMixerMgr->update();
     g_pumpMixerMgr->drain();
     g_pumpBusy = false;
+}
+
+/* Drive audio + MIDI during long, non-yielding RENDER work -- chiefly SCI32
+ * 640x480 frames where GfxFrameout composes many/large cels into the frame
+ * buffer in one pass, with the data already resident (NO file read) and without
+ * returning to delayMillis/pollEvent/updateScreen until the whole frame is
+ * drawn.  SCI's own frame throttle is POST-frame (GfxFrameout::throttle runs
+ * after frameOut completes), so a single heavy frameOut gets NO audio service
+ * for its full duration and the ~120 ms ring cushion underruns -- the LSL7
+ * talkie-animation dropout.  Called per screen item from drawScreenItemList so
+ * the gap between pumps is one cel draw (a few ms) instead of a whole frame.
+ *
+ * Unlike openfpga_pump_during_load this deliberately does NOT arm the deep
+ * cushion: frameOut runs every frame INCLUDING interactive play, where a deep
+ * cushion would push newly-triggered click/SFX seconds back in the FIFO.  It
+ * only tops the normal 120 ms ring and advances the MIDI melody so neither
+ * stalls mid-frame.  Time-gated to ~6 ms (one mixer block is ~5.3 ms) so a
+ * 90-item frame fires at most a handful of real pumps; reentrancy-safe via
+ * openfpga_mixer_pump_only's g_pumpBusy guard and the MIDI parser's s_inProc
+ * guard (a nested speech/CDDA read pulled by the mixer turns into a no-op). */
+extern "C" void openfpga_pump_during_render(void) {
+    extern void openfpga_midi_pump_pending(void);
+    static uint32 s_lastRenderPumpMs = 0;
+    uint32 now = of_time_ms();
+    if ((uint32)(now - s_lastRenderPumpMs) < 6u)
+        return;
+    s_lastRenderPumpMs = now;
+    openfpga_midi_pump_pending();
+    openfpga_mixer_pump_only();
 }
 
 /* Drive audio + MIDI + timers during long, non-yielding engine work -- chiefly

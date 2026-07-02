@@ -63,13 +63,27 @@ static const int kTargetBufferedPairs  = 48 * 120;  /* ~120 ms (interactive) */
  * is pre-filled enough to ride through the compute gap.  Latency is invisible
  * mid-transition (no interactive SFX), and the instant loading stops the target
  * drops back to 120 ms and the ring drains down to low latency on its own. */
-static const int kLoadCushionPairs     = 48 * 600;  /* ~600 ms (during loads) */
+static const int kLoadCushionPairs     = 48 * 800;  /* ~800 ms (during loads) */
 static uint32     g_loadCushionUntilMs = 0;
+static int        g_ringCapacityPairs  = 0;  /* full HW ring depth; set in init() */
 
 /* Called from openfpga_pump_during_load() on every resource read: hold the deep
  * cushion until `untilMs` (of_time_ms() clock). */
 void openfpga_mixer_extend_cushion(uint32 untilMs) {
     g_loadCushionUntilMs = untilMs;
+}
+
+/* ms of audio already mixed into the HW ring but NOT yet played.  This port
+ * bursts the mixer ahead of the DAC, so getSoundElapsedTime (samples CONSUMED)
+ * leads the audible voice by this much; SCI lip-sync (Portrait) subtracts it to
+ * track what is actually heard. */
+extern "C" uint32 openfpga_mixer_output_latency_ms(void) {
+    if (g_ringCapacityPairs <= 0)
+        return 0;
+    int buffered = g_ringCapacityPairs - of_audio_free();
+    if (buffered < 0)
+        buffered = 0;
+    return (uint32)(buffered * 1000 / OF_AUDIO_RATE);
 }
 
 OpenFPGAMixerManager::~OpenFPGAMixerManager() {
@@ -105,6 +119,7 @@ void OpenFPGAMixerManager::init() {
     /* Measure the ring depth: of_audio_init ran in main() and voice 31 is
      * still inactive here, so of_audio_free() reports the full capacity. */
     _ringCapacity = of_audio_free();
+    g_ringCapacityPairs = _ringCapacity;
 
     _initDone = true;
 }
@@ -118,7 +133,14 @@ void OpenFPGAMixerManager::update() {
      * OS-owned uncached SDRAM ring, so no cache flush is required here.
      * While a load is in flight, fill the deeper kLoadCushionPairs instead so a
      * non-yielding compute gap can't drain the ring to silence (see above). */
-    const int targetPairs = (of_time_ms() < g_loadCushionUntilMs)
+    /* Never use the deep load cushion while speech is playing: SCI lip-sync
+     * (Portrait, e.g. KQ6 talking heads) paces on the audio position, and
+     * bursting a short voice clip fully into the deep ring makes its handle
+     * finish early -> the portrait stops after a few frames.  Holding 120 ms
+     * keeps short lines tracking the audible voice. */
+    const bool speechActive = _mixer &&
+        _mixer->hasActiveChannelOfType(Audio::Mixer::kSpeechSoundType);
+    const int targetPairs = (!speechActive && of_time_ms() < g_loadCushionUntilMs)
                                 ? kLoadCushionPairs : kTargetBufferedPairs;
     for (;;) {
         int freePairs = of_audio_free();

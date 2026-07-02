@@ -1040,7 +1040,7 @@ void VMDPlayer::initComposited() {
 	CelInfo32 vmdCelInfo;
 	vmdCelInfo.bitmap = _bitmapId;
 
-	Video::AdvancedVMDDecoder *decoder = dynamic_cast<Video::AdvancedVMDDecoder *>(_decoder.get());
+	Video::AdvancedVMDDecoder *decoder = static_cast<Video::AdvancedVMDDecoder *>(_decoder.get());
 	assert(decoder);
 	decoder->setSurfaceMemory(vmdBitmap.getPixels(), vmdBitmap.getWidth(), vmdBitmap.getHeight(), 1);
 

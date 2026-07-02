@@ -826,7 +826,58 @@ void CelObj::scaleDraw(Buffer &target, const Ratio &scaleX, const Ratio &scaleY,
 	}
 }
 
+// openfpga: hoisted-locals scaled blits for the remap-data cel paths that the
+// generic RENDERER handled per-pixel (with live SCALER asserts + a per-pixel
+// g_sci->_gfxRemap32 deref chain). Measured to be the LSL7 inventory bottleneck:
+// during the open inventory the scaled sprites are remap-capable, so they take
+// scaleDrawUncomp/Map -> the generic path (genCels/f ~= cels/f). These reproduce
+// MAPPER_NoMap / MAPPER_Map over the ctor-built _valuesX/_valuesY tables, hoisting
+// the remap manager + start color out of the loop. translateMacColor is identity
+// for !_isMacSource, so byte-identical. FLIP is baked into _valuesX (one body).
+static inline void openfpgaScaledNoMapBlit(Buffer &target, const Common::Rect &targetRect,
+                                           const int16 *valuesX, const int16 *valuesY,
+                                           READER_Uncompressed &reader, const byte skip,
+                                           const uint8 remapStart) {
+	for (int16 y = targetRect.top; y < targetRect.bottom; ++y) {
+		const byte *srcRow = reader.getRow(valuesY[y]);
+		byte *dst = (byte *)target.getPixels() + target.w * y + targetRect.left;
+		for (int16 x = targetRect.left; x < targetRect.right; ++x, ++dst) {
+			const byte p = srcRow[valuesX[x]];
+			if (p != skip && p < remapStart)
+				*dst = p;
+		}
+	}
+}
+static inline void openfpgaScaledMapBlit(Buffer &target, const Common::Rect &targetRect,
+                                         const int16 *valuesX, const int16 *valuesY,
+                                         READER_Uncompressed &reader, const byte skip,
+                                         GfxRemap32 *const remap, const uint8 remapStart) {
+	for (int16 y = targetRect.top; y < targetRect.bottom; ++y) {
+		const byte *srcRow = reader.getRow(valuesY[y]);
+		byte *dst = (byte *)target.getPixels() + target.w * y + targetRect.left;
+		for (int16 x = targetRect.left; x < targetRect.right; ++x, ++dst) {
+			const byte p = srcRow[valuesX[x]];
+			if (p == skip)
+				continue;
+			if (p < remapStart)
+				*dst = p;
+			else if (remap->remapEnabled(p))
+				*dst = remap->remapColor(p, *dst);
+		}
+	}
+}
+
 void CelObj::scaleDrawUncomp(Buffer &target, const Ratio &scaleX, const Ratio &scaleY, const Common::Rect &targetRect, const Common::Point &scaledPosition) const {
+	if (!_isMacSource && !_drawBlackLines) {
+		const uint8 remapStart = g_sci->_gfxRemap32->getStartColor();
+		if (_drawMirrored) {
+			SCALER_Scale<true, READER_Uncompressed> sc(*this, targetRect, scaledPosition, scaleX, scaleY);
+			if (!sc._sourceBuffer) { openfpgaScaledNoMapBlit(target, targetRect, sc._valuesX, sc._valuesY, sc._reader, _skipColor, remapStart); return; }
+		} else {
+			SCALER_Scale<false, READER_Uncompressed> sc(*this, targetRect, scaledPosition, scaleX, scaleY);
+			if (!sc._sourceBuffer) { openfpgaScaledNoMapBlit(target, targetRect, sc._valuesX, sc._valuesY, sc._reader, _skipColor, remapStart); return; }
+		}
+	}
 	if (_drawMirrored) {
 		render<MAPPER_NoMap, SCALER_Scale<true, READER_Uncompressed> >(target, targetRect, scaledPosition, scaleX, scaleY);
 	} else {
@@ -843,6 +894,39 @@ void CelObj::drawNoFlipMap(Buffer &target, const Common::Rect &targetRect, const
 }
 
 void CelObj::drawUncompNoFlipMap(Buffer &target, const Common::Rect &targetRect, const Common::Point &scaledPosition) const {
+	// openfpga fast path: unscaled uncompressed ACTIVE-REMAP cel = the LSL7
+	// TRANSLUCENT inventory window (each pixel blends with the background). The
+	// generic RENDERER ran the per-pixel SCALER assert plus a g_sci->_gfxRemap32
+	// deref chain (getStartColor/remapEnabled/remapColor) over a large area every
+	// frame -> pipeline-saturating on the in-order core. This bypasses the
+	// RENDERER (no SCALER asserts), hoists the remap manager + start color out of
+	// the loop, and reproduces MAPPER_Map exactly (translateMacColor is identity
+	// for !_isMacSource; remapColor is now assert-free). Byte-identical.
+	if (!_isMacSource) {
+		GfxRemap32 *const remap = g_sci->_gfxRemap32;
+		const uint8 remapStart = remap->getStartColor();
+		READER_Uncompressed reader(*this, targetRect.width());
+		const byte skip = _skipColor;
+		byte *targetRow = (byte *)target.getPixels() + target.w * targetRect.top + targetRect.left;
+		const int16 w = targetRect.width();
+		const int16 h = targetRect.height();
+		const int16 srcXOff = targetRect.left - scaledPosition.x;
+		for (int16 y = 0; y < h; ++y) {
+			const byte *srcRow = reader.getRow(targetRect.top + y - scaledPosition.y) + srcXOff;
+			byte *dst = targetRow;
+			for (int16 x = 0; x < w; ++x, ++dst) {
+				const byte p = srcRow[x];
+				if (p == skip)
+					continue;
+				if (p < remapStart)
+					*dst = p;
+				else if (remap->remapEnabled(p))
+					*dst = remap->remapColor(p, *dst);
+			}
+			targetRow += target.w;
+		}
+		return;
+	}
 	render<MAPPER_Map, SCALER_NoScale<false, READER_Uncompressed> >(target, targetRect, scaledPosition);
 }
 
@@ -859,6 +943,17 @@ void CelObj::scaleDrawMap(Buffer &target, const Ratio &scaleX, const Ratio &scal
 }
 
 void CelObj::scaleDrawUncompMap(Buffer &target, const Ratio &scaleX, const Ratio &scaleY, const Common::Rect &targetRect, const Common::Point &scaledPosition) const {
+	if (!_isMacSource && !_drawBlackLines) {
+		GfxRemap32 *const remap = g_sci->_gfxRemap32;
+		const uint8 remapStart = remap->getStartColor();
+		if (_drawMirrored) {
+			SCALER_Scale<true, READER_Uncompressed> sc(*this, targetRect, scaledPosition, scaleX, scaleY);
+			if (!sc._sourceBuffer) { openfpgaScaledMapBlit(target, targetRect, sc._valuesX, sc._valuesY, sc._reader, _skipColor, remap, remapStart); return; }
+		} else {
+			SCALER_Scale<false, READER_Uncompressed> sc(*this, targetRect, scaledPosition, scaleX, scaleY);
+			if (!sc._sourceBuffer) { openfpgaScaledMapBlit(target, targetRect, sc._valuesX, sc._valuesY, sc._reader, _skipColor, remap, remapStart); return; }
+		}
+	}
 	if (_drawMirrored) {
 		render<MAPPER_Map, SCALER_Scale<true, READER_Uncompressed> >(target, targetRect, scaledPosition, scaleX, scaleY);
 	} else {
@@ -875,10 +970,58 @@ void CelObj::drawHzFlipNoMD(Buffer &target, const Common::Rect &targetRect, cons
 }
 
 void CelObj::drawUncompNoFlipNoMD(Buffer &target, const Common::Rect &targetRect, const Common::Point &scaledPosition) const {
+	// openfpga fast path: transparent uncompressed cel (LSL7's animated talking-head
+	// portrait -- the most common per-frame draw). Per-pixel MAPPER_NoMD is
+	// `if (src != skipColor) *dst = src` (translateMacColor is identity for
+	// !_isMacSource). Batch the writes: scan the source row for maximal runs of
+	// non-skip pixels and memcpy each run; skip pixels leave the destination
+	// untouched. Byte-identical to the per-pixel loop, but the copies go word-wise
+	// instead of one conditional byte store per pixel.
+	if (!_isMacSource) {
+		READER_Uncompressed reader(*this, targetRect.width());
+		const byte skip = _skipColor;
+		byte *targetRow = (byte *)target.getPixels() + target.w * targetRect.top + targetRect.left;
+		const int16 w = targetRect.width();
+		const int16 h = targetRect.height();
+		const int16 srcXOff = targetRect.left - scaledPosition.x;
+		for (int16 y = 0; y < h; ++y) {
+			const byte *srcRow = reader.getRow(targetRect.top + y - scaledPosition.y) + srcXOff;
+			int16 x = 0;
+			while (x < w) {
+				if (srcRow[x] == skip) { ++x; continue; }
+				const int16 runStart = x;
+				do { ++x; } while (x < w && srcRow[x] != skip);
+				memcpy(targetRow + runStart, srcRow + runStart, (size_t)(x - runStart));
+			}
+			targetRow += target.w;
+		}
+		return;
+	}
 	render<MAPPER_NoMD, SCALER_NoScale<false, READER_Uncompressed> >(target, targetRect, scaledPosition);
 }
 
 void CelObj::drawUncompNoFlipNoMDNoSkip(Buffer &target, const Common::Rect &targetRect, const Common::Point &scaledPosition) const {
+	// openfpga fast path: for a non-Mac source this is byte-for-byte a per-row
+	// copy. MAPPER_NoMDNoSkip::draw is `*target = translateMacColor(false, pixel)`
+	// = `*target = pixel`, and SCALER_NoScale<false>::read() just walks the source
+	// row left-to-right (setTarget: row = getRow(top+y - scaledPos.y), then
+	// += left - scaledPos.x). Every LSL7 pic is uncompressed + opaque, so this is
+	// the hot 640x480 room-load / under-sprite background-restore blit; a row
+	// memcpy replaces ~6-8 branchy insns/pixel with musl's word-wise copy. The
+	// generic render<> path stays as the Mac fallback (no Mac SCI game ships here).
+	if (!_isMacSource) {
+		READER_Uncompressed reader(*this, targetRect.width());
+		byte *targetPixel = (byte *)target.getPixels() + target.w * targetRect.top + targetRect.left;
+		const int16 w = targetRect.width();
+		const int16 h = targetRect.height();
+		const int16 srcXOff = targetRect.left - scaledPosition.x;
+		for (int16 y = 0; y < h; ++y) {
+			const byte *srcRow = reader.getRow(targetRect.top + y - scaledPosition.y) + srcXOff;
+			memcpy(targetPixel, srcRow, (size_t)w);
+			targetPixel += target.w;
+		}
+		return;
+	}
 	render<MAPPER_NoMDNoSkip, SCALER_NoScale<false, READER_Uncompressed> >(target, targetRect, scaledPosition);
 }
 
@@ -904,12 +1047,54 @@ void CelObj::scaleDrawNoMD(Buffer &target, const Ratio &scaleX, const Ratio &sca
 		render<MAPPER_NoMD, SCALER_Scale<false, READER_Compressed> >(target, targetRect, scaledPosition, scaleX, scaleY);
 }
 
+// openfpga: hoisted-locals scaled blit (LSL7 walking actors). Reproduces the
+// generic RENDERER exactly for the common case: SCALER_Scale::read() is
+// `_row[_valuesX[_x++]]` with `_row = _reader.getRow(_valuesY[y])`, and
+// MAPPER_NoMD is `if (p != skip) *dst = p` (translateMacColor is identity for a
+// non-Mac source). Running it over the constructor-built _valuesX/_valuesY tables
+// as locals drops the per-pixel scaler-member reloads and the always-false isMac
+// branch. Byte-identical to render<MAPPER_NoMD, SCALER_Scale<FLIP>>. FLIP is
+// baked into _valuesX, so one body serves both mirror directions.
+static inline void openfpgaScaledSkipBlit(Buffer &target, const Common::Rect &targetRect,
+                                          const int16 *valuesX, const int16 *valuesY,
+                                          READER_Uncompressed &reader, const byte skip) {
+	for (int16 y = targetRect.top; y < targetRect.bottom; ++y) {
+		const byte *srcRow = reader.getRow(valuesY[y]);
+		byte *dst = (byte *)target.getPixels() + target.w * y + targetRect.left;
+		for (int16 x = targetRect.left; x < targetRect.right; ++x) {
+			const byte p = srcRow[valuesX[x]];
+			if (p != skip)
+				*dst = p;
+			++dst;
+		}
+	}
+}
+
 void CelObj::scaleDrawUncompNoMD(Buffer &target, const Ratio &scaleX, const Ratio &scaleY, const Common::Rect &targetRect, const Common::Point &scaledPosition) const {
 	// In SSCI the checks are > because their rects are BR-inclusive; our checks
 	// are >= because our rects are BR-exclusive
 	if (targetRect.left >= targetRect.right ||
 		 targetRect.top >= targetRect.bottom) {
 		return;
+	}
+
+	// openfpga fast path (see openfpgaScaledSkipBlit). Bails to the generic
+	// renderer for Mac sources, black-line draw, and LarryScale (which fills the
+	// scaler's _sourceBuffer instead of reading the raw cel row).
+	if (!_isMacSource && !_drawBlackLines) {
+		if (_drawMirrored) {
+			SCALER_Scale<true, READER_Uncompressed> sc(*this, targetRect, scaledPosition, scaleX, scaleY);
+			if (!sc._sourceBuffer) {
+				openfpgaScaledSkipBlit(target, targetRect, sc._valuesX, sc._valuesY, sc._reader, _skipColor);
+				return;
+			}
+		} else {
+			SCALER_Scale<false, READER_Uncompressed> sc(*this, targetRect, scaledPosition, scaleX, scaleY);
+			if (!sc._sourceBuffer) {
+				openfpgaScaledSkipBlit(target, targetRect, sc._valuesX, sc._valuesY, sc._reader, _skipColor);
+				return;
+			}
+		}
 	}
 
 	if (_drawMirrored) {
@@ -987,7 +1172,7 @@ CelObjView::CelObjView(const GuiResourceId viewId, const int16 loopNo, const int
 	const int cacheIndex = searchCache(_info, &cacheInsertIndex);
 	if (cacheIndex != -1) {
 		CelCacheEntry &entry = (*_cache)[cacheIndex];
-		const CelObjView *const cachedCelObj = dynamic_cast<CelObjView *>(entry.celObj.get());
+		const CelObjView *const cachedCelObj = (entry.celObj->_info.type == kCelTypeView) ? static_cast<CelObjView *>(entry.celObj.get()) : nullptr;
 		if (cachedCelObj == nullptr) {
 			error("Expected a CelObjView in cache slot %d", cacheIndex);
 		}
@@ -1195,7 +1380,7 @@ CelObjPic::CelObjPic(const GuiResourceId picId, const int16 celNo) {
 	const int cacheIndex = searchCache(_info, &cacheInsertIndex);
 	if (cacheIndex != -1) {
 		CelCacheEntry &entry = (*_cache)[cacheIndex];
-		const CelObjPic *const cachedCelObj = dynamic_cast<CelObjPic *>(entry.celObj.get());
+		const CelObjPic *const cachedCelObj = (entry.celObj->_info.type == kCelTypePic) ? static_cast<CelObjPic *>(entry.celObj.get()) : nullptr;
 		if (cachedCelObj == nullptr) {
 			error("Expected a CelObjPic in cache slot %d", cacheIndex);
 		}

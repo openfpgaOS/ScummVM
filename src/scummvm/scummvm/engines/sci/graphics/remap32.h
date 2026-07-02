@@ -316,9 +316,15 @@ public:
 	 */
 	inline uint8 remapColor(const uint8 sourceColor, const uint8 targetColor) const {
 		const uint8 index = _remapEndColor - sourceColor;
-		assert(index < _remaps.size());
+		// openfpga: the two asserts that were here (index < _remaps.size() and
+		// _type != kRemapNone) ran PER PIXEL for every translucent pixel of a
+		// remap cel -- ~2 branch-mispredicts/pixel that saturate the in-order
+		// RISC-V pipeline when a large translucent window (LSL7 inventory) is
+		// open. They are redundant: every caller (MAPPER_Map / the openfpga
+		// drawUncompNoFlipMap fast path) reaches remapColor only after
+		// remapEnabled(sourceColor) already verified BOTH conditions, so the
+		// asserts can never fire in correct code. Removed for the hot path.
 		const SingleRemap &singleRemap = _remaps[index];
-		assert(singleRemap._type != kRemapNone);
 		// SSCI never really properly handled attempts to draw to a target with
 		// pixels above the remap color maximum. In RAMA, the cursor views have
 		// a remap color outlining the cursor, and so get drawn into a target

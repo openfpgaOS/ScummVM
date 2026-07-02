@@ -934,6 +934,21 @@ void GuestAdditions::syncMessageTypeFromScummVMUsingDefaultStrategy() const {
 		value &= ~kMessageTypeSubtitles;
 	}
 
+	// openfpgaOS: this King's Quest Collection build of KQ6 ships WITHOUT the
+	// speech volume (RESOURCE.AUD).  Its audio36/sync36/RAVE timelines all live
+	// inside that missing file, so when the game is told to use speech the
+	// talkers and hi-res portraits race (getAudioPosition / kDoSync report
+	// "finished" instantly, with no surviving timeline to pace against).  Fall
+	// back to text-only so message boxes are paced by the script's own
+	// text-length timer (RESOURCE.MSG is present).  No-op on a full talkie
+	// install -- there the audio36 resources ARE registered.
+	if ((value & kMessageTypeSpeech) &&
+	    g_sci->getGameId() == GID_KQ6 &&
+	    g_sci->getResMan()->listResources(kResourceTypeAudio36).empty()) {
+		value &= ~kMessageTypeSpeech;
+		value |= kMessageTypeSubtitles;
+	}
+
 	if (value) {
 		_state->variables[VAR_GLOBAL][kGlobalVarMessageType] = make_reg(0, value);
 	}

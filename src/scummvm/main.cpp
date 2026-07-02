@@ -229,8 +229,13 @@ static bool slotFileExists(const char *name) {
 }
 
 static void rememberPath(char *dst, size_t cap, const char *name) {
-    if (!dst[0])
-        snprintf(dst, cap, "%s", name);
+    if (dst[0] || !cap)
+        return;
+    size_t n = strlen(name);
+    if (n >= cap)
+        n = cap - 1;
+    memcpy(dst, name, n);
+    dst[n] = '\0';
 }
 
 static void rememberDataPath(const char *name, char *isoPath, size_t isoCap,
@@ -547,6 +552,14 @@ extern "C" int main(int argc, char **argv) {
 	ConfMan.setInt("speech_volume", 224,      gid);
 	ConfMan.setBool("speech_mute", false,     gid);
 	ConfMan.setBool("subtitles",   true,      gid);
+	/* Disable SCI32 "LarryScale" (high-quality cartoon sprite scaler). It defaults
+	 * ON for LSL7/QFG4/etc. and runs an expensive edge-directed scale PER character
+	 * sprite EVERY frame -- ~18 ms/cel on this soft RISC-V core (measured: normal
+	 * play 8-16 fps, and the translucent inventory with its many scaled items drops
+	 * to 1 fps). Off, scaled cels take the fast nearest-neighbour path (our
+	 * scaleDrawUncompNoMD fast path); sprites are slightly blockier but the game is
+	 * playable. Revert (true) if you prefer the smooth scaling over the speed. */
+	ConfMan.setBool("enable_larryscale", false, gid);
 
     /* Skip SCUMM's MD5 detection -- known game, and the file scan
      * starves the launcher UART pump on the Pocket. */

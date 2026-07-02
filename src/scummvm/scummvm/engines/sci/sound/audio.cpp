@@ -232,10 +232,19 @@ void AudioPlayer::resumeAudio() {
 	_mixer->pauseHandle(_audioHandle, false);
 }
 
+// Defined in the openfpgaOS backend (openfpga_mixer.cpp).
+extern "C" uint32 openfpga_mixer_output_latency_ms(void);
+
 int AudioPlayer::getAudioPosition() {
-	if (_mixer->isSoundHandleActive(_audioHandle))
-		return _mixer->getSoundElapsedTime(_audioHandle) * 6 / 100; // return elapsed time in ticks
-	else if (_wPlayFlag)
+	if (_mixer->isSoundHandleActive(_audioHandle)) {
+		// openfpgaOS bursts the mixer ahead of the DAC, so getSoundElapsedTime
+		// (samples consumed) LEADS the audible voice by the buffered ring depth.
+		// De-lead it so SCI lip-sync (Portrait) tracks what is actually heard.
+		int elapsedMs = (int)_mixer->getSoundElapsedTime(_audioHandle) - (int)openfpga_mixer_output_latency_ms();
+		if (elapsedMs < 0)
+			elapsedMs = 0;
+		return elapsedMs * 6 / 100; // return elapsed time in ticks
+	} else if (_wPlayFlag)
 		return 0; // Sound has "loaded" so return that it hasn't started
 	else
 		return -1; // Sound finished
@@ -479,6 +488,12 @@ Audio::RewindableAudioStream *AudioPlayer::getAudioStream(uint32 number, uint32 
 	return audioStream;
 }
 
+// openfpgaOS: the script-requested CD-audio length (in frames).  Persisted so
+// audioCdPosition() can pace a CD-music cutscene by wall-clock when the streamed
+// data-only ISO has no physical Red Book track.  One AudioPlayer per game, so a
+// file-scope static suffices (and avoids a class-size change / header rebuild).
+static uint32 s_audioCdDuration = 0;
+
 int AudioPlayer::audioCdPlay(int track, int start, int duration) {
 	if (!_initCD) {
 		// Initialize CD mode if we haven't already
@@ -489,6 +504,7 @@ int AudioPlayer::audioCdPlay(int track, int start, int duration) {
 	if (getSciVersion() == SCI_VERSION_1_1) {
 		// King's Quest VI CD Audio format
 		_audioCdStart = g_system->getMillis();
+		s_audioCdDuration = (duration > 0) ? (uint32)duration : 0; // frames, for the wall-clock fallback
 
 		// Subtract one from track. KQ6 starts at track 1, while ScummVM
 		// ignores the data track and considers track 2 to be track 1.
@@ -529,6 +545,7 @@ int AudioPlayer::audioCdPlay(int track, int start, int duration) {
 
 void AudioPlayer::audioCdStop() {
 	_audioCdStart = 0;
+	s_audioCdDuration = 0;
 	g_system->getAudioCDManager()->stop();
 }
 
@@ -538,7 +555,19 @@ void AudioPlayer::audioCdUpdate() {
 
 int AudioPlayer::audioCdPosition() {
 	// Return -1 if the sample is done playing. Converting to frames to compare.
-	if (((g_system->getMillis() - _audioCdStart) * 75 / 1000) >= (uint32)g_system->getAudioCDManager()->getStatus().duration)
+	uint32 durationFrames = (uint32)g_system->getAudioCDManager()->getStatus().duration;
+
+	// openfpgaOS: the streamed data-only ISO carries no Red Book CD tracks, so the
+	// AudioCDManager reports duration 0 and a CD-music-paced cutscene (e.g. the
+	// KQ6 intro) would end instantly.  The script passed the intended length to
+	// kDoCdAudio (s_audioCdDuration), so when nothing is physically playing, pace
+	// by wall-clock against that requested length instead.
+	if (durationFrames == 0)
+		durationFrames = s_audioCdDuration;
+	if (durationFrames == 0)
+		return -1; // nothing playing and no known length
+
+	if (((g_system->getMillis() - _audioCdStart) * 75 / 1000) >= durationFrames)
 		return -1;
 
 	// Return the position otherwise (in ticks).
