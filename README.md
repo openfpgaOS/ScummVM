@@ -511,6 +511,8 @@ found. Keep critical names un-truncated (e.g. `SPEECH.INFO`, `CDDA.SOU`).
 A zip of the game files; set `data_type=zip` (or leave default — `.zip` is
 auto-detected). Members are read directly. A zip can also carry a raw disc image:
 set `data_type=cue` and `cue_file=<member>.cue`.
+Uncompressed zips (Compression Level 0, aka "Store") are recommended,
+DEFLATE/DEFLATE64 will greatly increase loading times.
 
 ### CUE / BIN (`.cue` + `.bin`)
 
