@@ -40,6 +40,19 @@ extern "C" {
  * graphics manager without a cross-cast through the virtual BaseBackend. */
 static OpenFPGAGraphicsManager *g_splashGfx = nullptr;
 
+/* Audio-pump re-entrancy flag.  Set while ANY audio pump runs so a nested FS
+ * read pulled by the mixer/CDDA -- which funnels through openfpga_pump_during_
+ * load() -> openfpga_drive_audio_and_timers() on the FS read path -- no-ops
+ * instead of re-entering the pump mid-mix.  CRITICAL: delayMillis()'s per-ms
+ * pumps must set it too (via pumpAudioTick).  They used NOT to (they called
+ * openfpga_audiocd_pump() / mgr->update() directly), so a CDDA/speech ISO read
+ * re-entered the mixer mid-block and corrupted the output -- the LucasArts
+ * CD-audio dropout and talkie-speech stutter.  SCI music is MIDI (no FS read
+ * while playing), so it was spared, which made it look SCUMM-specific.  Declared
+ * here (not just before delayMillis) so serviceCursorFromWork() can also bail
+ * when a pump is in flight -- no cursor GPU flip mid audio-mix. */
+static bool g_pumpBusy = false;
+
 OpenFPGAGraphicsManager::OpenFPGAGraphicsManager()
     : _screenW(320), _screenH(200), _screenChangeID(0),
       _overlayVisible(false), _paletteDirty(false), _screenDirty(false),
@@ -47,7 +60,8 @@ OpenFPGAGraphicsManager::OpenFPGAGraphicsManager()
       _cursorW(0), _cursorH(0), _cursorKeycolor(0), _cursorVisible(false),
       _gpuReady(false), _videoBufIdx(-1), _videoFence(0), _gpuCleanMask(0),
       _gpuStalled(false), _gpuStallToken(0),
-      _splashActive(false), _keypadMode(false) {
+      _splashActive(false), _keypadMode(false),
+      _lastEnginePresentMs(0) {
     memset(_screenBuf, 0, sizeof(_screenBuf));
     memset(_palette, 0, sizeof(_palette));
     memset(_cursorData, 0, sizeof(_cursorData));
@@ -386,6 +400,13 @@ void OpenFPGAGraphicsManager::presentFrame() {
 }
 
 void OpenFPGAGraphicsManager::updateScreen() {
+    /* Stamp the engine-present time so presentCursor() knows the game is
+     * actively redrawing and can skip its own (redundant, GPU-contending) flip. */
+    _lastEnginePresentMs = of_time_ms();
+    presentFrameInternal();
+}
+
+void OpenFPGAGraphicsManager::presentFrameInternal() {
     /* The engine is presenting a real frame now -- let initSize() blank
      * normally again (this frame replaces the splash on screen).  initSize()
      * deliberately SKIPS the framebuffer-mode switch while the splash is up (to
@@ -533,6 +554,24 @@ void OpenFPGAGraphicsManager::updateScreen() {
     extern void openfpga_mixer_pump_only(void);
     openfpga_midi_pump_pending();
     openfpga_mixer_pump_only();
+}
+
+void OpenFPGAGraphicsManager::presentCursor() {
+    /* Nothing to smooth before the first real frame (splash still owns the
+     * screen, and a present would prematurely switch the framebuffer mode) or
+     * while the cursor is hidden. */
+    if (_splashActive || !_cursorVisible)
+        return;
+    /* If the engine itself presented very recently it is actively redrawing, and
+     * its own frame already shows the cursor at its current (serviceInput-moved)
+     * position -- adding a second flip here would just double the present rate
+     * and starve the audio pump (the talkie-speech stutter).  Only present when
+     * the game has gone quiet (static room, or stuck in a long non-yielding
+     * load/render), which is exactly when the cursor would otherwise freeze. */
+    if ((uint32)(of_time_ms() - _lastEnginePresentMs) < 30u)
+        return;
+    /* Only the cursor moved, so the dirty-rect blit is just the cursor box. */
+    presentFrameInternal();
 }
 
 void OpenFPGAGraphicsManager::setKeypadMode(bool on) {
@@ -728,16 +767,25 @@ OSystem_OpenFPGA::OSystem_OpenFPGA()
       _masterVolume(255), _musicVolume(192),
       _selectHeld(false), _selectConsumed(false),
       _lastMouseTick(0),
-      _mouseAccumX(0), _mouseAccumY(0) {
+      _mouseAccumX(0), _mouseAccumY(0),
+      _joyFiltX(0), _joyFiltY(0),
+      _lastCursorServiceMs(0), _inCursorService(false) {
 }
 
 OSystem_OpenFPGA::~OSystem_OpenFPGA() {
 }
 
+/* Stashed OSystem instance so the free-function work pumps (openfpga_pump_during_
+ * load, called from the FS read path) can service the cursor without a header
+ * dependency.  Set in initBackend(). */
+static OSystem_OpenFPGA *g_ofCursorSystem = nullptr;
+
 void OSystem_OpenFPGA::initBackend() {
     /* Guard against double init (main calls us, then scummvm_main calls us again) */
     if (_ofGfx)
         return;
+
+    g_ofCursorSystem = this;
 
     _startTime = of_time_ms();
 
@@ -841,6 +889,15 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
     if (popQueuedEvent(event))
         return true;
 
+    /* All input is read in serviceInput() (also called from delayMillis() to
+     * keep the cursor smooth); it pushes events onto _eventQueue, which we then
+     * drain.  Keeping of_input_poll() to this one funnel is what stops the
+     * delayMillis poll from stealing button-press edges from us. */
+    serviceInput(false);
+    return popQueuedEvent(event);
+}
+
+void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
     of_input_poll();
 
     /* Auto-dismiss REMOVED: this fired a single blind Return ~60 polls (~2s)
@@ -852,12 +909,18 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
      * future game needs a startup dialog dismissed, gate a Return on the GUI
      * actually being active rather than firing it blindly on a timer. */
 
-    /* ===== Dock USB keyboard =====
+    /* ===== Dock USB keyboard + mouse =====
+     * Only serviced from pollEvent (fromDelay=false).  The dock keyboard/mouse
+     * are read through their own syscalls (not of_input_poll), so we must NOT
+     * consume their edges/deltas on the extra delayMillis service passes -- that
+     * would drop keypresses and double-apply motion.  The controller (below) is
+     * safe on both passes because its edges are queued the moment they're read.
+     *
      * A real keyboard plugged into the Pocket dock types directly into the
      * engine -- no keypad mode needed (so e.g. the LSL age quiz, which reads a
      * typed number via kReadNumber, is answerable normally).  Checked before
      * the controller so typed input is never swallowed by keypad/mouse logic. */
-    {
+    if (!fromDelay) {
         of_keyboard_state_t kb;
         of_input_keyboard_state(&kb);
         if (kb.present) {
@@ -882,7 +945,7 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
                         uint16 ascii;
                         if (hidUsageToScummVM((uint8_t)u, shift, kc, ascii)) {
                             queueKey(kc, ascii, flags);
-                            return popQueuedEvent(event);
+                            return;
                         }
                     }
                 }
@@ -894,8 +957,9 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
 
     /* ===== Dock USB mouse =====
      * Relative motion -> cursor, buttons -> left/right click.  Uses the SDK's
-     * pressed/released edges, so it composes with the controller cursor. */
-    {
+     * pressed/released edges, so it composes with the controller cursor.
+     * pollEvent-only for the same reason as the keyboard above. */
+    if (!fromDelay) {
         of_mouse_state_t m;
         of_input_mouse_state(&m);
         if (m.present) {
@@ -905,10 +969,8 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
             };
             for (uint i = 0; i < 2; ++i) {
                 if (m.buttons_pressed & mb[i].mask || m.buttons_released & mb[i].mask) {
-                    event.type = (m.buttons_pressed & mb[i].mask) ? mb[i].down : mb[i].up;
-                    event.mouse.x = _ofGfx->getMouseX();
-                    event.mouse.y = _ofGfx->getMouseY();
-                    return true;
+                    queueMouseEvent((m.buttons_pressed & mb[i].mask) ? mb[i].down : mb[i].up);
+                    return;
                 }
             }
             if (m.dx || m.dy) {
@@ -933,10 +995,8 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
                 accY -= mdy * DOCK_MOUSE_DIV;
                 if (mdx || mdy) {
                     _ofGfx->moveMouse(mdx, mdy);
-                    event.type = Common::EVENT_MOUSEMOVE;
-                    event.mouse.x = _ofGfx->getMouseX();
-                    event.mouse.y = _ofGfx->getMouseY();
-                    return true;
+                    queueMouseEvent(Common::EVENT_MOUSEMOVE);
+                    return;
                 }
             }
         }
@@ -956,7 +1016,7 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
             _mouseAccumY = 0;
             _mouseButtonL = false;
             _mouseButtonR = false;
-            return false;
+            return;
         }
         _ignoreInitialButtons = false;
     }
@@ -1014,7 +1074,7 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
             _selectConsumed = true;
             _selectHeld = true;
             queueKey(Common::KEYCODE_ESCAPE, 27);
-            return popQueuedEvent(event);
+            return;
         } else if (state.buttons_pressed & OF_BTN_START) {
             /* SELECT+START = toggle the numeric keypad, deliberately.  Keypad
              * mode disables the mouse and turns every button into a digit with
@@ -1026,7 +1086,7 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
             _selectConsumed = true;
         }
         _selectHeld = true;
-        return false;
+        return;
     }
     if (_selectHeld) {                  /* SELECT just released */
         _selectHeld = false;
@@ -1037,7 +1097,7 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
             _ofGfx->setKeypadMode(_keypadMode);
         }
         _selectConsumed = false;
-        return false;
+        return;
     }
     if (_keypadMode) {
         static const struct { uint32 btn; Common::KeyCode kc; uint16 ch; } kp[] = {
@@ -1052,7 +1112,7 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
         for (uint i = 0; i < sizeof(kp) / sizeof(kp[0]); ++i) {
             if (state.buttons_pressed & kp[i].btn) {
                 queueKey(kp[i].kc, kp[i].ch);
-                return popQueuedEvent(event);
+                return;
             }
         }
         if (state.buttons_pressed & OF_BTN_START) {
@@ -1062,9 +1122,9 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
              * Enter -> next question).  Tap SELECT to leave the keypad when done
              * (that restores the mouse). */
             queueKey(Common::KEYCODE_RETURN, Common::ASCII_RETURN);
-            return popQueuedEvent(event);
+            return;
         }
-        return false;   /* swallow movement/clicks while in keypad mode */
+        return;   /* swallow movement/clicks while in keypad mode */
     }
 
     uint32 nowMs = getMillis();
@@ -1089,8 +1149,15 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
         analogMaxRate = analogMaxRate * surfaceW / 320;
         dpadBaseRate  = dpadBaseRate  * surfaceW / 320;
     }
-    int lx = state.joy_lx;
-    int ly = state.joy_ly;
+    /* Low-pass the raw axes (one-pole IIR, alpha = 1/4) before the deadzone, so
+     * ADC jitter on a held stick averages out to a steady value instead of a
+     * trembling one -- a chief cause of the cursor "jumping around".  Residual
+     * (<=3 counts after decay) sits well inside the deadzone, so a released
+     * stick still reads a hard zero with no drift. */
+    _joyFiltX += (state.joy_lx - _joyFiltX) / 4;
+    _joyFiltY += (state.joy_ly - _joyFiltY) / 4;
+    int lx = _joyFiltX;
+    int ly = _joyFiltY;
     if (lx > -deadzone && lx < deadzone) lx = 0;
     if (ly > -deadzone && ly < deadzone) ly = 0;
 
@@ -1120,40 +1187,43 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
     if (moved)
         _ofGfx->moveMouse(dx, dy);
 
+    /* When servicing from delayMillis() the engine isn't redrawing, so present
+     * the cursor ourselves -- this is what decouples cursor smoothness from the
+     * game's (low, irregular) frame rate.  presentCursor() no-ops if the cursor
+     * is hidden or the splash is still up. */
+    if (fromDelay && moved)
+        _ofGfx->presentCursor();
+
     /* A = left click */
     bool aDown = (state.buttons & OF_BTN_A) != 0;
     if (aDown != _mouseButtonL) {
         _mouseButtonL = aDown;
-        event.type = aDown ? Common::EVENT_LBUTTONDOWN : Common::EVENT_LBUTTONUP;
-        event.mouse.x = _ofGfx->getMouseX();
-        event.mouse.y = _ofGfx->getMouseY();
-        return true;
+        queueMouseEvent(aDown ? Common::EVENT_LBUTTONDOWN : Common::EVENT_LBUTTONUP);
+        return;
     }
 
     /* B = right click */
     bool bDown = (state.buttons & OF_BTN_B) != 0;
     if (bDown != _mouseButtonR) {
         _mouseButtonR = bDown;
-        event.type = bDown ? Common::EVENT_RBUTTONDOWN : Common::EVENT_RBUTTONUP;
-        event.mouse.x = _ofGfx->getMouseX();
-        event.mouse.y = _ofGfx->getMouseY();
-        return true;
+        queueMouseEvent(bDown ? Common::EVENT_RBUTTONDOWN : Common::EVENT_RBUTTONUP);
+        return;
     }
 
     /* Controller shortcuts. */
     if (state.buttons_pressed & OF_BTN_X) {
         queueKey(Common::KEYCODE_RETURN, Common::ASCII_RETURN);
-        return popQueuedEvent(event);
+        return;
     }
 
     if (state.buttons_pressed & OF_BTN_Y) {
         queueKey(Common::KEYCODE_SPACE, Common::ASCII_SPACE);
-        return popQueuedEvent(event);
+        return;
     }
 
     if (state.buttons_pressed & OF_BTN_START) {
         queueKey(Common::KEYCODE_F5, Common::ASCII_F5);
-        return popQueuedEvent(event);
+        return;
     }
 
     /* Plain Select intentionally has no Escape binding. SCUMM uses Escape
@@ -1161,22 +1231,49 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
 
     if (state.buttons_pressed & OF_BTN_L3) {
         queueKey(Common::KEYCODE_TAB, Common::ASCII_TAB);
-        return popQueuedEvent(event);
+        return;
     }
 
     if (state.buttons_pressed & OF_BTN_R3) {
         queueKey(Common::KEYCODE_PERIOD, '.');
-        return popQueuedEvent(event);
+        return;
     }
 
-    if (moved) {
-        event.type = Common::EVENT_MOUSEMOVE;
-        event.mouse.x = _ofGfx->getMouseX();
-        event.mouse.y = _ofGfx->getMouseY();
-        return true;
-    }
+    /* Pure movement: hand the engine the cursor's new position so hover/verb
+     * lines and the next click target track it.  Only from pollEvent -- from
+     * delayMillis we already moved + presented, and _mousePos re-syncs on the
+     * next pollEvent, so queuing here too would only flood the queue. */
+    if (!fromDelay && moved)
+        queueMouseEvent(Common::EVENT_MOUSEMOVE);
+}
 
-    return false;
+void OSystem_OpenFPGA::serviceCursorFromWork() {
+    if (_inCursorService)               /* re-entered via mixer->FS-load pump */
+        return;
+    if (g_pumpBusy)                     /* inside an audio pump's FS read -- no
+                                         * cursor GPU flip mid-mix; the caller's
+                                         * own delayMillis tick services it */
+        return;
+    uint32 now = of_time_ms();
+    if ((uint32)(now - _lastCursorServiceMs) < 16u)   /* ~60 Hz */
+        return;
+    _lastCursorServiceMs = now;
+    _inCursorService = true;
+    serviceInput(true);
+    _inCursorService = false;
+}
+
+void openfpga_service_cursor(void) {
+    if (g_ofCursorSystem)
+        g_ofCursorSystem->serviceCursorFromWork();
+}
+
+void OSystem_OpenFPGA::queueMouseEvent(Common::EventType type) {
+    Common::Event ev;
+    ev.type = type;
+    ev.mouse.x = _ofGfx->getMouseX();
+    ev.mouse.y = _ofGfx->getMouseY();
+    _eventQueue.push(ev);
 }
 
 void OSystem_OpenFPGA::queueKey(Common::KeyCode keycode, uint16 ascii, byte flags) {
@@ -1242,30 +1339,39 @@ uint32 OSystem_OpenFPGA::getMillis(bool skipRecord) {
     return of_time_ms() - _startTime;
 }
 
-void OSystem_OpenFPGA::delayMillis(uint msecs) {
-    /* Main-thread audio servicing at 1 ms granularity.  Each tick:
-     *   - drain() advances the SDK software-mixer voices (cheap)
-     *   - update() mixes + pushes a block to the HW ring when it has room
-     * Tried moving this to the 1 kHz timer ISR but of_audio_write from IRQ
-     * produces audible vibrato; main-thread is the safer spot even though it
-     * can underrun during long engine work. */
-    OpenFPGAMixerManager *mgr = (OpenFPGAMixerManager *)_mixerManager;
+/* One guarded audio-servicing tick for delayMillis()'s low-latency loop
+ * (g_pumpBusy declared near the top of the file). */
+static void pumpAudioTick(OpenFPGAMixerManager *mgr, bool doUpdate) {
+    if (g_pumpBusy)
+        return;                 /* nested FS-read pump -- the outer tick covers it */
+    g_pumpBusy = true;
+    extern void openfpga_midi_pump_pending(void);
     extern void openfpga_audiocd_pump(void);
     openfpga_midi_pump_pending();
     openfpga_audiocd_pump();
-    mgr->update();
-    mgr->drain();
+    if (doUpdate)
+        mgr->update();          /* mix + push a block to the HW ring (may read FS) */
+    mgr->drain();               /* advance SDK software-mixer voices (cheap) */
+    g_pumpBusy = false;
+}
+
+void OSystem_OpenFPGA::delayMillis(uint msecs) {
+    /* Main-thread audio servicing at 1 ms granularity.  All pumping goes through
+     * pumpAudioTick() so a CDDA/speech ISO read can't re-enter the mixer mid-mix
+     * (see g_pumpBusy above).  Tried moving this to the 1 kHz timer ISR but
+     * of_audio_write from IRQ produces audible vibrato; main-thread is the safer
+     * spot even though it can underrun during long engine work. */
+    OpenFPGAMixerManager *mgr = (OpenFPGAMixerManager *)_mixerManager;
+    pumpAudioTick(mgr, true);
     while (msecs > 0) {
         usleep(1000);
-        openfpga_midi_pump_pending();
-        openfpga_audiocd_pump();
-        mgr->drain();
-        if ((msecs & 0x3) == 0) mgr->update();   /* refill every ~4 ms */
+        pumpAudioTick(mgr, (msecs & 0x3) == 0);   /* update (refill) every ~4 ms */
+        /* Keep the cursor alive during the wait (~60 Hz internal gate); the flip
+         * itself defers to the engine's own frames inside presentCursor(). */
+        serviceCursorFromWork();
         --msecs;
     }
-    openfpga_midi_pump_pending();
-    mgr->update();
-    mgr->drain();
+    pumpAudioTick(mgr, true);
 }
 
 /* Shared by pollEvent, delayMillis, and the graphics manager's
@@ -1276,7 +1382,7 @@ void OSystem_OpenFPGA::delayMillis(uint msecs) {
  * avoid the virtual-base cast from g_system. */
 static DefaultTimerManager   *g_pumpTimerMgr = nullptr;
 static OpenFPGAMixerManager  *g_pumpMixerMgr = nullptr;
-static bool                   g_pumpBusy = false;
+/* g_pumpBusy is declared above delayMillis() (its per-ms pumps need it). */
 
 void openfpga_set_pump_managers(Common::TimerManager *t, MixerManager *m) {
     g_pumpTimerMgr = (DefaultTimerManager *)t;
@@ -1361,6 +1467,14 @@ void openfpga_pump_during_load(void) {
      * when the pump itself is throttled below. */
     extern void openfpga_mixer_extend_cushion(uint32 untilMs);
     openfpga_mixer_extend_cushion(now + 600u);
+
+    /* Keep the cursor moving through long non-yielding loads (SCI room/screen
+     * transitions read+decompress large volumes without returning to delayMillis
+     * / pollEvent).  serviceCursorFromWork() self-gates to ~60 Hz and, since the
+     * engine isn't presenting during a load, presentCursor()'s engine-recent gate
+     * passes so the cursor actually redraws.  Its re-entrancy guard swallows the
+     * nested load read the mixer pump below may pull. */
+    openfpga_service_cursor();
 
     if ((uint32)(now - s_lastPumpMs) < 8u)
         return;

@@ -95,6 +95,14 @@ public:
      * the engine loads, before it produces its first frame). */
     void showSplash();
 
+    /* Re-composite + flip the current frame to reflect a cursor move made
+     * OUTSIDE the engine's own updateScreen() -- i.e. from delayMillis(), so the
+     * cursor stays smooth even when the game is not redrawing.  No-op while the
+     * splash is still up (first real frame not yet presented) or the cursor is
+     * hidden; otherwise it re-runs updateScreen(), whose dirty-rect path blits
+     * only the cursor box. */
+    void presentCursor();
+
 private:
     uint _screenW, _screenH;
     int _screenChangeID;
@@ -145,7 +153,17 @@ private:
      * OSystem_OpenFPGA::pollEvent); draws the on-screen keypad legend. */
     bool _keypadMode;
 
+    /* Wall-clock (of_time_ms) of the last ENGINE-driven present (updateScreen).
+     * presentCursor() skips its extra flip while this is recent, so the cursor
+     * only adds GPU work when the game itself has gone quiet -- avoids doubling
+     * the present rate (and starving the audio pump) during active/talkie
+     * scenes, where the engine's own frame already carries the moved cursor. */
+    uint32 _lastEnginePresentMs;
+
     void ensureGpuReady();
+    /* The actual present pipeline (blit + cursor + flip).  updateScreen() stamps
+     * _lastEnginePresentMs and calls this; presentCursor() gates then calls it. */
+    void presentFrameInternal();
     uint8_t *acquireFrameBuffer();
     /* Bounded, non-fatal replacement for of_gpu_wait(): returns true when the
      * fence retired, false on timeout (caller latches the GPU as stalled). */
@@ -251,10 +269,38 @@ private:
 
     uint32 _lastMouseTick;
     int32 _mouseAccumX, _mouseAccumY;
+    /* One-pole low-pass of the analog axes -- sheds ADC jitter so a held stick
+     * drives a steady cursor instead of a trembling one. */
+    int32 _joyFiltX, _joyFiltY;
+    /* Wall-clock of the last cursor service from delayMillis(), so repeated
+     * small delays still service at a steady ~60 Hz rather than never. */
+    uint32 _lastCursorServiceMs;
     Common::Queue<Common::Event> _eventQueue;
 
+    /* Single input poll point.  Reads the controller (and, only when NOT called
+     * from delayMillis, the dock keyboard/mouse), moves the cursor, and pushes
+     * any resulting events onto _eventQueue.  pollEvent() drains the queue;
+     * delayMillis() calls it (fromDelay=true) to smooth the cursor between the
+     * engine's own frames.  Funnelling all of_input_poll() edge latching through
+     * here is what lets delayMillis poll without stealing button edges from
+     * pollEvent. */
+    void serviceInput(bool fromDelay);
+    void queueMouseEvent(Common::EventType type);
     void queueKey(Common::KeyCode keycode, uint16 ascii, byte flags = 0);
     bool popQueuedEvent(Common::Event &event);
+
+    /* Re-entrancy guard for serviceCursorFromWork(): the cursor present pumps
+     * the mixer, which can pull a speech/CDDA read back through the FS load path
+     * and re-enter here -- swallow that nested call. */
+    bool _inCursorService;
+
+public:
+    /* Poll input + move/present the cursor from a long non-yielding work loop
+     * (delayMillis, and the FS load pump) so the cursor keeps moving while the
+     * engine isn't returning to its own event/redraw loop.  Time-gated to ~60 Hz
+     * on _lastCursorServiceMs; the actual flip is further gated inside
+     * presentCursor() so it defers to the engine's own frames. */
+    void serviceCursorFromWork();
 };
 
 #endif /* OPENFPGA_OSYSTEM_H */
