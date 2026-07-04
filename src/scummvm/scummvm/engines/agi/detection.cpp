@@ -676,6 +676,18 @@ const AGIGameDescription *openFPGAFindGameDesc(const Common::String &gameid,
 		// Demo and full versions must agree so we never silently launch a demo.
 		if (((g->desc.flags & ADGF_DEMO) != 0) != wantDemo)
 			score -= 1000;
+		// Prefer a standard disk-based interpreter over PC-Booter (GType_V1),
+		// Apple II (GType_A2) and Gold Rush booter (GType_GAL) variants.  Those
+		// loaders scan the game directory for raw .img/.ima floppy images, but
+		// the openfpgaOS launcher only ever supplies the flattened AGI files
+		// (logdir, vol.*), so such a row can never load even when it shares the
+		// gameid/platform/language of the real DOS entry.  This is what makes
+		// KQ2 pick its unloadable "5.25\" Booter" row ahead of "2.1 1987-04-10".
+		// The penalty is smaller than the platform/language weights, so it only
+		// breaks ties among otherwise-equal candidates; when a gameid has *only*
+		// booter/A2 rows they are all penalised equally and the best still wins.
+		if (g->gameType == GType_V1 || g->gameType == GType_A2 || g->gameType == GType_GAL)
+			score -= 3;
 		// Exact "extra"/variant string is the finest tiebreak.
 		if (!extra.empty() && g->desc.extra && extra == g->desc.extra)
 			score += 2;
