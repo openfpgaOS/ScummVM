@@ -552,7 +552,13 @@ void OpenFPGAGraphicsManager::presentFrameInternal() {
 
     extern void openfpga_midi_pump_pending(void);
     extern void openfpga_mixer_pump_only(void);
+    extern void openfpga_audiocd_pump(void);
     openfpga_midi_pump_pending();
+    /* Full CDDA pump HERE, right after the flip is queued: the next engine
+     * present is at least a frame away, so this is where the batched CD-audio
+     * refill (a few large blocking bridge reads, ~5x/s) can run without
+     * delaying a frame. */
+    openfpga_audiocd_pump();
     openfpga_mixer_pump_only();
 }
 
@@ -1405,8 +1411,12 @@ void openfpga_drive_audio_and_timers(void) {
 void openfpga_mixer_pump_only(void) {
     if (!g_pumpMixerMgr || g_pumpBusy) return;
     g_pumpBusy = true;
-    extern void openfpga_audiocd_pump(void);
-    openfpga_audiocd_pump();
+    /* Light CDDA pump: this runs on latency-critical paths (just before a
+     * frame blit in presentFrameInternal, between zip read chunks), where a
+     * batched blocking refill would land in the frame time.  It still refills
+     * below the emergency floor so audio can't underrun. */
+    extern void openfpga_audiocd_pump_light(void);
+    openfpga_audiocd_pump_light();
     g_pumpMixerMgr->update();
     g_pumpMixerMgr->drain();
     g_pumpBusy = false;
@@ -1456,17 +1466,36 @@ void openfpga_pump_during_load(void) {
     static uint32 s_lastPumpMs = 0;
     uint32 now = of_time_ms();
 
-    /* A load is clearly in flight.  Arm a DEEP audio cushion for the next
-     * ~600 ms: the engine often follows a burst of reads with >120 ms of pure
-     * in-memory work (resource decompress, room kAnimate setup, the transition
-     * effect) during which NO read and NO updateScreen fires -- so neither pump
-     * site runs and the normal 120 ms ring cushion underruns (the "hiccup
-     * between loads").  Pre-filling a deep buffer here rides through that gap;
-     * latency is invisible mid-transition and the target snaps back to 120 ms
-     * the moment loading stops.  Cheap (one store) -- do it on every read, even
-     * when the pump itself is throttled below. */
+    /* Arm a DEEP audio cushion for the next ~600 ms, but only when reads are
+     * BURSTING (a real load): the engine often follows a burst of reads with
+     * >120 ms of pure in-memory work (resource decompress, room kAnimate
+     * setup, the transition effect) during which NO read and NO updateScreen
+     * fires -- so neither pump site runs and the normal 120 ms ring cushion
+     * underruns (the "hiccup between loads").  Pre-filling a deep buffer here
+     * rides through that gap.
+     *
+     * The burst gate matters: arming on EVERY read let a lone resource read
+     * every couple of seconds in normal play flap the target 120ms->800ms->
+     * drain->repeat; each arm made the mixer rebuild ~700 ms of buffer, and
+     * with a rate-converted CDDA stream attached that rebuild is a heavy CPU
+     * burst -- the MI1 CD-music picture stutter.  A genuine transition issues
+     * dozens of reads within milliseconds, so requiring a few reads in quick
+     * succession costs a real load nothing. */
     extern void openfpga_mixer_extend_cushion(uint32 untilMs);
-    openfpga_mixer_extend_cushion(now + 600u);
+    static uint32 s_burstStartMs = 0;
+    static uint32 s_burstReads = 0;
+    if ((uint32)(now - s_burstStartMs) > 150u) {
+        s_burstStartMs = now;
+        s_burstReads = 0;
+    }
+    ++s_burstReads;
+    /* >=4 reads spanning >=50 ms: a real transition sustains both trivially
+     * (reads every few ms for hundreds of ms); a lone resource access issues
+     * a couple of 32 KB buffer fills inside a millisecond and passes neither.
+     * The first 50 ms of a real load run unarmed, which the normal 120 ms
+     * cushion covers. */
+    if (s_burstReads >= 4u && (uint32)(now - s_burstStartMs) >= 50u)
+        openfpga_mixer_extend_cushion(now + 600u);
 
     /* Keep the cursor moving through long non-yielding loads (SCI room/screen
      * transitions read+decompress large volumes without returning to delayMillis

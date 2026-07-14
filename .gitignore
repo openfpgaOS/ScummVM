@@ -1,4 +1,10 @@
 *.o
+# Bundled prebuilt musl C runtime objects -- shipped with the SDK like
+# libc.a/libm.a so a fresh checkout can link without building musl. The
+# broad *.o rule above would otherwise drop them and break the link.
+!src/sdk/musl/lib/crt1.o
+!src/sdk/musl/lib/crti.o
+!src/sdk/musl/lib/crtn.o
 *.elf
 ._*
 app_pc
@@ -8,3 +14,4 @@ build/
 releases/
 src/tools/phdp/phdp
 src/tools/phdp/phdpd
+.DS_Store

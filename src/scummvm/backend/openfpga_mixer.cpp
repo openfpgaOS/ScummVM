@@ -142,7 +142,16 @@ void OpenFPGAMixerManager::update() {
         _mixer->hasActiveChannelOfType(Audio::Mixer::kSpeechSoundType);
     const int targetPairs = (!speechActive && of_time_ms() < g_loadCushionUntilMs)
                                 ? kLoadCushionPairs : kTargetBufferedPairs;
-    for (;;) {
+    /* Cap one update() call's work.  When the deep load cushion arms, the
+     * uncapped loop mixed the ring from 120 ms straight up to 800 ms in ONE
+     * call -- ~200 blocks, ~360 ms of CPU with a rate-converted CDDA stream
+     * attached: a hard main-thread freeze (the MI1 CD-music picture stutter).
+     * Capped, the cushion still builds just as deep, but spread across the
+     * many pump calls a real load generates (one per FS read, >=8 ms apart),
+     * so no single call can stall a frame for more than a few blocks' cost. */
+    const unsigned kMaxBlocksPerUpdate = 8;
+    unsigned blocks = 0;
+    while (blocks < kMaxBlocksPerUpdate) {
         int freePairs = of_audio_free();
         if (freePairs < (int)_framesPerBlock)
             break;                                      /* ring full */
@@ -153,6 +162,7 @@ void OpenFPGAMixerManager::update() {
             break;                                      /* cushion reached */
         _mixer->mixCallback((uint8 *)_buffer, _framesPerBlock * 4);
         int wrote = of_audio_write(_buffer, (int)_framesPerBlock);
+        blocks++;
         if (wrote <= 0)
             break;
     }

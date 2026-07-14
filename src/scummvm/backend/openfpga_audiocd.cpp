@@ -37,6 +37,21 @@ constexpr uint32 kCDHWFrames = 65536;       /* ~1.5 s at 44.1 kHz */
 constexpr uint32 kCDHWChunkFrames = 4096;   /* ~93 ms refill unit */
 constexpr uint32 kCDHWGuardFrames = 512;
 constexpr uint32 kCDHWSilenceFrames = 2048;
+/* Refill hysteresis.  Topping the ring up on every pump tick reads ~800 bytes
+ * ~200x per second -- each one a blocking APF-bridge round-trip on the render
+ * thread (the CD-music picture stutter).  Instead let the ring drain a full
+ * batch and refill it in a few large reads (~5x per second).  Light pump sites
+ * (mid-present, mid-read) don't batch at all; they only refill below the
+ * emergency floor so a long non-yielding engine stretch can't underrun. */
+constexpr uint32 kCDHWRefillBatchFrames = 8192;   /* ~186 ms per batch */
+constexpr uint32 kCDHWEmergencyFrames   = 16384;  /* ~371 ms floor */
+
+/* Scoped re-entrancy flag for the pump paths (they have several exits). */
+struct PumpScope {
+    explicit PumpScope(bool &flag) : _flag(flag) { _flag = true; }
+    ~PumpScope() { _flag = false; }
+    bool &_flag;
+};
 
 class StdioSeekableReadStream : public Common::SeekableReadStream {
 public:
@@ -251,7 +266,7 @@ public:
           _ring(nullptr), _ringSize(kCDRingBytes), _head(0), _tail(0), _used(0),
           _initialLoops((numLoops < 0) ? 0u : (uint)((numLoops <= 1) ? 1 : numLoops)),
           _loopsLeftAfterCurrent(0), _infinite(numLoops < 0), _finished(false),
-          _err(false) {
+          _err(false), _inPump(false) {
         _ring = (byte *)malloc(_ringSize);
         if (_asyncSlot >= 0) {
             _asyncChunk = of_file_async_max_read();
@@ -286,8 +301,13 @@ public:
     }
 
     void pump(bool wait) {
+        /* Re-entered via a mid-read mixer pump (see HardwareCDDARing::pump);
+         * a nested read would clobber _head/_sourcePos mid-transfer. */
+        if (_inPump)
+            return;
         if (_err || _finished || !_ring)
             return;
+        PumpScope scope(_inPump);
 
         pollAsync();
         if (wait)
@@ -409,8 +429,11 @@ public:
 
 private:
     bool refillBlocking() {
+        if (_inPump)                 /* nested via a mid-read mixer pump */
+            return false;
         if (_err || _finished || !_ring)
             return false;
+        PumpScope scope(_inPump);
 
         waitForAsync();
         if (_sourcePos >= _streamBytes && !advanceLoop())
@@ -580,6 +603,7 @@ private:
     bool _infinite;
     bool _finished;
     bool _err;
+    bool _inPump;
 };
 
 class HardwareCDDARing {
@@ -598,6 +622,7 @@ public:
           _loopsLeftAfterCurrent(0), _infinite(numLoops < 0),
           _tailSilenceWritten(false), _finishedFeeding(false),
           _started(false), _paused(false), _done(false), _err(false),
+          _inPump(false),
           _mixer(mixer), _soundType(soundType), _volume(volume),
           _balance(balance), _lastVolL(-1), _lastVolR(-1) {
         _left = (int16 *)calloc(_ringFrames, sizeof(int16));
@@ -662,9 +687,15 @@ public:
         _started = false;
     }
 
-    void pump() {
+    void pump(bool allowBatch) {
+        /* Re-entered via a mid-read mixer pump (SlotFileStream pumps audio
+         * between zip read chunks; without the guard that nested pump could
+         * issue a second read into _io while the outer one is in flight). */
+        if (_inPump)
+            return;
         if (!_started || _paused || _done)
             return;
+        PumpScope scope(_inPump);
 
         updateCursor();
         if (!_started || _done)
@@ -678,7 +709,22 @@ public:
         }
 
         applyVolume();
-        fillAvailable(kCDHWChunkFrames * 2);
+
+        if (!_finishedFeeding) {
+            uint64 buffered = bufferedFrames();
+            uint32 freeFrames = 0;
+            if (buffered + kCDHWGuardFrames < _ringFrames)
+                freeFrames = _ringFrames - (uint32)buffered - kCDHWGuardFrames;
+            const bool urgent = buffered < kCDHWEmergencyFrames;
+            if (urgent || (allowBatch && freeFrames >= kCDHWRefillBatchFrames)) {
+                /* Cap one pump's worth of blocking reads; after a long stall
+                 * the next pumps (urgent) top the rest back up. */
+                uint32 budget = freeFrames;
+                if (budget > kCDHWRefillBatchFrames * 2)
+                    budget = kCDHWRefillBatchFrames * 2;
+                fillAvailable(budget);
+            }
+        }
         updateCursor();
     }
 
@@ -908,6 +954,7 @@ private:
     bool _paused;
     bool _done;
     bool _err;
+    bool _inPump;
     Audio::Mixer *_mixer;
     Audio::Mixer::SoundType _soundType;
     byte _volume;
@@ -1245,7 +1292,7 @@ void OpenFPGAAudioCDManager::update() {
     if (_paused)
         return;
     if (_activeHW) {
-        _activeHW->pump();
+        _activeHW->pump(true);
         if (!_activeHW->isActive()) {
             delete _activeHW;
             _activeHW = nullptr;
@@ -1280,11 +1327,11 @@ bool OpenFPGAAudioCDManager::existExtractedCDAudioFiles(uint track) {
     return DefaultAudioCDManager::existExtractedCDAudioFiles(track);
 }
 
-void OpenFPGAAudioCDManager::pump() {
+void OpenFPGAAudioCDManager::pump(bool allowBatch) {
     if (_paused)
         return;
     if (_activeHW)
-        _activeHW->pump();
+        _activeHW->pump(allowBatch);
     else if (_activeStream)
         _activeStream->pump(false);
 }
@@ -1298,7 +1345,16 @@ void OpenFPGAAudioCDManager::quiesce() {
 
 extern "C" void openfpga_audiocd_pump(void) {
     if (g_activeCDManager)
-        g_activeCDManager->pump();
+        g_activeCDManager->pump(true);
+}
+
+/* Light pump for call sites that sit on the latency-critical path (mid-present,
+ * between zip read chunks): keeps the HW cursor/volume serviced but defers the
+ * batched blocking refill to a full pump unless the buffer hits the emergency
+ * floor. */
+extern "C" void openfpga_audiocd_pump_light(void) {
+    if (g_activeCDManager)
+        g_activeCDManager->pump(false);
 }
 
 extern "C" void openfpga_audiocd_pause(bool paused) {

@@ -106,8 +106,12 @@ public:
             if (_pos > _size)
                 _size = _pos;
         }
-        if (toWrite != dataSize)
+        if (toWrite != dataSize) {
+            if (!_err)
+                warning("[save] '%s' exceeds the %u-byte slot -- save aborted",
+                        _name.c_str(), (uint32)SAVE_DATA_MAX);
             _err = true;
+        }
         return toWrite;
     }
 
@@ -164,6 +168,17 @@ private:
         if (_flushed) return;
         _flushed = true;
 
+        /* Never commit a bad (e.g. overflowed/truncated) save: a truncated
+         * payload still parses as a valid save and would silently replace a
+         * good one, then load back with its tail sections zeroed.  Leaving
+         * the slot untouched keeps the previous save intact and lets the
+         * engine report "Game NOT saved". */
+        if (_err) {
+            warning("[save] '%s' not committed (write error/overflow); "
+                    "previous slot contents preserved", _name.c_str());
+            return;
+        }
+
         uint32 dataLen = _size;
         uint32 totalLen = dataLen + (uint32)sizeof(SaveSlotHeader);
         if (dataLen > SAVE_DATA_MAX) {
@@ -173,9 +188,10 @@ private:
             return;
         }
 
-        debug(1, "[save] slot=%d file='%s' name='%s' payload=%u total=%u max=%u",
-              _slot, g_savePaths[_slot], _name.c_str(), dataLen,
-              totalLen, (uint32)OPENFPGA_SAVE_SIZE);
+        /* Payload vs the 256 KB slot cap (saves are raw -- zlib is stubbed);
+         * enable debuglevel 1 to watch for saves creeping toward the cap. */
+        debug(1, "[save] slot=%d name='%s' payload=%u/%u total=%u",
+              _slot, _name.c_str(), dataLen, (uint32)SAVE_DATA_MAX, totalLen);
 
         openfpga_audiocd_quiesce();
 
@@ -271,6 +287,13 @@ Common::InSaveFile *OpenFPGASaveFileManager::openForLoading(const Common::String
         fclose(f);
         return nullptr;
     }
+
+    /* A payload that exactly fills the slot almost certainly hit the write
+     * clamp in an older build (a truncated save loads with its tail sections
+     * zeroed -- e.g. dead verb UI).  Load it anyway, but say so. */
+    if (hdr.dataLen >= SAVE_DATA_MAX)
+        warning("[save] '%s' fills the whole slot -- likely truncated by an "
+                "older build; loaded state may be incomplete", name.c_str());
 
     byte *data = (byte *)malloc(hdr.dataLen);
     if (!data) { fclose(f); return nullptr; }

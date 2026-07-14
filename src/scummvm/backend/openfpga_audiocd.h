@@ -61,7 +61,10 @@ public:
 
     bool existExtractedCDAudioFiles(uint track) override;
 
-    void pump();
+    /* allowBatch=false is the "light" pump for latency-critical call sites:
+     * it services the HW cursor/volume but skips the batched blocking refill
+     * unless the ring is close to underrun. */
+    void pump(bool allowBatch = true);
     void quiesce();
 
 private:
@@ -85,6 +88,7 @@ private:
 };
 
 extern "C" void openfpga_audiocd_pump(void);
+extern "C" void openfpga_audiocd_pump_light(void);
 extern "C" void openfpga_audiocd_pause(bool paused);
 extern "C" void openfpga_audiocd_quiesce(void);
 

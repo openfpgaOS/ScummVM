@@ -32,6 +32,11 @@
 #include <sys/un.h>
 #include <poll.h>
 #include <termios.h>
+#include <sys/ioctl.h>
+#ifdef __APPLE__
+#include <IOKit/serial/ioss.h>  /* IOSSIOSPEED: set arbitrary (non-standard) baud rates */
+#include <glob.h>
+#endif
 
 #include "phdp_proto.h"
 
@@ -322,18 +327,43 @@ static speed_t baud_to_speed(int baud) {
     case 57600:   return B57600;
     case 115200:  return B115200;
     case 230400:  return B230400;
+    /* High baud rates are non-standard and absent on some platforms (e.g. macOS). */
+#ifdef B460800
     case 460800:  return B460800;
+#endif
+#ifdef B500000
     case 500000:  return B500000;
+#endif
+#ifdef B576000
     case 576000:  return B576000;
+#endif
+#ifdef B921600
     case 921600:  return B921600;
+#endif
+#ifdef B1000000
     case 1000000: return B1000000;
+#endif
+#ifdef B1152000
     case 1152000: return B1152000;
+#endif
+#ifdef B1500000
     case 1500000: return B1500000;
+#endif
+#ifdef B2000000
     case 2000000: return B2000000;
+#endif
+#ifdef B2500000
     case 2500000: return B2500000;
+#endif
+#ifdef B3000000
     case 3000000: return B3000000;
+#endif
+#ifdef B3500000
     case 3500000: return B3500000;
+#endif
+#ifdef B4000000
     case 4000000: return B4000000;
+#endif
     default:      return B0;
     }
 }
@@ -346,14 +376,6 @@ static int uart_open(void) {
     if (tcgetattr(fd, &tty) != 0) { close(fd); return -1; }
 
     speed_t sp = baud_to_speed(G.baud);
-    if (sp == B0) {
-        fprintf(stderr, "unsupported baud rate %d\n", G.baud);
-        close(fd);
-        return -1;
-    }
-
-    cfsetispeed(&tty, sp);
-    cfsetospeed(&tty, sp);
 
     /* Raw mode, 8N1 */
     cfmakeraw(&tty);
@@ -362,7 +384,36 @@ static int uart_open(void) {
     tty.c_cc[VMIN]  = 0;
     tty.c_cc[VTIME] = 0;
 
+#ifdef __APPLE__
+    /* macOS termios only knows standard B-constants; high/non-standard rates
+     * (e.g. 2 Mbaud) are set via the IOSSIOSPEED ioctl below. Seed a valid
+     * standard speed here so tcsetattr succeeds. */
+    cfsetispeed(&tty, sp == B0 ? B9600 : sp);
+    cfsetospeed(&tty, sp == B0 ? B9600 : sp);
+#else
+    if (sp == B0) {
+        fprintf(stderr, "unsupported baud rate %d\n", G.baud);
+        close(fd);
+        return -1;
+    }
+    cfsetispeed(&tty, sp);
+    cfsetospeed(&tty, sp);
+#endif
+
     if (tcsetattr(fd, TCSANOW, &tty) != 0) { close(fd); return -1; }
+
+#ifdef __APPLE__
+    if (sp == B0) {
+        /* Apply the real (non-standard) baud rate after tcsetattr. */
+        speed_t speed = (speed_t)G.baud;
+        if (ioctl(fd, IOSSIOSPEED, &speed) < 0) {
+            fprintf(stderr, "failed to set baud rate %d: %s\n", G.baud, strerror(errno));
+            close(fd);
+            return -1;
+        }
+    }
+#endif
+
     tcflush(fd, TCIOFLUSH);
 
     return fd;
@@ -1039,9 +1090,17 @@ static void ipc_handle_command(int client_idx) {
 static int ipc_listen_setup(void) {
     unlink(PHDP_SOCK_PATH);
 
-    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         perror("socket");
+        return -1;
+    }
+
+    /* SOCK_NONBLOCK is not portable (absent on macOS/BSD); set it via fcntl. */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        perror("fcntl");
+        close(fd);
         return -1;
     }
 
@@ -1131,8 +1190,8 @@ static void try_uart_connect(void) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "usage: %s [-d /dev/ttyUSB0] [-b 2000000] [-v] [-t]\n"
-        "  -d PATH    UART device (default /dev/ttyUSB0)\n"
+        "usage: %s [-d DEVICE] [-b 2000000] [-v] [-t]\n"
+        "  -d PATH    UART device (default: auto-detected USB-serial adapter)\n"
         "  -b BAUD    UART baud rate (default 2000000)\n"
         "  -v         verbose: state, packet headers, stream progress\n"
         "  -t         trace: -v + per-byte hex dumps + IPC events + timestamps\n",
@@ -1140,9 +1199,35 @@ static void usage(const char *prog) {
     exit(1);
 }
 
+/* Pick the default UART device for this platform. On Linux the USB-serial
+ * adapter is /dev/ttyUSB0; on macOS it enumerates as /dev/cu.usbserial-* (or
+ * /dev/cu.usbmodem-*) with an adapter-specific suffix, so glob for it. Only
+ * used when the user does not pass -d. Returns a static/leaked string. */
+static const char *default_uart_path(void) {
+#ifdef __APPLE__
+    static const char *patterns[] = {
+        "/dev/cu.usbserial-*", "/dev/cu.usbmodem*", "/dev/cu.SLAB_USBtoUART*",
+    };
+    for (size_t i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
+        glob_t g;
+        if (glob(patterns[i], 0, NULL, &g) == 0 && g.gl_pathc > 0) {
+            char *path = strdup(g.gl_pathv[0]);
+            globfree(&g);
+            if (path) return path;
+        }
+        globfree(&g);
+    }
+    /* Nothing detected — fall through to the Linux name so the failure path
+     * still has a device to report. */
+    return "/dev/ttyUSB0";
+#else
+    return "/dev/ttyUSB0";
+#endif
+}
+
 int main(int argc, char **argv) {
     /* Defaults */
-    G.uart_path = "/dev/ttyUSB0";
+    G.uart_path = default_uart_path();
     G.baud      = PHDP_DEFAULT_BAUD;
     G.verbose   = false;
     G.trace     = false;
