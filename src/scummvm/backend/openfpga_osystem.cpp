@@ -8,6 +8,7 @@
 #include "backends/mutex/null/null-mutex.h"
 #include "backends/timer/default/default-timer.h"
 #include "backends/events/default/default-events.h"
+#include "common/config-manager.h"
 #include "common/memstream.h"
 #include "common/stream.h"
 #include "openfpga_audiocd.h"
@@ -748,6 +749,201 @@ void OpenFPGAGraphicsManager::drawCursor(uint8_t *dst, uint fbW, uint fbH,
 
 namespace {
 
+struct PocketKeyBinding {
+    bool configured;
+    Common::KeyCode keycode;
+    uint16 ascii;
+};
+
+struct PocketKeyName {
+    const char *name;
+    Common::KeyCode keycode;
+    uint16 ascii;
+};
+
+static const PocketKeyName kPocketKeyNames[] = {
+    { "enter",     Common::KEYCODE_RETURN,     Common::ASCII_RETURN },
+    { "return",    Common::KEYCODE_RETURN,     Common::ASCII_RETURN },
+    { "escape",    Common::KEYCODE_ESCAPE,     Common::ASCII_ESCAPE },
+    { "esc",       Common::KEYCODE_ESCAPE,     Common::ASCII_ESCAPE },
+    { "space",     Common::KEYCODE_SPACE,      Common::ASCII_SPACE },
+    { "tab",       Common::KEYCODE_TAB,        Common::ASCII_TAB },
+    { "backspace", Common::KEYCODE_BACKSPACE,  Common::ASCII_BACKSPACE },
+
+    { "period",    Common::KEYCODE_PERIOD,      '.' },
+    { "dot",       Common::KEYCODE_PERIOD,      '.' },
+    { "comma",     Common::KEYCODE_COMMA,       ',' },
+    { "minus",     Common::KEYCODE_MINUS,       '-' },
+    { "equals",    Common::KEYCODE_EQUALS,      '=' },
+    { "slash",     Common::KEYCODE_SLASH,       '/' },
+    { "semicolon", Common::KEYCODE_SEMICOLON,   ';' },
+
+    { "delete",    Common::KEYCODE_DELETE,      127 },
+    { "insert",    Common::KEYCODE_INSERT,      0 },
+    { "home",      Common::KEYCODE_HOME,        0 },
+    { "end",       Common::KEYCODE_END,         0 },
+    { "pageup",    Common::KEYCODE_PAGEUP,      0 },
+    { "pagedown",  Common::KEYCODE_PAGEDOWN,    0 },
+
+    { "up",        Common::KEYCODE_UP,          0 },
+    { "down",      Common::KEYCODE_DOWN,        0 },
+    { "left",      Common::KEYCODE_LEFT,        0 },
+    { "right",     Common::KEYCODE_RIGHT,       0 },
+
+    { "f1",        Common::KEYCODE_F1,          Common::ASCII_F1 },
+    { "f2",        Common::KEYCODE_F2,          Common::ASCII_F2 },
+    { "f3",        Common::KEYCODE_F3,          Common::ASCII_F3 },
+    { "f4",        Common::KEYCODE_F4,          Common::ASCII_F4 },
+    { "f5",        Common::KEYCODE_F5,          Common::ASCII_F5 },
+    { "f6",        Common::KEYCODE_F6,          Common::ASCII_F6 },
+    { "f7",        Common::KEYCODE_F7,          Common::ASCII_F7 },
+    { "f8",        Common::KEYCODE_F8,          Common::ASCII_F8 },
+    { "f9",        Common::KEYCODE_F9,          Common::ASCII_F9 },
+    { "f10",       Common::KEYCODE_F10,         Common::ASCII_F10 },
+    { "f11",       Common::KEYCODE_F11,         Common::ASCII_F11 },
+    { "f12",       Common::KEYCODE_F12,         Common::ASCII_F12 }
+};
+
+static PocketKeyBinding parsePocketKeyBinding(const Common::String &value) {
+    PocketKeyBinding binding = {
+        false,
+        Common::KEYCODE_INVALID,
+        0
+    };
+
+    Common::String key = value;
+    key.toLowercase();
+    key.trim();
+
+    if (key.empty() || key == "none")
+        return binding;
+
+    const Common::String keyboardPrefix = "keyboard:";
+    if (key.hasPrefix(keyboardPrefix))
+        key = key.substr(keyboardPrefix.size());
+
+    if (key.size() == 1) {
+        const char ch = key[0];
+
+        if (ch >= '0' && ch <= '9') {
+            binding.configured = true;
+            binding.keycode = static_cast<Common::KeyCode>(
+                Common::KEYCODE_0 + (ch - '0'));
+            binding.ascii = ch;
+            return binding;
+        }
+
+        if (ch >= 'a' && ch <= 'z') {
+            binding.configured = true;
+            binding.keycode = static_cast<Common::KeyCode>(
+                Common::KEYCODE_a + (ch - 'a'));
+            binding.ascii = ch;
+            return binding;
+        }
+
+        for (uint i = 0;
+             i < sizeof(kPocketKeyNames) / sizeof(kPocketKeyNames[0]);
+             ++i) {
+            if (key[0] == kPocketKeyNames[i].ascii &&
+                kPocketKeyNames[i].ascii != 0) {
+                binding.configured = true;
+                binding.keycode = kPocketKeyNames[i].keycode;
+                binding.ascii = kPocketKeyNames[i].ascii;
+                return binding;
+            }
+        }
+    }
+
+    for (uint i = 0;
+         i < sizeof(kPocketKeyNames) / sizeof(kPocketKeyNames[0]);
+         ++i) {
+        if (key == kPocketKeyNames[i].name) {
+            binding.configured = true;
+            binding.keycode = kPocketKeyNames[i].keycode;
+            binding.ascii = kPocketKeyNames[i].ascii;
+            return binding;
+        }
+    }
+
+    return binding;
+}
+
+static PocketKeyBinding getPocketKeyBinding(const char *configKey) {
+    if (!ConfMan.hasKey(configKey))
+        return parsePocketKeyBinding(Common::String());
+
+    return parsePocketKeyBinding(ConfMan.get(configKey));
+}
+
+struct PocketControlConfig {
+    bool loaded;
+
+    PocketKeyBinding selectUp;
+    PocketKeyBinding selectDown;
+    PocketKeyBinding selectLeft;
+    PocketKeyBinding selectRight;
+
+    PocketKeyBinding selectA;
+    PocketKeyBinding selectB;
+    PocketKeyBinding selectX;
+    PocketKeyBinding selectY;
+    PocketKeyBinding selectStart;
+
+    PocketKeyBinding l;
+    PocketKeyBinding r;
+
+    PocketKeyBinding start;
+    PocketKeyBinding a;
+    PocketKeyBinding b;
+    PocketKeyBinding x;
+    PocketKeyBinding y;
+};
+
+static PocketControlConfig gPocketControls = {};
+
+static void loadPocketControlConfig() {
+    if (gPocketControls.loaded)
+        return;
+
+    gPocketControls.selectUp =
+        getPocketKeyBinding("openfpga_control_select_up");
+    gPocketControls.selectDown =
+        getPocketKeyBinding("openfpga_control_select_down");
+    gPocketControls.selectLeft =
+        getPocketKeyBinding("openfpga_control_select_left");
+    gPocketControls.selectRight =
+        getPocketKeyBinding("openfpga_control_select_right");
+
+    gPocketControls.selectA =
+        getPocketKeyBinding("openfpga_control_select_a");
+    gPocketControls.selectB =
+        getPocketKeyBinding("openfpga_control_select_b");
+    gPocketControls.selectX =
+        getPocketKeyBinding("openfpga_control_select_x");
+    gPocketControls.selectY =
+        getPocketKeyBinding("openfpga_control_select_y");
+    gPocketControls.selectStart =
+        getPocketKeyBinding("openfpga_control_select_start");
+
+    gPocketControls.l =
+        getPocketKeyBinding("openfpga_control_l");
+    gPocketControls.r =
+        getPocketKeyBinding("openfpga_control_r");
+
+    gPocketControls.start =
+        getPocketKeyBinding("openfpga_control_start");
+    gPocketControls.a =
+        getPocketKeyBinding("openfpga_control_a");
+    gPocketControls.b =
+        getPocketKeyBinding("openfpga_control_b");
+    gPocketControls.x =
+        getPocketKeyBinding("openfpga_control_x");
+    gPocketControls.y =
+        getPocketKeyBinding("openfpga_control_y");
+
+    gPocketControls.loaded = true;
+}
+
 int pixelsFromRate(int rate, uint32 elapsedMs, int32 &accum) {
     if (rate == 0) {
         accum = 0;
@@ -1015,6 +1211,8 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
     of_input_state_t state;
     of_input_state(0, &state);
 
+    loadPocketControlConfig();
+
     if (_ignoreInitialButtons) {
         if (state.buttons != 0) {
             _lastMouseTick = getMillis();
@@ -1052,15 +1250,111 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
      *       START=Enter   SELECT=exit
      * While SELECT is held, other input is suspended. */
     if (state.buttons & OF_BTN_SELECT) {
-        if (state.buttons_pressed & OF_BTN_UP) {
+        if ((state.buttons_pressed & OF_BTN_LEFT) &&
+            gPocketControls.selectLeft.configured) {
+            _selectConsumed = true;
+            _selectHeld = true;
+            queueKey(
+                gPocketControls.selectLeft.keycode,
+                gPocketControls.selectLeft.ascii);
+            return;
+        }
+
+        if ((state.buttons_pressed & OF_BTN_UP) &&
+            gPocketControls.selectUp.configured) {
+            _selectConsumed = true;
+            _selectHeld = true;
+            queueKey(
+                gPocketControls.selectUp.keycode,
+                gPocketControls.selectUp.ascii);
+            return;
+        }
+
+        if ((state.buttons_pressed & OF_BTN_DOWN) &&
+            gPocketControls.selectDown.configured) {
+            _selectConsumed = true;
+            _selectHeld = true;
+            queueKey(
+                gPocketControls.selectDown.keycode,
+                gPocketControls.selectDown.ascii);
+            return;
+        }
+
+        if ((state.buttons_pressed & OF_BTN_RIGHT) &&
+            gPocketControls.selectRight.configured) {
+            _selectConsumed = true;
+            _selectHeld = true;
+            queueKey(
+                gPocketControls.selectRight.keycode,
+                gPocketControls.selectRight.ascii);
+            return;
+        }
+
+        if ((state.buttons_pressed & OF_BTN_A) &&
+            gPocketControls.selectA.configured) {
+            _selectConsumed = true;
+            _selectHeld = true;
+            queueKey(
+                gPocketControls.selectA.keycode,
+                gPocketControls.selectA.ascii);
+            return;
+        }
+
+        if ((state.buttons_pressed & OF_BTN_B) &&
+            gPocketControls.selectB.configured) {
+            _selectConsumed = true;
+            _selectHeld = true;
+            queueKey(
+                gPocketControls.selectB.keycode,
+                gPocketControls.selectB.ascii);
+            return;
+        }
+
+        if ((state.buttons_pressed & OF_BTN_X) &&
+            gPocketControls.selectX.configured) {
+            _selectConsumed = true;
+            _selectHeld = true;
+            queueKey(
+                gPocketControls.selectX.keycode,
+                gPocketControls.selectX.ascii);
+            return;
+        }
+
+        if ((state.buttons_pressed & OF_BTN_Y) &&
+            gPocketControls.selectY.configured) {
+            _selectConsumed = true;
+            _selectHeld = true;
+            queueKey(
+                gPocketControls.selectY.keycode,
+                gPocketControls.selectY.ascii);
+            return;
+        }
+
+        if ((state.buttons_pressed & OF_BTN_START) &&
+            gPocketControls.selectStart.configured) {
+            _selectConsumed = true;
+            _selectHeld = true;
+            queueKey(
+                gPocketControls.selectStart.keycode,
+                gPocketControls.selectStart.ascii);
+            return;
+        }
+
+        if (!gPocketControls.selectUp.configured &&
+            (state.buttons_pressed & OF_BTN_UP)) {
             _masterVolume = (_masterVolume + 16 > 255) ? 255 : _masterVolume + 16;
             of_mixer_set_master_volume(_masterVolume);
             _selectConsumed = true;
-        } else if (state.buttons_pressed & OF_BTN_DOWN) {
+        } else if (!gPocketControls.selectDown.configured &&
+            (state.buttons_pressed & OF_BTN_DOWN)) {
             _masterVolume = (_masterVolume - 16 < 0) ? 0 : _masterVolume - 16;
             of_mixer_set_master_volume(_masterVolume);
             _selectConsumed = true;
-        } else if (state.buttons_pressed & (OF_BTN_LEFT | OF_BTN_RIGHT)) {
+        } else if (
+            ((!gPocketControls.selectLeft.configured &&
+            (state.buttons_pressed & OF_BTN_LEFT)) ||
+            (!gPocketControls.selectRight.configured &&
+            (state.buttons_pressed & OF_BTN_RIGHT)))) {
             int d = (state.buttons_pressed & OF_BTN_RIGHT) ? 16 : -16;
             _musicVolume += d;
             if (_musicVolume < 0)   _musicVolume = 0;
@@ -1072,7 +1366,8 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
                 getMixer()->setVolumeForSoundType(Audio::Mixer::kMusicSoundType, _musicVolume);
             of_mixer_set_group_volume(OF_MIXER_GROUP_MUSIC, _musicVolume);
             _selectConsumed = true;
-        } else if (state.buttons_pressed & OF_BTN_B) {
+        } else if (!gPocketControls.selectB.configured &&
+            (state.buttons_pressed & OF_BTN_B)) {
             /* SELECT+B = Escape.  SCI menus and many message/dialog windows
              * dismiss/continue on Esc, and we otherwise have no Escape binding
              * (plain Esc is avoided because SCUMM uses it to skip cutscenes).
@@ -1081,7 +1376,8 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
             _selectHeld = true;
             queueKey(Common::KEYCODE_ESCAPE, 27);
             return;
-        } else if (state.buttons_pressed & OF_BTN_START) {
+        } else if (!gPocketControls.selectStart.configured &&
+            (state.buttons_pressed & OF_BTN_START)) {
             /* SELECT+START = toggle the numeric keypad, deliberately.  Keypad
              * mode disables the mouse and turns every button into a digit with
              * no on-screen indicator, so a bare SELECT tap must NOT enter it
@@ -1132,6 +1428,21 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
         }
         return;   /* swallow movement/clicks while in keypad mode */
     }
+    if ((state.buttons_pressed & OF_BTN_L1) &&
+        gPocketControls.l.configured) {
+        queueKey(
+            gPocketControls.l.keycode,
+            gPocketControls.l.ascii);
+        return;
+    }
+
+    if ((state.buttons_pressed & OF_BTN_R1) &&
+        gPocketControls.r.configured) {
+        queueKey(
+            gPocketControls.r.keycode,
+            gPocketControls.r.ascii);
+        return;
+    }
 
     uint32 nowMs = getMillis();
     uint32 elapsedMs = (_lastMouseTick == 0) ? 16 : nowMs - _lastMouseTick;
@@ -1140,8 +1451,14 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
         elapsedMs = 50;
 
     const int deadzone = 4000;
-    const bool slowMouse = (state.buttons & (OF_BTN_L1 | OF_BTN_L2)) != 0;
-    const bool fastMouse = (state.buttons & (OF_BTN_R1 | OF_BTN_R2)) != 0;
+    const bool slowMouse =
+        !gPocketControls.l.configured &&
+        (state.buttons & (OF_BTN_L1 | OF_BTN_L2)) != 0;
+
+    const bool fastMouse =
+        !gPocketControls.r.configured &&
+        (state.buttons & (OF_BTN_R1 | OF_BTN_R2)) != 0;
+
     int analogMaxRate = slowMouse ? 120 : (fastMouse ? 420 : 260);
     int dpadBaseRate = slowMouse ? 60 : (fastMouse ? 240 : 120);
     /* Cursor rates are in GAME pixels/sec.  A hi-res SCI32 surface (640x480) is
@@ -1200,35 +1517,73 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
     if (fromDelay && moved)
         _ofGfx->presentCursor();
 
-    /* A = left click */
-    bool aDown = (state.buttons & OF_BTN_A) != 0;
-    if (aDown != _mouseButtonL) {
-        _mouseButtonL = aDown;
-        queueMouseEvent(aDown ? Common::EVENT_LBUTTONDOWN : Common::EVENT_LBUTTONUP);
-        return;
+    /* A defaults to left mouse click unless overridden by [controls]. */
+    if (gPocketControls.a.configured) {
+        if (state.buttons_pressed & OF_BTN_A) {
+            queueKey(
+                gPocketControls.a.keycode,
+                gPocketControls.a.ascii);
+            return;
+        }
+    } else {
+        const bool aDown = (state.buttons & OF_BTN_A) != 0;
+        if (aDown != _mouseButtonL) {
+            _mouseButtonL = aDown;
+            queueMouseEvent(
+                aDown ? Common::EVENT_LBUTTONDOWN : Common::EVENT_LBUTTONUP);
+            return;
+        }
     }
 
-    /* B = right click */
-    bool bDown = (state.buttons & OF_BTN_B) != 0;
-    if (bDown != _mouseButtonR) {
-        _mouseButtonR = bDown;
-        queueMouseEvent(bDown ? Common::EVENT_RBUTTONDOWN : Common::EVENT_RBUTTONUP);
-        return;
+    /* B defaults to right mouse click unless overridden by [controls]. */
+    if (gPocketControls.b.configured) {
+        if (state.buttons_pressed & OF_BTN_B) {
+            queueKey(
+                gPocketControls.b.keycode,
+                gPocketControls.b.ascii);
+            return;
+        }
+    } else {
+        const bool bDown = (state.buttons & OF_BTN_B) != 0;
+        if (bDown != _mouseButtonR) {
+            _mouseButtonR = bDown;
+            queueMouseEvent(
+                bDown ? Common::EVENT_RBUTTONDOWN : Common::EVENT_RBUTTONUP);
+            return;
+        }
     }
 
-    /* Controller shortcuts. */
+    /* Controller shortcuts, overridable per game through [controls]. */
     if (state.buttons_pressed & OF_BTN_X) {
-        queueKey(Common::KEYCODE_RETURN, Common::ASCII_RETURN);
+        if (gPocketControls.x.configured) {
+            queueKey(
+                gPocketControls.x.keycode,
+                gPocketControls.x.ascii);
+        } else {
+            queueKey(Common::KEYCODE_RETURN, Common::ASCII_RETURN);
+        }
         return;
     }
 
     if (state.buttons_pressed & OF_BTN_Y) {
-        queueKey(Common::KEYCODE_SPACE, Common::ASCII_SPACE);
+        if (gPocketControls.y.configured) {
+            queueKey(
+                gPocketControls.y.keycode,
+                gPocketControls.y.ascii);
+        } else {
+            queueKey(Common::KEYCODE_SPACE, Common::ASCII_SPACE);
+        }
         return;
     }
 
     if (state.buttons_pressed & OF_BTN_START) {
-        queueKey(Common::KEYCODE_F5, Common::ASCII_F5);
+        if (gPocketControls.start.configured) {
+            queueKey(
+                gPocketControls.start.keycode,
+                gPocketControls.start.ascii);
+        } else {
+            queueKey(Common::KEYCODE_F5, Common::ASCII_F5);
+        }
         return;
     }
 
