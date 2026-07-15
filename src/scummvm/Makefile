@@ -251,9 +251,29 @@ ENGINE_ELFS = $(foreach E,$(ENGINES),$(BUILD)/scummvm_$(OUT_$(E)).elf)
 # `make` builds every engine ELF, then assembles the SD-card image.
 all: release
 
+# ── Container-by-default RISC-V build (mirrors sdk.mk) ──────────────
+# This Makefile rolls its own compile rules (no sdk.mk include), so it
+# carries the same delegate guard: outside the container `build` re-execs
+# ONE `make build` inside the openfpgaos-firmware image, where the
+# toolchain is pinned to riscv64-unknown-elf-.  Host-side targets
+# (release/copy/package — image assembly) keep running on the host.
+# USE_SDK_CONTAINER=0 is the explicit host-toolchain opt-out.
+USE_SDK_CONTAINER ?= 1
+SDK_CONTAINER    ?= $(ROOT)/tools/sdk-container.sh
+ifeq ($(USE_SDK_CONTAINER)_$(OF_SDK_IN_CONTAINER),1_)
+
+build: SDK_FORCE
+	@bash $(SDK_CONTAINER) make build ENGINES="$(ENGINES)"
+SDK_FORCE:
+.PHONY: SDK_FORCE
+
+else
+
 build: $(ENGINE_ELFS)
 	@echo; echo "Built per-engine ELFs sharing one libcore.a:"
 	@for f in $(notdir $(ENGINE_ELFS)); do echo "  $(BUILD)/$$f"; done
+
+endif
 
 # Assemble the deployable tree: image.sh wipes+rebuilds $(OUT) from dist/
 # (instance os.ini/JSON already point at the per-engine ELFs), then we drop ALL

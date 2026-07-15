@@ -56,8 +56,13 @@ for `make core`).
 ## runtime/<name>/
 
 The OS repo's `make sdk DEST=<this-sdk>` populates `runtime/<name>/` with
-your core's bitstream + kernel (it runs each OS target's
-`sdk-runtime.sh`). Your platform scripts read their artifacts from there.
+your target's runtime artifacts (it runs each OS target's
+`sdk-runtime.sh`) — the kernel, plus the core bitstream for targets that
+vendor it per app. A target may instead install its core from a separate
+release rather than syncing the bitstream here (MiSTer syncs only the
+kernel; its game-agnostic core ships via `make package TARGET=mister` and
+is installed once to `_Computer/OpenfpgaOS.rbf`). Your platform scripts
+read their artifacts from there.
 Every target uses `runtime/<name>/` (pocket → `runtime/pocket/`, mister →
 `runtime/mister/`); only the target-agnostic `bank.ofsf` lives at
 `runtime/` root.

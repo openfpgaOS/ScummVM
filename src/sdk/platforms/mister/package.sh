@@ -7,54 +7,86 @@
 #
 # openfpgaOS SDK — MiSTer platform packager.
 #
-# Zips one built MiSTer bundle (build/mister/<label>/openfpgaOS.vhd +
-# boot.rom + openfpgaOS.rbf) into a self-contained release ZIP.  Called
-# by the generic scripts/package.sh dispatcher.
+# Per-game (locked multi-instance) release, built from what the staging dir
+# under build/mister/<label>/ carries: one or more <Inst>.mgl launchers plus
+# a <Game>/boot.vhd shell.  The game is self-contained and core-agnostic; the
+# ZIP unzips into games/OpenfpgaOS/ and the commercial IWADs are user-supplied
+# (dropped into <Game>/wads/, injected by setup.sh).  This is the shape
+# produced by mkgame.sh + mkmgl.sh.
+#
+# Called by the generic scripts/package.sh dispatcher.
 #
 # Usage: package.sh <build_dir> <label> <releases_dir>
 #
 set -e
+shopt -s nullglob
 INPUT="$1"; LABEL="$2"; REL="$3"
 SDK_DIR="$(cd "$(dirname "$0")/../../../.." && pwd)"
 GREEN='\033[92m'; RESET='\033[0m'
 
-[ -f "$INPUT/openfpgaOS.vhd" ] || exit 0   # not a MiSTer image bundle — skip
-
-# Self-contained bundle: backfill kernel/bitstream from runtime/mister/.
-[ -f "$INPUT/boot.rom" ]       || cp "$SDK_DIR/runtime/mister/os.bin"        "$INPUT/boot.rom"       2>/dev/null || true
-[ -f "$INPUT/openfpgaOS.rbf" ] || cp "$SDK_DIR/runtime/mister/openfpgaOS.rbf" "$INPUT/openfpgaOS.rbf" 2>/dev/null || true
-[ -f "$INPUT/boot.rom" ]       || { echo "Error: no boot.rom for $LABEL — sync runtime/mister (openfpgaOS: make sdk DEST=...)"; exit 1; }
-[ -f "$INPUT/openfpgaOS.rbf" ] || { echo "Error: no openfpgaOS.rbf for $LABEL — sync runtime/mister"; exit 1; }
-
-# Version from the core's dist metadata (custom cores); SDK demo apps
-# have no per-app core.json — fall back to 1.0.0.
-GAME_VERSION=$(python3 -c "
+# Version from the core's dist metadata (custom cores); SDK demo apps have no
+# per-app core.json — fall back to 1.0.0.
+game_version() {
+    python3 -c "
 import json, glob
 js = glob.glob('$SDK_DIR/dist/$LABEL/Cores/*/core.json')
 print(json.load(open(js[0]))['core']['metadata']['version'] if js else '1.0.0')
-" 2>/dev/null || echo "1.0.0")
+" 2>/dev/null || echo "1.0.0"
+}
 
-OUTPUT="$REL/${LABEL}-v${GAME_VERSION}.zip"
+# ── PER-GAME bundle (checked first: a game staging carries .mgl launchers) ──
+MGLS=("$INPUT"/*.mgl)
+if [ ${#MGLS[@]} -gt 0 ]; then
+    BOOTVHD="$(find "$INPUT" -maxdepth 2 -name boot.vhd 2>/dev/null | head -1)"
+    [ -n "$BOOTVHD" ] || { echo "Error: $LABEL has .mgl launchers but no <Game>/boot.vhd"; exit 1; }
+    GAME="$(basename "$(dirname "$BOOTVHD")")"
+    VER="$(game_version)"
+    OUTPUT="$REL/${LABEL}-v${VER}.zip"
 
-cat > "$INPUT/INSTALL.txt" << EOF
-$LABEL for openfpgaOS (MiSTer)
+    cat > "$INPUT/INSTALL.txt" << EOF
+$GAME for openfpgaOS (MiSTer) — per-game package
 
-Version: $GAME_VERSION
+Version: $VER
 
-Installation:
-1. openfpgaOS.rbf  -> /media/fat/_Console/
-2. boot.rom        -> /media/fat/games/openfpgaOS/
-3. openfpgaOS.vhd  -> /media/fat/games/openfpgaOS/
-   (rename to $LABEL.vhd if you keep several games side by side)
-4. Launch openfpgaOS from the Console menu, then "Mount Disk" in the
-   OSD and pick the image.
+This package is self-contained and works with the game-agnostic openfpgaOS
+core.  Install the core once (openfpgaOS.rbf -> /media/fat/_Computer/,
+boot.rom -> /media/fat/games/OpenfpgaOS/), then for each game:
 
-Saves live INSIDE the image — never recreate /saves or /config with
-ordinary tools (they are preallocated for power-cut safety).
+1. Unzip this archive INTO  /media/fat/games/OpenfpgaOS/
+   You get:
+     $GAME.mgl, <more>.mgl        one launcher per instance
+     $GAME/boot.vhd               read-only game image (shell — no IWADs yet)
+     $GAME/$GAME.saves.vhd        saves template (setup.sh seeds it, see below)
+     $GAME/<inst>.ini             per-instance launch config
+     $GAME/wads/                  <- drop your IWADs here
+     $GAME/setup.sh               seeds saves + injects your wads
+     $GAME/external_files.csv     MiSTer-Downloader freeware wad list
+
+2. Copy the commercial IWADs you own (e.g. DOOM2.WAD, PLUTONIA.WAD, TNT.WAD)
+   into  games/OpenfpgaOS/$GAME/wads/.  Freeware wads can be fetched with
+   MiSTer Downloader via external_files.csv.
+
+3. Run setup once (and again after adding wads):
+     copy  $GAME/setup.sh  to  /media/fat/Scripts/  and run it from the
+     Scripts menu, or over ssh:  bash $GAME/setup.sh $GAME
+   It seeds  saves/OpenfpgaOS/$GAME.vhd  (only if absent — your saves are
+   never overwritten) and injects your wads into boot.vhd.
+
+4. Pick a $GAME .mgl from the MiSTer menu to play.
+
+Your saves + settings live in  /media/fat/saves/OpenfpgaOS/$GAME.vhd,
+preallocated for power-cut safety and kept on a separate volume so a game
+update (which only replaces boot.vhd) can never touch them.  Never recreate
+that image with ordinary tools.
 EOF
 
-(cd "$INPUT" && rm -f "$OUTPUT" 2>/dev/null; \
- zip "$OUTPUT" openfpgaOS.vhd boot.rom openfpgaOS.rbf INSTALL.txt >/dev/null)
+    (cd "$INPUT" && rm -f "$OUTPUT" 2>/dev/null; \
+     zip -r "$OUTPUT" . -x '*.log' '*.mkcommon/*' >/dev/null)
 
-echo -e "${GREEN}Package created: $OUTPUT${RESET}"
-echo "  Size: $(du -h "$OUTPUT" | cut -f1)"
+    echo -e "${GREEN}Package created: $OUTPUT${RESET}"
+    echo "  Game: $GAME | instances: ${#MGLS[@]} | Size: $(du -h "$OUTPUT" | cut -f1)"
+    exit 0
+fi
+
+# No .mgl launchers in the staging dir — not a per-game MiSTer bundle, skip.
+exit 0

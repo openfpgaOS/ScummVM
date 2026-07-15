@@ -321,6 +321,13 @@ struct of_services_table {
      * The hook MUST NOT issue a blocking file read (nested invocation is
      * suppressed by the kernel). Pass NULL to clear. */
     void      (*file_set_idle_hook)(void (*hook)(void));
+
+    /* -- Dock state (append-only) --
+     * Nonzero while the handheld sits in its dock (external display,
+     * detached controllers).  Live state, not a boot-time latch --
+     * dock/undock happens at runtime, so re-check across frames.
+     * Always 1 on console targets (MiSTer). */
+    int       (*input_is_docked)(void);
 };
 
 #ifndef OF_PC

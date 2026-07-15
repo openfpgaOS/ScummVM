@@ -54,15 +54,18 @@ release:
 	@rm -rf $(BUILD)
 	@mkdir -p $(SDK_ROOT)/build/pocket
 	@cp -r $(DIST)/ $(BUILD)/
-	@# Runtime binaries (pocket-specific → runtime/pocket/).  Copy EVERY
-	@# variant bitstream the demo core's core.json names (os25.rbf_r + os30.rbf_r)
-	@# plus the loader VM.  The bitstream is chosen per-instance at load time:
-	@# the chip32 loader probes the "Variant Select" data slot (data.json id 9,
-	@# stamped onto os30 apps by apply-variants.sh) and loads os25 or os30.
-	@for rbf in $$(grep -o '"[^"]*\.rbf_r"' $(BUILD)/Cores/$(CORE_ID)/core.json | tr -d '"' | sort -u); do \
-		cp $(RUNTIME_POCKET)/$$rbf $(BUILD)/Cores/$(CORE_ID)/ || exit 1; \
+	@# Runtime binaries (pocket-specific → runtime/pocket/).  Each core pins ONE
+	@# bitstream as its sole cores[] entry with per-core chip32_vm (framework-level
+	@# chip32_vm disables the APF datatable auto-population — see git history).  So
+	@# os25/os30 ship as SEPARATE cores: the os25 demo core (os25.rbf_r) and the
+	@# os30 3D core (os30.rbf_r).  Give every core dir exactly the bitstream(s) its
+	@# own core.json names, plus the shared loader VM.
+	@for core in $(BUILD)/Cores/*/; do \
+		for rbf in $$(grep -o '"[^"]*\.rbf_r"' "$$core/core.json" | tr -d '"' | sort -u); do \
+			cp $(RUNTIME_POCKET)/$$rbf "$$core/" || exit 1; \
+		done; \
+		cp $(RUNTIME_POCKET)/loader.bin "$$core/"; \
 	done
-	@cp $(RUNTIME_POCKET)/loader.bin $(BUILD)/Cores/$(CORE_ID)/
 	@mkdir -p $(BUILD)/Assets/$(PLATFORM)/common
 	@cp $(RUNTIME_POCKET)/os.bin $(BUILD)/Assets/$(PLATFORM)/common/
 	@# Sound bank (SC-55 GM, target-agnostic → runtime/)
@@ -76,6 +79,16 @@ release:
 			[ -f "$$f" ] && cp "$$f" "$(BUILD)/Assets/$(PLATFORM)/common/"; \
 		done; \
 	done 2>/dev/null; true
+	@# --- os30 3D core lives on its OWN platform (openfpgaos3d) so the Pocket
+	@# reconfigures the FPGA to os30 instead of reusing the demo core's
+	@# already-loaded os25.  Give that platform the shared runtime + triangles.
+	@if [ -d "$(BUILD)/Assets/openfpgaos3d" ]; then \
+		mkdir -p $(BUILD)/Assets/openfpgaos3d/common; \
+		cp $(RUNTIME_POCKET)/os.bin $(BUILD)/Assets/openfpgaos3d/common/; \
+		cp $(RUNTIME)/bank.ofsf $(BUILD)/Assets/openfpgaos3d/common/ 2>/dev/null || true; \
+		[ -f "$(SDK_ROOT)/.obj/sdk/triangles/app.elf" ] && \
+			cp "$(SDK_ROOT)/.obj/sdk/triangles/app.elf" "$(BUILD)/Assets/openfpgaos3d/common/triangles.elf" || true; \
+	fi
 	@echo "Ready: build/pocket/sdk/"
 
 new:
