@@ -442,6 +442,9 @@ static uint32_t _gpu_batch_inflight_mask;
  * threshold, so every "stage token, kick, poll token" pattern stays
  * deadlock-free by construction. */
 static uint32_t _gpu_unflushed_sync;
+/* -1 = unresolved; 1 = publish commands via the uncached alias (MiSTer),
+ * 0 = cached flush + drain (Pocket).  See _gpu_flush_cmd_stream. */
+static int _gpu_publish_uncached = -1;
 
 static const uint32_t _gpu_ring_mask = OF_GPU_RING_SIZE - 1;
 
@@ -587,34 +590,42 @@ static inline void _gpu_flush_cmd_stream(void) {
     uint32_t submit_words = _gpu_cmd_words;
     uint32_t submit_index = _gpu_batch_index;
 
-    /* Publish the staged commands to DRAM through the UNCACHED alias.
+    /* Publish the staged commands to DRAM — path is per-platform.
      *
-     * The previous cbo.flush + same-master cached-readback "drain" was a
-     * timing heuristic, and it loses on MiSTer: the doorbell DMA has
-     * GPU-over-CPU priority at the SDRAM arbiter, and a dirty line whose
-     * writeback hadn't physically landed was read back by the GPU as the
-     * line's PREVIOUS content — valid-looking command words from two
-     * submissions ago in the same staging slot (screen-visible as stale
-     * replayed draws + contiguous missing column runs; same failure class
-     * as the HW-confirmed white-texel bug).  Uncached stores are ordered
-     * by construction: each completes on its AXI B-response through the
-     * same single-outstanding fabric the GPU's pull reads, so when the
-     * kick lands every word is in SDRAM.  The cached copy stays valid for
-     * the CPU (no invalidate), so emission reads/writes stay fast; the
-     * uncached copy below is the only publish step.  (_gpu_flush_cmd_
-     * cache_range/_gpu_drain_cmd_writeback above are retired from this
-     * path — kept only for reference.) */
-    {
+     * MiSTer: the doorbell DMA has GPU-over-CPU priority at the SDRAM
+     * arbiter, so a dirty line whose cbo.flush writeback hasn't physically
+     * landed is read back by the GPU as the line's PREVIOUS content —
+     * valid-looking command words from two submissions ago in the same
+     * staging slot (screen-visible as stale replayed draws + contiguous
+     * missing column runs; same failure class as the HW-confirmed
+     * white-texel bug).  Uncached stores are ordered by construction:
+     * each completes on its AXI B-response through the same
+     * single-outstanding fabric the GPU's pull reads, so when the kick
+     * lands every word is in SDRAM.  The cached copy stays valid for the
+     * CPU (no invalidate), so emission reads/writes stay fast.
+     *
+     * Pocket: the arbiter doesn't starve the writeback, so the cached
+     * cbo.flush + same-master readback drain is already correct there —
+     * and far faster than re-writing every command word through the
+     * single-outstanding uncached alias (thousands of serialized stores
+     * per heavy frame = visible frame-rate loss on the handheld). */
+    if (_gpu_publish_uncached < 0)
+        _gpu_publish_uncached =
+            (of_get_caps()->platform_id == OF_PLATFORM_MISTER);
+    if (_gpu_publish_uncached) {
         volatile uint32_t *dst =
             (volatile uint32_t *)of_uncached(_gpu_batch_buf);
         for (uint32_t w = 0; w < submit_words; w++)
             dst[w] = _gpu_batch_buf[w];
+        __asm__ volatile("fence" ::: "memory");
+    } else {
+        _gpu_flush_cmd_cache_range(_gpu_batch_buf, submit_words * 4u);
+        _gpu_drain_cmd_writeback(submit_words * 4u);
     }
-    __asm__ volatile("fence" ::: "memory");
     _gpu_wait_dma_desc_slot_debug();
 
-    /* The uncached publish above is the data-visibility barrier.  The GPU
-     * MMIO doorbell registers sit on a single in-order peripheral path, so
+    /* The publish above is the data-visibility barrier.  The GPU MMIO
+     * doorbell registers sit on a single in-order peripheral path, so
      * extra CPU fences between these volatile writes only add latency. */
     GPU_DMA_SRC  = _gpu_batch_dma_addr;
     GPU_DMA_LEN  = submit_words;

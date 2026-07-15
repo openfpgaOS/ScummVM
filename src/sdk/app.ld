@@ -17,7 +17,7 @@
  *
  * BRAM hot path: mark functions with OF_FASTTEXT (or OF_FASTDATA /
  * OF_FASTRODATA) -- see api/of_fastram.h. Marked symbols land in BRAM
- * (~23 KB, zero wait state). The OS ELF loader detects BRAM-targeted
+ * (14 KB, zero wait state -- APP_BRAM below). The OS ELF loader detects BRAM-targeted
  * PT_LOAD segments and copies them at load time. Apps that don't use
  * the macros are unaffected -- the BRAM section stays empty and no
  * extra PT_LOAD is generated.
