@@ -115,6 +115,25 @@ struct GameConfig {
                              * plays the bundled Speech.xwb over the classic
                              * scripts.  Requires variant=SE + the SE pak and
                              * speech bank on the disc.  Default off. */
+    char control_select_up   [16];
+    char control_select_down [16];
+    char control_select_left [16];
+    char control_select_right[16];
+
+    char control_select_a    [16];
+    char control_select_b    [16];
+    char control_select_x    [16];
+    char control_select_y    [16];
+    char control_select_start[16];
+
+    char control_l           [16];
+    char control_r           [16];
+
+    char control_start       [16];
+    char control_a           [16];
+    char control_b           [16];
+    char control_x           [16];
+    char control_y           [16];
 };
 
 /* Default engine id for this ELF.  Overridable at build time so a per-engine
@@ -310,6 +329,70 @@ static bool loadGameConfigFromOS(GameConfig &cfg) {
     getOSConfigString("scummvm", "subdir",      cfg.subdir,      sizeof(cfg.subdir));
     cfg.cd_track_offset = of_config_get_int("scummvm", "cd_track_offset", 0);
     cfg.voices = of_config_get_bool("scummvm", "voices", 0) != 0;
+
+    getOSConfigString(
+        "controls", "select_up",
+        cfg.control_select_up, sizeof(cfg.control_select_up));
+
+    getOSConfigString(
+        "controls", "select_down",
+        cfg.control_select_down, sizeof(cfg.control_select_down));
+
+    getOSConfigString(
+        "controls", "select_left",
+        cfg.control_select_left, sizeof(cfg.control_select_left));
+
+    getOSConfigString(
+        "controls", "select_right",
+        cfg.control_select_right, sizeof(cfg.control_select_right));
+
+    getOSConfigString(
+        "controls", "select_a",
+        cfg.control_select_a, sizeof(cfg.control_select_a));
+
+    getOSConfigString(
+        "controls", "select_b",
+        cfg.control_select_b, sizeof(cfg.control_select_b));
+
+    getOSConfigString(
+        "controls", "select_x",
+        cfg.control_select_x, sizeof(cfg.control_select_x));
+
+    getOSConfigString(
+        "controls", "select_y",
+        cfg.control_select_y, sizeof(cfg.control_select_y));
+
+    getOSConfigString(
+        "controls", "select_start",
+        cfg.control_select_start, sizeof(cfg.control_select_start));
+
+    getOSConfigString(
+        "controls", "l",
+        cfg.control_l, sizeof(cfg.control_l));
+
+    getOSConfigString(
+        "controls", "r",
+        cfg.control_r, sizeof(cfg.control_r));
+
+    getOSConfigString(
+        "controls", "start",
+        cfg.control_start, sizeof(cfg.control_start));
+
+    getOSConfigString(
+        "controls", "a",
+        cfg.control_a, sizeof(cfg.control_a));
+
+    getOSConfigString(
+        "controls", "b",
+        cfg.control_b, sizeof(cfg.control_b));
+
+    getOSConfigString(
+        "controls", "x",
+        cfg.control_x, sizeof(cfg.control_x));
+
+    getOSConfigString(
+        "controls", "y",
+        cfg.control_y, sizeof(cfg.control_y));
 
     return cfg.gameid[0] != '\0';
 }
@@ -593,6 +676,27 @@ extern "C" int main(int argc, char **argv) {
      * removes the CD-audio WAV fallback, so MI1 music goes silent --
      * that is the documented trade for MI1 voices. */
     ConfMan.setBool("use_remastered_audio", cfg.voices, gid);
+
+    /* Per-game Pocket controller-to-keyboard mappings. */
+    ConfMan.set("openfpga_control_select_up",    cfg.control_select_up,    gid);
+    ConfMan.set("openfpga_control_select_down",  cfg.control_select_down,  gid);
+    ConfMan.set("openfpga_control_select_left",  cfg.control_select_left,  gid);
+    ConfMan.set("openfpga_control_select_right", cfg.control_select_right, gid);
+
+    ConfMan.set("openfpga_control_select_a",     cfg.control_select_a,     gid);
+    ConfMan.set("openfpga_control_select_b",     cfg.control_select_b,     gid);
+    ConfMan.set("openfpga_control_select_x",     cfg.control_select_x,     gid);
+    ConfMan.set("openfpga_control_select_y",     cfg.control_select_y,     gid);
+    ConfMan.set("openfpga_control_select_start", cfg.control_select_start, gid);
+
+    ConfMan.set("openfpga_control_l",            cfg.control_l,            gid);
+    ConfMan.set("openfpga_control_r",            cfg.control_r,            gid);
+
+    ConfMan.set("openfpga_control_start",        cfg.control_start,        gid);
+    ConfMan.set("openfpga_control_a",            cfg.control_a,            gid);
+    ConfMan.set("openfpga_control_b",            cfg.control_b,            gid);
+    ConfMan.set("openfpga_control_x",            cfg.control_x,            gid);
+    ConfMan.set("openfpga_control_y",            cfg.control_y,            gid);
 
     /* Skip copy-protection screens.  MI2's Dial-A-Pirate, Indy 4's
      * passport-Q&A, and DOTT's "type word from manual" are all gated
