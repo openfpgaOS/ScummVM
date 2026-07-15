@@ -774,6 +774,7 @@ OSystem_OpenFPGA::OSystem_OpenFPGA()
       _selectHeld(false), _selectConsumed(false),
       _lastMouseTick(0),
       _mouseAccumX(0), _mouseAccumY(0),
+      _lastSyncedMouseX(-1), _lastSyncedMouseY(-1),
       _joyFiltX(0), _joyFiltY(0),
       _lastCursorServiceMs(0), _inCursorService(false) {
 }
@@ -900,6 +901,10 @@ bool OSystem_OpenFPGA::pollEvent(Common::Event &event) {
      * drain.  Keeping of_input_poll() to this one funnel is what stops the
      * delayMillis poll from stealing button-press edges from us. */
     serviceInput(false);
+    /* Cursor motion may have been applied without an event (delayMillis
+     * passes only move + present); queue a catch-up MOUSEMOVE if the
+     * engine's last-seen position is stale. */
+    syncEngineMousePos();
     return popQueuedEvent(event);
 }
 
@@ -915,12 +920,13 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
      * future game needs a startup dialog dismissed, gate a Return on the GUI
      * actually being active rather than firing it blindly on a timer. */
 
-    /* ===== Dock USB keyboard + mouse =====
-     * Only serviced from pollEvent (fromDelay=false).  The dock keyboard/mouse
-     * are read through their own syscalls (not of_input_poll), so we must NOT
-     * consume their edges/deltas on the extra delayMillis service passes -- that
-     * would drop keypresses and double-apply motion.  The controller (below) is
-     * safe on both passes because its edges are queued the moment they're read.
+    /* ===== Dock USB keyboard =====
+     * Only serviced from pollEvent (fromDelay=false).  The keyboard is read
+     * through its own syscall (not of_input_poll) and the read consumes the
+     * key edges; unlike the mouse below, not every consumed edge turns into a
+     * queued event (the arming filter and the one-key-per-pass early return
+     * below), so the extra delayMillis service passes would silently drop
+     * typed characters -- and typing gains nothing from 60 Hz servicing.
      *
      * A real keyboard plugged into the Pocket dock types directly into the
      * engine -- no keypad mode needed (so e.g. the LSL age quiz, which reads a
@@ -962,50 +968,77 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
     }
 
     /* ===== Dock USB mouse =====
-     * Relative motion -> cursor, buttons -> left/right click.  Uses the SDK's
-     * pressed/released edges, so it composes with the controller cursor.
-     * pollEvent-only for the same reason as the keyboard above. */
-    if (!fromDelay) {
+     * Relative motion -> cursor, buttons -> left/right click.  Serviced on
+     * BOTH passes, unlike the keyboard: the consuming read is safe here
+     * because motion is applied to the cursor the moment it is read and
+     * button edges are queued the moment they are read -- the same property
+     * that makes the controller safe on both passes.  Servicing from
+     * delayMillis is what keeps a physical mouse as smooth as the pad cursor
+     * while the engine isn't redrawing (static rooms, script waits, loads).
+     * Motion is applied BEFORE the buttons so a click's same-poll motion
+     * isn't dropped and the click lands at the moved cursor. */
+    bool dockMoved = false;
+    {
         of_mouse_state_t m;
         of_input_mouse_state(&m);
-        if (m.present) {
-            struct { uint16 mask; Common::EventType down, up; } mb[] = {
-                { 0x1u, Common::EVENT_LBUTTONDOWN, Common::EVENT_LBUTTONUP },
-                { 0x2u, Common::EVENT_RBUTTONDOWN, Common::EVENT_RBUTTONUP },
-            };
-            for (uint i = 0; i < 2; ++i) {
-                if (m.buttons_pressed & mb[i].mask || m.buttons_released & mb[i].mask) {
-                    queueMouseEvent((m.buttons_pressed & mb[i].mask) ? mb[i].down : mb[i].up);
-                    return;
-                }
-            }
-            if (m.dx || m.dy) {
-                /* The dock reports very large, bursty deltas (observed up to
-                 * ~5000/poll), and moveMouse moves in game pixels -- so cap the
-                 * per-poll input (limits a single jump to CAP/DIV px) and scale
-                 * down by DOCK_MOUSE_DIV, accumulating the remainder so slow
-                 * movements still track.  Raise DOCK_MOUSE_DIV to slow it. */
-                static const int DOCK_MOUSE_DIV = 128;
-                static const int DOCK_MOUSE_CAP = 4096;   /* => max ~32 px/poll */
-                static int accX = 0, accY = 0;
-                int rx = (int)m.dx, ry = (int)m.dy;
-                if (rx >  DOCK_MOUSE_CAP) rx =  DOCK_MOUSE_CAP;
-                if (rx < -DOCK_MOUSE_CAP) rx = -DOCK_MOUSE_CAP;
-                if (ry >  DOCK_MOUSE_CAP) ry =  DOCK_MOUSE_CAP;
-                if (ry < -DOCK_MOUSE_CAP) ry = -DOCK_MOUSE_CAP;
-                accX += rx;
-                accY += ry;
-                int mdx = accX / DOCK_MOUSE_DIV;
-                int mdy = accY / DOCK_MOUSE_DIV;
-                accX -= mdx * DOCK_MOUSE_DIV;
-                accY -= mdy * DOCK_MOUSE_DIV;
-                if (mdx || mdy) {
-                    _ofGfx->moveMouse(mdx, mdy);
-                    queueMouseEvent(Common::EVENT_MOUSEMOVE);
-                    return;
-                }
+        if (m.present && (m.dx || m.dy)) {
+            /* The dock reports very large, bursty deltas (observed up to
+             * ~5000/poll), and moveMouse moves in game pixels -- so cap the
+             * per-poll input (limits a single jump to CAP/DIV px) and scale
+             * down by DOCK_MOUSE_DIV, accumulating the remainder so slow
+             * movements still track.  Raise DOCK_MOUSE_DIV to slow it. */
+            static const int DOCK_MOUSE_DIV = 128;
+            static const int DOCK_MOUSE_CAP = 4096;   /* => max ~32 px/poll */
+            static int accX = 0, accY = 0;
+            int rx = (int)m.dx, ry = (int)m.dy;
+            if (rx >  DOCK_MOUSE_CAP) rx =  DOCK_MOUSE_CAP;
+            if (rx < -DOCK_MOUSE_CAP) rx = -DOCK_MOUSE_CAP;
+            if (ry >  DOCK_MOUSE_CAP) ry =  DOCK_MOUSE_CAP;
+            if (ry < -DOCK_MOUSE_CAP) ry = -DOCK_MOUSE_CAP;
+            accX += rx;
+            accY += ry;
+            int mdx = accX / DOCK_MOUSE_DIV;
+            int mdy = accY / DOCK_MOUSE_DIV;
+            accX -= mdx * DOCK_MOUSE_DIV;
+            accY -= mdy * DOCK_MOUSE_DIV;
+            if (mdx || mdy) {
+                _ofGfx->moveMouse(mdx, mdy);
+                dockMoved = true;
             }
         }
+        /* Button edges are handled even when !present: on hot-unplug the
+         * firmware latches release edges for anything still held into this
+         * final read, and dropping them would leave the engine with a button
+         * stuck down forever. */
+        struct { uint16 mask; Common::EventType down, up; } mb[] = {
+            { 0x1u, Common::EVENT_LBUTTONDOWN, Common::EVENT_LBUTTONUP },
+            { 0x2u, Common::EVENT_RBUTTONDOWN, Common::EVENT_RBUTTONUP },
+        };
+        for (uint i = 0; i < 2; ++i) {
+            const bool down = (m.buttons_pressed  & mb[i].mask) != 0;
+            const bool up   = (m.buttons_released & mb[i].mask) != 0;
+            if (down && up) {
+                /* Both edges in one poll: order by the final level, so a
+                 * sub-frame click ends UP and a release+re-press ends DOWN. */
+                if (m.buttons & mb[i].mask) {
+                    queueMouseEvent(mb[i].up);
+                    queueMouseEvent(mb[i].down);
+                } else {
+                    queueMouseEvent(mb[i].down);
+                    queueMouseEvent(mb[i].up);
+                }
+            } else if (down) {
+                queueMouseEvent(mb[i].down);
+            } else if (up) {
+                queueMouseEvent(mb[i].up);
+            }
+        }
+        /* From delayMillis the engine isn't redrawing -- present the moved
+         * cursor ourselves, exactly like the pad path below.  Done here, not
+         * there, so mouse motion still presents when SELECT/keypad handling
+         * returns before reaching the pad cursor code. */
+        if (fromDelay && dockMoved)
+            _ofGfx->presentCursor();
     }
 
     /* Analog stick and D-pad both drive the mouse.  Movement is applied
@@ -1196,8 +1229,9 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
     /* When servicing from delayMillis() the engine isn't redrawing, so present
      * the cursor ourselves -- this is what decouples cursor smoothness from the
      * game's (low, irregular) frame rate.  presentCursor() no-ops if the cursor
-     * is hidden or the splash is still up. */
-    if (fromDelay && moved)
+     * is hidden or the splash is still up.  Skipped if the dock mouse already
+     * presented this pass (its block above): one flip per pass is enough. */
+    if (fromDelay && moved && !dockMoved)
         _ofGfx->presentCursor();
 
     /* A = left click */
@@ -1245,11 +1279,21 @@ void OSystem_OpenFPGA::serviceInput(bool fromDelay) {
         return;
     }
 
-    /* Pure movement: hand the engine the cursor's new position so hover/verb
-     * lines and the next click target track it.  Only from pollEvent -- from
-     * delayMillis we already moved + presented, and _mousePos re-syncs on the
-     * next pollEvent, so queuing here too would only flood the queue. */
-    if (!fromDelay && moved)
+    /* Pure movement (pad or dock mouse) reaches the engine's hover/verb logic
+     * via syncEngineMousePos() in pollEvent(): it queues one catch-up
+     * EVENT_MOUSEMOVE whenever the engine's last-seen position is stale.
+     * Position-based rather than moved-this-pass so motion applied on
+     * delayMillis passes -- where we only move + present -- is never lost,
+     * even when this function early-returns above. */
+}
+
+/* Queue a catch-up EVENT_MOUSEMOVE if the engine hasn't seen the cursor's
+ * current position.  Every queued mouse event stamps the live position (see
+ * queueMouseEvent), so this stays one event per actual change, not a flood. */
+void OSystem_OpenFPGA::syncEngineMousePos() {
+    if (!_ofGfx)
+        return;
+    if (_ofGfx->getMouseX() != _lastSyncedMouseX || _ofGfx->getMouseY() != _lastSyncedMouseY)
         queueMouseEvent(Common::EVENT_MOUSEMOVE);
 }
 
@@ -1279,6 +1323,10 @@ void OSystem_OpenFPGA::queueMouseEvent(Common::EventType type) {
     ev.type = type;
     ev.mouse.x = _ofGfx->getMouseX();
     ev.mouse.y = _ofGfx->getMouseY();
+    /* Every mouse event carries the live position, so it also brings the
+     * engine up to date -- record that for syncEngineMousePos(). */
+    _lastSyncedMouseX = ev.mouse.x;
+    _lastSyncedMouseY = ev.mouse.y;
     _eventQueue.push(ev);
 }
 

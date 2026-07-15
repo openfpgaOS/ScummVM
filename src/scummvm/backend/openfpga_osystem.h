@@ -269,6 +269,12 @@ private:
 
     uint32 _lastMouseTick;
     int32 _mouseAccumX, _mouseAccumY;
+    /* Last cursor position handed to the engine (stamped by every queued
+     * mouse event).  pollEvent() compares it with the live position and
+     * queues a catch-up EVENT_MOUSEMOVE when they differ -- this is how
+     * motion applied on delayMillis passes (move + present, no event)
+     * reaches the engine's hover/verb logic. */
+    int _lastSyncedMouseX, _lastSyncedMouseY;
     /* One-pole low-pass of the analog axes -- sheds ADC jitter so a held stick
      * drives a steady cursor instead of a trembling one. */
     int32 _joyFiltX, _joyFiltY;
@@ -277,14 +283,15 @@ private:
     uint32 _lastCursorServiceMs;
     Common::Queue<Common::Event> _eventQueue;
 
-    /* Single input poll point.  Reads the controller (and, only when NOT called
-     * from delayMillis, the dock keyboard/mouse), moves the cursor, and pushes
-     * any resulting events onto _eventQueue.  pollEvent() drains the queue;
-     * delayMillis() calls it (fromDelay=true) to smooth the cursor between the
-     * engine's own frames.  Funnelling all of_input_poll() edge latching through
-     * here is what lets delayMillis poll without stealing button edges from
-     * pollEvent. */
+    /* Single input poll point.  Reads the controller and the dock mouse on
+     * every pass (the dock keyboard only when NOT called from delayMillis),
+     * moves the cursor, and pushes any resulting events onto _eventQueue.
+     * pollEvent() drains the queue; delayMillis() calls it (fromDelay=true) to
+     * smooth the cursor between the engine's own frames.  Funnelling all
+     * of_input_poll() edge latching through here is what lets delayMillis poll
+     * without stealing button edges from pollEvent. */
     void serviceInput(bool fromDelay);
+    void syncEngineMousePos();
     void queueMouseEvent(Common::EventType type);
     void queueKey(Common::KeyCode keycode, uint16 ascii, byte flags = 0);
     bool popQueuedEvent(Common::Event &event);
