@@ -652,11 +652,11 @@ The Pocket gamepad drives the mouse-and-keyboard adventure UI:
 | B | Right mouse button (examine / default verb) |
 | X | Enter / confirm |
 | Y | Space (pause) |
-| START | F5 (ScummVM menu — save / load / options) |
+| START | F5 (the game's **original** menu — save / load; see volume note below) |
 | L3 | Tab (inventory / verb toggle in some games) |
 | R3 | `.` (skip current line of dialogue) |
-| Hold SELECT + Up/Down | Master volume |
-| Hold SELECT + Left/Right | Music volume |
+| Hold SELECT + Up/Down | Master volume (works in every game) |
+| Hold SELECT + Left/Right | Music volume (works in every game) |
 | Tap SELECT | Toggle on-screen numeric **keypad** (type codes with no keyboard) |
 
 In keypad mode the face/d-pad buttons map to digits `1`–`0` and START submits
@@ -672,6 +672,15 @@ the wrong engine version for your data, so the wrong index-file reader runs.
 Match `variant` to the dump: e.g. Loom **EGA** floppy (v3) vs Loom **VGA** CD
 (v4) have different index formats. Cross-check the index-file size in
 `scumm-md5.h` (Loom VGA's `000.LFL` is 8307 bytes; EGA's is 5748).
+
+**No volume sliders in the LucasArts menu.** START/F5 opens each game's
+**original** in-engine menu (the themed ScummVM GUI is not stable on this
+backend), and the original menus of the v4/v5 games — MI1, MI2, Indy3/4,
+Loom — never had volume controls; that's faithful, not broken. DOTT / Sam&Max
+show sliders only in their CD (talkie) variants, and Full Throttle / The Dig
+always do. In any game, **hold SELECT + Up/Down (master) or SELECT +
+Left/Right (music)** to set volume directly — there is currently no on-screen
+indicator, so listen for the change.
 
 **Game runs but no music.** Confirm which music path the *version* uses
 (§ [Music](#music-three-paths)). A CD/talkie version flagged `MDT_NONE` has **no
