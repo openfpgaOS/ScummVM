@@ -23,6 +23,10 @@ extern "C" {
 }
 
 extern "C" void openfpga_audiocd_quiesce(void);
+/* Light audio pump (PCM mixer only, re-entry safe via g_pumpBusy) -- keeps
+ * the ring fed across the blocking bridge reads below.  Same pattern as
+ * SlotFileStream::read in main.cpp. */
+extern void openfpga_mixer_pump_only(void);
 
 namespace {
 
@@ -198,8 +202,18 @@ private:
         FILE *f = openSlot(_slot, "wb");
         if (!f) { _err = true; return; }
 
+        /* Two-phase, magic-LAST commit.  The slot commit is a long blocking
+         * window (256 KB over the bridge + the nonvolatile fclose); a
+         * power-off/sleep in that window used to leave a VALID header over
+         * incomplete payload -- readHeader accepted it and the engine got
+         * garbage (the "WRONG SAVE TYPE" / assert-on-load corruption
+         * reports).  Now the header goes out with magic=0 first, payload
+         * second, and the real magic is written LAST: an interrupted commit
+         * fails the magic check and reads as an empty slot instead of a
+         * plausible save.  No format change -- completed saves are
+         * byte-identical to before. */
         SaveSlotHeader hdr;
-        hdr.magic = SAVE_MAGIC;
+        hdr.magic = 0;
         memset(hdr.filename, 0, SAVE_NAME_MAX);
         strncpy(hdr.filename, _name.c_str(), SAVE_NAME_MAX - 1);
         hdr.dataLen = dataLen;
@@ -207,6 +221,12 @@ private:
         if (!writeExact(f, &hdr, sizeof(hdr)) ||
             !writeExact(f, g_saveWriteBuffer, dataLen)) {
             _err = true;
+        }
+        if (!_err) {
+            hdr.magic = SAVE_MAGIC;
+            if (fseek(f, 0, SEEK_SET) != 0 ||
+                !writeExact(f, &hdr, sizeof(hdr)))
+                _err = true;
         }
         if (fclose(f) != 0)
             _err = true;
@@ -240,6 +260,11 @@ bool OpenFPGASaveFileManager::readHeader(int slot, SaveSlotHeader *hdr) {
     if (!f) return false;
     size_t n = fread(hdr, 1, sizeof(SaveSlotHeader), f);
     fclose(f);
+    /* The restore dialog and findSlotByName/findFreeSlot scan all 9 slots
+     * back to back (fopen+fread+fclose each) -- pump once per slot so slow
+     * bridge round-trips can't accumulate into a dropout while menu music
+     * is playing. */
+    openfpga_mixer_pump_only();
     if (n != sizeof(SaveSlotHeader)) return false;
     if (hdr->magic != SAVE_MAGIC) return false;
     if (hdr->dataLen == 0 || hdr->dataLen > SAVE_DATA_MAX) return false;
@@ -289,16 +314,38 @@ Common::InSaveFile *OpenFPGASaveFileManager::openForLoading(const Common::String
     }
 
     /* A payload that exactly fills the slot almost certainly hit the write
-     * clamp in an older build (a truncated save loads with its tail sections
-     * zeroed -- e.g. dead verb UI).  Load it anyway, but say so. */
-    if (hdr.dataLen >= SAVE_DATA_MAX)
-        warning("[save] '%s' fills the whole slot -- likely truncated by an "
-                "older build; loaded state may be incomplete", name.c_str());
+     * clamp in an older build: the tail was never written, and feeding the
+     * zero-tailed payload to the engine's serializer ends in an engine
+     * assert (SCUMM saveload resource loop) and a dead session.  REFUSE the
+     * load -- the engine reports a clean per-slot failure instead, and the
+     * user's other slots stay reachable.  (A legitimate save of exactly
+     * SAVE_DATA_MAX bytes is indistinguishable from a truncated one and
+     * pays the price; the odds are negligible.) */
+    if (hdr.dataLen >= SAVE_DATA_MAX) {
+        warning("[save] '%s' fills the whole slot -- truncated by an older "
+                "build's write clamp; refusing to load it", name.c_str());
+        fclose(f);
+        return nullptr;
+    }
 
     byte *data = (byte *)malloc(hdr.dataLen);
     if (!data) { fclose(f); return nullptr; }
 
-    if (hdr.dataLen && fread(data, 1, hdr.dataLen, f) != hdr.dataLen) {
+    /* Chunk the payload read (up to 256 KB) and pump the mixer between
+     * chunks: restore runs while menu music is playing, and one unpumped
+     * bridge read of that size is an audible dropout. */
+    uint32 got = 0;
+    bool readOk = true;
+    while (got < hdr.dataLen) {
+        const uint32 chunk = (hdr.dataLen - got > 8192) ? 8192 : hdr.dataLen - got;
+        if (fread(data + got, 1, chunk, f) != chunk) {
+            readOk = false;
+            break;
+        }
+        got += chunk;
+        openfpga_mixer_pump_only();
+    }
+    if (!readOk) {
         free(data);
         fclose(f);
         return nullptr;

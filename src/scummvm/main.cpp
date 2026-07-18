@@ -179,7 +179,18 @@ public:
         byte *out = (byte *)buf;
         uint32 total = 0;
 
+        /* Full load pump (audio + MIDI + timers + burst-gated deep cushion),
+         * BEFORE each fread so the first and final chunks are covered too --
+         * the same contract as FdReadStream on the ISO path.  The old
+         * mixer-only pump kept PCM fed during the reads but never armed the
+         * deep cushion and never drained pending MIDI ticks, so on zip
+         * installs (how LSL7 ships) every speech-line load ended in an
+         * unprotected compute gap (zlib inflate, resource setup) that
+         * underran the ~120 ms base ring -- the recurring PCM stutter --
+         * and music events queued by the 1 kHz IRQ dispatched late in a
+         * burst after each read. */
         while (cnt) {
+            openfpga_pump_during_load();
             uint32 chunk = cnt < kSlotReadPumpChunk ? cnt : kSlotReadPumpChunk;
             uint32 got = (uint32)fread(out + total, 1, chunk, _f);
             total += got;
@@ -187,8 +198,6 @@ public:
 
             if (got != chunk)
                 break;
-
-            openfpga_mixer_pump_only();
         }
 
         return total;

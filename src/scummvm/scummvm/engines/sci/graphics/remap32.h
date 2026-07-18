@@ -338,6 +338,23 @@ public:
 	}
 
 	/**
+	 * openfpga: returns the composite table controlling `color`, or nullptr
+	 * when `color` has no active remap (the caller must then leave the pixel
+	 * undrawn, exactly like remapEnabled() == false).  Folds remapEnabled's
+	 * range/type checks and remapColor's index math into one per-draw lookup
+	 * so the translucent blit loop can go per-pixel table-free; the
+	 * `targetColor >= _remapStartColor -> 0` rule from remapColor still
+	 * applies at the use site (it depends on the destination pixel).
+	 */
+	inline const uint8 *remapTableFor(uint8 color) const {
+		const uint8 index = _remapEndColor - color;
+		if (index >= _remaps.size() || _remaps[index]._type == kRemapNone) {
+			return nullptr;
+		}
+		return _remaps[index]._remapColors;
+	}
+
+	/**
 	 * Updates all active remaps in response to a palette change or a remap
 	 * settings change.
 	 *

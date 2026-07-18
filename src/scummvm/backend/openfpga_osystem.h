@@ -186,6 +186,11 @@ void openfpga_set_config_path(const char *path);
  * (pollEvent, updateScreen, delayMillis). */
 void openfpga_drive_audio_and_timers(void);
 void openfpga_mixer_pump_only(void);
+/* Full load-path pump: audio + MIDI + timers + cursor, 8 ms-throttled, and
+ * burst-gated deep-cushion arming (>=4 reads over >=50 ms).  Call from any
+ * chunked read loop that services a real load; a lone read never arms the
+ * cushion (the MI1 flap fix), so it is safe at every read site. */
+void openfpga_pump_during_load(void);
 
 /* Draw the ScummVM logo splash to the framebuffer (called from main() while
  * the engine loads, before it produces its first frame). */

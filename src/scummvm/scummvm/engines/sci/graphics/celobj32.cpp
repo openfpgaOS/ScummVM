@@ -742,18 +742,23 @@ void CelObj::putCopyInCache(const int cacheIndex) const {
 #pragma mark -
 #pragma mark CelObj - Drawing
 
-template<typename MAPPER, typename SCALER, bool DRAW_BLACK_LINES>
+// openfpga: IS_MAC is a template parameter, not the runtime bool it was
+// upstream.  Every mapper inlines translateMacColor(isMacSource, pixel), so
+// the runtime form paid an always-false branch per pixel on every generic
+// path (no Mac SCI game ships on this port); render<> below resolves
+// _isMacSource ONCE per draw, the same way it already resolved
+// _drawBlackLines, and with IS_MAC=false the translate collapses to an
+// unconditional byte move at compile time.
+template<typename MAPPER, typename SCALER, bool DRAW_BLACK_LINES, bool IS_MAC>
 struct RENDERER {
 	MAPPER &_mapper;
 	SCALER &_scaler;
 	const uint8 _skipColor;
-	const bool _isMacSource;
 
-	RENDERER(MAPPER &mapper, SCALER &scaler, const uint8 skipColor, const bool isMacSource) :
+	RENDERER(MAPPER &mapper, SCALER &scaler, const uint8 skipColor) :
 	_mapper(mapper),
 	_scaler(scaler),
-	_skipColor(skipColor),
-	_isMacSource(isMacSource) {}
+	_skipColor(skipColor) {}
 
 	inline void draw(Buffer &target, const Common::Rect &targetRect, const Common::Point &scaledPosition) const {
 		byte *targetPixel = (byte *)target.getPixels() + target.w * targetRect.top + targetRect.left;
@@ -771,7 +776,7 @@ struct RENDERER {
 			_scaler.setTarget(targetRect.left, targetRect.top + y);
 
 			for (int16 x = 0; x < targetWidth; ++x) {
-				_mapper.draw(targetPixel++, _scaler.read(), _skipColor, _isMacSource);
+				_mapper.draw(targetPixel++, _scaler.read(), _skipColor, IS_MAC);
 			}
 
 			targetPixel += skipStride;
@@ -784,8 +789,13 @@ void CelObj::render(Buffer &target, const Common::Rect &targetRect, const Common
 
 	MAPPER mapper;
 	SCALER scaler(*this, targetRect.left - scaledPosition.x + targetRect.width(), scaledPosition);
-	RENDERER<MAPPER, SCALER, false> renderer(mapper, scaler, _skipColor, _isMacSource);
-	renderer.draw(target, targetRect, scaledPosition);
+	if (_isMacSource) {
+		RENDERER<MAPPER, SCALER, false, true> renderer(mapper, scaler, _skipColor);
+		renderer.draw(target, targetRect, scaledPosition);
+	} else {
+		RENDERER<MAPPER, SCALER, false, false> renderer(mapper, scaler, _skipColor);
+		renderer.draw(target, targetRect, scaledPosition);
+	}
 }
 
 template<typename MAPPER, typename SCALER>
@@ -794,11 +804,21 @@ void CelObj::render(Buffer &target, const Common::Rect &targetRect, const Common
 	MAPPER mapper;
 	SCALER scaler(*this, targetRect, scaledPosition, scaleX, scaleY);
 	if (_drawBlackLines) {
-		RENDERER<MAPPER, SCALER, true> renderer(mapper, scaler, _skipColor, _isMacSource);
-		renderer.draw(target, targetRect, scaledPosition);
+		if (_isMacSource) {
+			RENDERER<MAPPER, SCALER, true, true> renderer(mapper, scaler, _skipColor);
+			renderer.draw(target, targetRect, scaledPosition);
+		} else {
+			RENDERER<MAPPER, SCALER, true, false> renderer(mapper, scaler, _skipColor);
+			renderer.draw(target, targetRect, scaledPosition);
+		}
 	} else {
-		RENDERER<MAPPER, SCALER, false> renderer(mapper, scaler, _skipColor, _isMacSource);
-		renderer.draw(target, targetRect, scaledPosition);
+		if (_isMacSource) {
+			RENDERER<MAPPER, SCALER, false, true> renderer(mapper, scaler, _skipColor);
+			renderer.draw(target, targetRect, scaledPosition);
+		} else {
+			RENDERER<MAPPER, SCALER, false, false> renderer(mapper, scaler, _skipColor);
+			renderer.draw(target, targetRect, scaledPosition);
+		}
 	}
 }
 
@@ -811,10 +831,67 @@ void CelObj::drawNoFlip(Buffer &target, const Common::Rect &targetRect, const Co
 }
 
 void CelObj::drawUncompNoFlip(Buffer &target, const Common::Rect &targetRect, const Common::Point &scaledPosition) const {
+	// openfpga fast path: unscaled remap-capable cel drawn while no remap is
+	// active.  MAPPER_NoMap is `if (p != skip && p < remapStart) *dst = p`
+	// with a per-pixel g_sci->_gfxRemap32->getStartColor() deref; hoist the
+	// start color and memcpy maximal drawable runs.  Pixels that are skip OR
+	// in the remap range leave the destination untouched (MAPPER_NoMap's
+	// silent-drop rule), so both act as run breaks.  Byte-identical
+	// (translateMacColor is identity for !_isMacSource).
+	if (!_isMacSource) {
+		READER_Uncompressed reader(*this, targetRect.width());
+		const byte skip = _skipColor;
+		const uint8 remapStart = g_sci->_gfxRemap32->getStartColor();
+		byte *targetRow = (byte *)target.getPixels() + target.w * targetRect.top + targetRect.left;
+		const int16 w = targetRect.width();
+		const int16 h = targetRect.height();
+		const int16 srcXOff = targetRect.left - scaledPosition.x;
+		for (int16 y = 0; y < h; ++y) {
+			const byte *srcRow = reader.getRow(targetRect.top + y - scaledPosition.y) + srcXOff;
+			int16 x = 0;
+			while (x < w) {
+				const byte p = srcRow[x];
+				if (p == skip || p >= remapStart) {
+					++x;
+					continue;
+				}
+				const int16 runStart = x;
+				do {
+					++x;
+				} while (x < w && srcRow[x] != skip && srcRow[x] < remapStart);
+				memcpy(targetRow + runStart, srcRow + runStart, (size_t)(x - runStart));
+			}
+			targetRow += target.w;
+		}
+		return;
+	}
 	render<MAPPER_NoMap, SCALER_NoScale<false, READER_Uncompressed> >(target, targetRect, scaledPosition);
 }
 
 void CelObj::drawUncompHzFlip(Buffer &target, const Common::Rect &targetRect, const Common::Point &scaledPosition) const {
+	// openfpga fast path: mirrored twin of drawUncompNoFlip above, with the
+	// same reversed-walk indexing as drawUncompHzFlipNoMD (target column x
+	// reads srcRow[srcX0 - x]).  No memcpy possible (the copy reverses), but
+	// the remap-manager deref, per-pixel mapper call, and isMac test are gone.
+	if (!_isMacSource) {
+		READER_Uncompressed reader(*this, _width);
+		const byte skip = _skipColor;
+		const uint8 remapStart = g_sci->_gfxRemap32->getStartColor();
+		byte *targetRow = (byte *)target.getPixels() + target.w * targetRect.top + targetRect.left;
+		const int16 w = targetRect.width();
+		const int16 h = targetRect.height();
+		const int16 srcX0 = (_width - 1) - (targetRect.left - scaledPosition.x);
+		for (int16 y = 0; y < h; ++y) {
+			const byte *src = reader.getRow(targetRect.top + y - scaledPosition.y) + srcX0;
+			for (int16 x = 0; x < w; ++x) {
+				const byte p = src[-x];
+				if (p != skip && p < remapStart)
+					targetRow[x] = p;
+			}
+			targetRow += target.w;
+		}
+		return;
+	}
 	render<MAPPER_NoMap, SCALER_NoScale<true, READER_Uncompressed> >(target, targetRect, scaledPosition);
 }
 
@@ -848,10 +925,23 @@ static inline void openfpgaScaledNoMapBlit(Buffer &target, const Common::Rect &t
 		}
 	}
 }
+/* Per-draw remap LUT for the Map blits below: lut[p] is the composite table
+ * for remap-range color p, or nullptr when p has no active remap (pixel
+ * dropped, exactly MAPPER_Map's remapEnabled()==false case).  Replaces the
+ * per-pixel remapEnabled+remapColor dependent-load chain (bounds check, type
+ * test, index math re-derived per pixel) with one indexed load; the
+ * `*dst >= remapStart -> 0` rule stays at the use site because it depends on
+ * the destination pixel.  Colors below remapStart are never looked up. */
+static inline void openfpgaBuildRemapLut(const uint8 *lut[256], GfxRemap32 *const remap,
+                                         const uint8 remapStart) {
+	for (uint p = remapStart; p < 256; ++p)
+		lut[p] = remap->remapTableFor((uint8)p);
+}
+
 static inline void openfpgaScaledMapBlit(Buffer &target, const Common::Rect &targetRect,
                                          const int16 *valuesX, const int16 *valuesY,
                                          READER_Uncompressed &reader, const byte skip,
-                                         GfxRemap32 *const remap, const uint8 remapStart) {
+                                         const uint8 *const *lut, const uint8 remapStart) {
 	for (int16 y = targetRect.top; y < targetRect.bottom; ++y) {
 		const byte *srcRow = reader.getRow(valuesY[y]);
 		byte *dst = (byte *)target.getPixels() + target.w * y + targetRect.left;
@@ -859,10 +949,13 @@ static inline void openfpgaScaledMapBlit(Buffer &target, const Common::Rect &tar
 			const byte p = srcRow[valuesX[x]];
 			if (p == skip)
 				continue;
-			if (p < remapStart)
+			if (p < remapStart) {
 				*dst = p;
-			else if (remap->remapEnabled(p))
-				*dst = remap->remapColor(p, *dst);
+			} else {
+				const uint8 *t = lut[p];
+				if (t)
+					*dst = (*dst >= remapStart) ? 0 : t[*dst];
+			}
 		}
 	}
 }
@@ -905,6 +998,8 @@ void CelObj::drawUncompNoFlipMap(Buffer &target, const Common::Rect &targetRect,
 	if (!_isMacSource) {
 		GfxRemap32 *const remap = g_sci->_gfxRemap32;
 		const uint8 remapStart = remap->getStartColor();
+		const uint8 *lut[256];
+		openfpgaBuildRemapLut(lut, remap, remapStart);
 		READER_Uncompressed reader(*this, targetRect.width());
 		const byte skip = _skipColor;
 		byte *targetRow = (byte *)target.getPixels() + target.w * targetRect.top + targetRect.left;
@@ -918,10 +1013,13 @@ void CelObj::drawUncompNoFlipMap(Buffer &target, const Common::Rect &targetRect,
 				const byte p = srcRow[x];
 				if (p == skip)
 					continue;
-				if (p < remapStart)
+				if (p < remapStart) {
 					*dst = p;
-				else if (remap->remapEnabled(p))
-					*dst = remap->remapColor(p, *dst);
+				} else {
+					const uint8 *t = lut[p];
+					if (t)
+						*dst = (*dst >= remapStart) ? 0 : t[*dst];
+				}
 			}
 			targetRow += target.w;
 		}
@@ -946,12 +1044,14 @@ void CelObj::scaleDrawUncompMap(Buffer &target, const Ratio &scaleX, const Ratio
 	if (!_isMacSource && !_drawBlackLines) {
 		GfxRemap32 *const remap = g_sci->_gfxRemap32;
 		const uint8 remapStart = remap->getStartColor();
+		const uint8 *lut[256];
+		openfpgaBuildRemapLut(lut, remap, remapStart);
 		if (_drawMirrored) {
 			SCALER_Scale<true, READER_Uncompressed> sc(*this, targetRect, scaledPosition, scaleX, scaleY);
-			if (!sc._sourceBuffer) { openfpgaScaledMapBlit(target, targetRect, sc._valuesX, sc._valuesY, sc._reader, _skipColor, remap, remapStart); return; }
+			if (!sc._sourceBuffer) { openfpgaScaledMapBlit(target, targetRect, sc._valuesX, sc._valuesY, sc._reader, _skipColor, lut, remapStart); return; }
 		} else {
 			SCALER_Scale<false, READER_Uncompressed> sc(*this, targetRect, scaledPosition, scaleX, scaleY);
-			if (!sc._sourceBuffer) { openfpgaScaledMapBlit(target, targetRect, sc._valuesX, sc._valuesY, sc._reader, _skipColor, remap, remapStart); return; }
+			if (!sc._sourceBuffer) { openfpgaScaledMapBlit(target, targetRect, sc._valuesX, sc._valuesY, sc._reader, _skipColor, lut, remapStart); return; }
 		}
 	}
 	if (_drawMirrored) {
@@ -977,9 +1077,18 @@ void CelObj::drawUncompNoFlipNoMD(Buffer &target, const Common::Rect &targetRect
 	// non-skip pixels and memcpy each run; skip pixels leave the destination
 	// untouched. Byte-identical to the per-pixel loop, but the copies go word-wise
 	// instead of one conditional byte store per pixel.
+	//
+	// The run-boundary scan itself is SWAR word-at-a-time (plain rv32im, no
+	// bitmanip): after a short byte prologue aligns the source pointer, whole
+	// words are tested at once -- all-skip words extend a transparent span,
+	// and the has-zero-byte trick on (word ^ skip4) detects a skip byte inside
+	// an opaque run.  Word loads are only ever issued on 4-aligned pointers
+	// (this core faults on misaligned loads), and the trailing byte loops find
+	// the exact boundary, so which bytes get memcpy'd is unchanged.
 	if (!_isMacSource) {
 		READER_Uncompressed reader(*this, targetRect.width());
 		const byte skip = _skipColor;
+		const uint32 skip4 = (uint32)skip * 0x01010101u;
 		byte *targetRow = (byte *)target.getPixels() + target.w * targetRect.top + targetRect.left;
 		const int16 w = targetRect.width();
 		const int16 h = targetRect.height();
@@ -988,9 +1097,31 @@ void CelObj::drawUncompNoFlipNoMD(Buffer &target, const Common::Rect &targetRect
 			const byte *srcRow = reader.getRow(targetRect.top + y - scaledPosition.y) + srcXOff;
 			int16 x = 0;
 			while (x < w) {
-				if (srcRow[x] == skip) { ++x; continue; }
+				if (srcRow[x] == skip) {
+					++x;
+					while (x < w && ((uintptr)(srcRow + x) & 3) && srcRow[x] == skip)
+						++x;
+					if (!((uintptr)(srcRow + x) & 3))
+						while (x + 4 <= w && *(const uint32 *)(srcRow + x) == skip4)
+							x += 4;
+					while (x < w && srcRow[x] == skip)
+						++x;
+					continue;
+				}
 				const int16 runStart = x;
-				do { ++x; } while (x < w && srcRow[x] != skip);
+				++x;
+				while (x < w && ((uintptr)(srcRow + x) & 3) && srcRow[x] != skip)
+					++x;
+				if (!((uintptr)(srcRow + x) & 3)) {
+					while (x + 4 <= w) {
+						const uint32 v = *(const uint32 *)(srcRow + x) ^ skip4;
+						if ((v - 0x01010101u) & ~v & 0x80808080u)
+							break;
+						x += 4;
+					}
+				}
+				while (x < w && srcRow[x] != skip)
+					++x;
 				memcpy(targetRow + runStart, srcRow + runStart, (size_t)(x - runStart));
 			}
 			targetRow += target.w;
@@ -1026,6 +1157,31 @@ void CelObj::drawUncompNoFlipNoMDNoSkip(Buffer &target, const Common::Rect &targ
 }
 
 void CelObj::drawUncompHzFlipNoMD(Buffer &target, const Common::Rect &targetRect, const Common::Point &scaledPosition) const {
+	// openfpga fast path: mirrored twin of drawUncompNoFlipNoMD above -- hit by
+	// every unscaled transparent cel drawn facing left.  SCALER_NoScale<true>
+	// starts each row at source index (celWidth-1) - (targetRect.left -
+	// scaledPosition.x) and walks right-to-left (*_row--), so target column x
+	// reads srcRow[srcX0 - x].  The copy direction reverses, so runs can't
+	// memcpy, but the loop keeps the forward fast path's shape: hoisted
+	// locals, no per-pixel mapper call, no isMac test.
+	if (!_isMacSource) {
+		READER_Uncompressed reader(*this, _width);
+		const byte skip = _skipColor;
+		byte *targetRow = (byte *)target.getPixels() + target.w * targetRect.top + targetRect.left;
+		const int16 w = targetRect.width();
+		const int16 h = targetRect.height();
+		const int16 srcX0 = (_width - 1) - (targetRect.left - scaledPosition.x);
+		for (int16 y = 0; y < h; ++y) {
+			const byte *src = reader.getRow(targetRect.top + y - scaledPosition.y) + srcX0;
+			for (int16 x = 0; x < w; ++x) {
+				const byte p = src[-x];
+				if (p != skip)
+					targetRow[x] = p;
+			}
+			targetRow += target.w;
+		}
+		return;
+	}
 	render<MAPPER_NoMD, SCALER_NoScale<true, READER_Uncompressed> >(target, targetRect, scaledPosition);
 }
 

@@ -101,6 +101,12 @@ CXXFLAGS  = $(COMMON_FLAGS)
 CXXFLAGS += -std=gnu++11 -fno-exceptions -fno-rtti -fno-threadsafe-statics
 CXXFLAGS += -Icompat/cxx_includes
 CXXFLAGS += -DNONSTANDARD_PORT -DHAVE_CONFIG_H -DDISABLE_COMMAND_LINE
+# Upstream's shipping configuration: compiles out the #ifndef RELEASE_BUILD
+# blocks -- notably the per-pixel _rowEdge asserts in celobj32's SCALER
+# read() paths, which otherwise cost a live compare+branch on every pixel
+# of every generic cel draw.  Plain assert() stays live (no -DNDEBUG): the
+# save/audio layers rely on those sanity checks to catch corruption early.
+CXXFLAGS += -DRELEASE_BUILD
 CXXFLAGS += -Wno-reorder -Wno-unused-parameter -Wno-sign-compare
 CXXFLAGS += -Wno-missing-field-initializers -Wno-unused-variable
 CXXFLAGS += -Wno-unknown-pragmas -Wno-multichar

@@ -261,10 +261,10 @@ extern "C" void midi_tick_irq(void) {
 }
 
 void openfpga_midi_pump_pending(void) {
-    /* Orphaned HW music voices (SDK mixer stale-handle path) are now reaped
-     * inside smp_voice_tick() itself — the explicit per-pump
-     * smp_voice_reap_orphans() call this used to make was removed from the
-     * SDK together with the function. */
+    /* Reap orphaned HW music voices left looping by the SDK mixer's stale-handle
+     * path (see smp_voice_reap_orphans).  Main-thread, cheap, runs every pump so
+     * a dropped looping voice drones for at most ~one frame instead of forever. */
+    smp_voice_reap_orphans();
 
     Common::TimerManager::TimerProc proc =
         (Common::TimerManager::TimerProc)g_midiTimerProc;

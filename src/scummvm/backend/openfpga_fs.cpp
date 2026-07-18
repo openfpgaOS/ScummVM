@@ -56,8 +56,17 @@ public:
             openfpga_pump_during_load();
 
             /* Bound one syscall so the pump still fires between chunks on a
-             * single large unbuffered read (e.g. Resource::loadPatch). */
-            uint32 want = (cnt > 64u * 1024u) ? 64u * 1024u : cnt;
+             * single large unbuffered read (e.g. Resource::loadPatch).  The
+             * cap is the worst-case unpumped window on this path -- 32 KB
+             * matches the buffered-wrapper size below (so buffered refills
+             * are unaffected) while halving the old 64 KB blind spot for
+             * large direct reads like LSL7 speech samples.  Build-time
+             * tunable for on-device A/B: raise it back if per-syscall bridge
+             * overhead measurably hurts load throughput. */
+#ifndef OPENFPGA_FS_READ_CHUNK
+#define OPENFPGA_FS_READ_CHUNK (32u * 1024u)
+#endif
+            uint32 want = (cnt > OPENFPGA_FS_READ_CHUNK) ? OPENFPGA_FS_READ_CHUNK : cnt;
 
             ssize_t got = ::read(_fd, out + total, want);
             if (got < 0) {
